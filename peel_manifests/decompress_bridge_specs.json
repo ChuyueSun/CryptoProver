@@ -1,0 +1,17 @@
+{
+  "name": "decompress-bridge-specs",
+  "depth": 3,
+  "experiment_mode": "bridge-specs",
+  "pin": "consumer:to_edwards",
+  "target": "curve25519-dalek/src/edwards.rs",
+  "files": [
+    {
+      "path": "curve25519-dalek/src/specs/decompress_bridge_specs.rs",
+      "proof_op": "none",
+      "spec_fns": [
+        "montgomery_to_edwards_affine",
+        "edwards_y_from_montgomery_u"
+      ]
+    }
+  ]
+}

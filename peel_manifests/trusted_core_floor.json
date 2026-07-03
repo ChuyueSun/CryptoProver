@@ -1,0 +1,1311 @@
+{
+  "name": "trusted-core-cut",
+  "floor": "trusted-core",
+  "files": [
+    {
+      "path": "curve25519-dalek/src/backend/serial/curve_models/mod.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/backend/serial/scalar_mul/pippenger.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/backend/serial/scalar_mul/straus.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/backend/serial/scalar_mul/variable_base.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/backend/serial/scalar_mul/vartime_double_base.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/backend/serial/u64/field.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/backend/serial/u64/scalar.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/edwards.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/field.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/common_lemmas/bit_lemmas.rs",
+      "lemmas": [
+        "lemma_or_bit",
+        "lemma_mask_bound_implies_bit_clean",
+        "lemma_mask_or_bound",
+        "lemma_or_bit_all"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/common_lemmas/bits_as_nat_lemmas.rs",
+      "lemmas": [
+        "lemma_bits_as_nat_rec_eq_pow2_mul_bits_from_index",
+        "lemma_bits_as_nat_eq_bits_from_index",
+        "lemma_bits_as_nat_lt_pow2_255_implies_msb_false",
+        "lemma_bits_be_as_nat_eq_bits_from_index",
+        "lemma_byte_bits_value_is_mod",
+        "lemma_byte_bits_value_full",
+        "lemma_bits_from_index_eq_byte_bits",
+        "lemma_bits_from_index_split",
+        "lemma_bits_chunks_eq_bytes_prefix",
+        "lemma_bits_from_bytes_eq_u8_32_as_nat"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/common_lemmas/div_mod_lemmas.rs",
+      "lemmas": [
+        "lemma_mod_sum_factor",
+        "lemma_mod_diff_factor",
+        "lemma_div_of_sum",
+        "lemma_div_strictly_bounded",
+        "lemma_mul_le_implies_div_le",
+        "lemma_mod_sum_both_divisible",
+        "lemma_divisibility_factor",
+        "lemma_int_nat_mod_equiv",
+        "lemma_mul_distributes_over_neg_mod",
+        "lemma_double_neg_mod",
+        "lemma_mul_by_minus_one_is_negation",
+        "lemma_mod_add_eq"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/common_lemmas/mask_lemmas.rs",
+      "lemmas": [
+        "lemma_low_bits_mask_increases"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/common_lemmas/mul_lemmas.rs",
+      "lemmas": [
+        "lemma_mul_lt",
+        "lemma_mul_le",
+        "lemma_m",
+        "lemma_nat_distributive",
+        "lemma_mul_distributive_3_terms",
+        "lemma_mul_distributive_4_terms",
+        "lemma_mul_distributive_5_terms",
+        "lemma_mul_distributive_6_terms",
+        "lemma_mul_distributive_7_terms",
+        "lemma_mul_distributive_8_terms",
+        "lemma_mul_quad_prod",
+        "lemma_mul_commutative_8_terms",
+        "lemma_product_square_factorize",
+        "lemma_mul_si_vi_and_reorder",
+        "lemma_mul_w0_and_reorder"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/common_lemmas/number_theory_lemmas.rs",
+      "lemmas": [
+        "lemma_divides_linear_combo",
+        "lemma_divides_linear_combo_sub",
+        "lemma_gcd_divides_both",
+        "lemma_gcd_positive",
+        "lemma_common_divisor_divides_gcd",
+        "lemma_gcd_with_prime",
+        "lemma_gcd_symmetric",
+        "lemma_gcd_mod_noop",
+        "lemma_divisor_of_odd_is_odd",
+        "lemma_coprime_div_cancel",
+        "lemma_only_odd_divisor_of_pow2",
+        "lemma_gcd_pow2_odd",
+        "lemma_mod_is_zero_when_divisible",
+        "lemma_binomial_divisible_by_prime",
+        "lemma_binomial_prime_divisibility_helper",
+        "lemma_binomial_absorption",
+        "lemma_binomial_n_1",
+        "lemma_binomial_absorption_factorial",
+        "lemma_binomial_factorial_relation",
+        "lemma_factorial_positive",
+        "lemma_fermat_strong",
+        "lemma_binomial_expansion_mod_p",
+        "lemma_shifted_is_a_times",
+        "lemma_binomial_sum_excess_zero",
+        "lemma_pascal_sum_split",
+        "lemma_binomial_theorem",
+        "lemma_partial_binomial_sum_mod_p",
+        "lemma_fermat_cancellation",
+        "lemma_mod_sub_eq_implies_zero",
+        "lemma_product_of_multiples_eq",
+        "lemma_extended_gcd_is_gcd",
+        "lemma_bezout_identity",
+        "lemma_mod_inverse_correct",
+        "lemma_product_nonzero_mod_prime",
+        "lemma_euclid_prime",
+        "lemma_euclid_prime_helper",
+        "lemma_mod_difference_zero",
+        "lemma_multiples_distinct_mod_prime",
+        "lemma_mod_sub_eq",
+        "lemma_mult_maps_to_nonzero",
+        "lemma_product_of_multiples_mod_eq_factorial",
+        "lemma_fermat_little_theorem",
+        "lemma_factorial_coprime_to_prime",
+        "lemma_cancellation_mod_prime",
+        "lemma_product_of_complements",
+        "lemma_p_is_odd",
+        "lemma_p_divisibility_facts",
+        "lemma_prime_gt_2_is_odd",
+        "lemma_pow_2_is_mul",
+        "lemma_square_root_of_unity",
+        "lemma_euler_criterion"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/common_lemmas/pow_lemmas.rs",
+      "lemmas": [
+        "lemma_pow2_plus_one",
+        "lemma_div_bound",
+        "lemma_two_factoring",
+        "lemma_pow2_square",
+        "lemma_pow_nat_is_nat",
+        "lemma_pow2_mul_bound_general",
+        "lemma_binary_sum_div_decomposition",
+        "lemma_binary_sum_mod_decomposition",
+        "lemma_pow2_mul_mod",
+        "lemma_pow2_div_mod",
+        "pow2_MUL_div",
+        "lemma_pow2_mul_div",
+        "lemma_pow2_mul_div_mod_small_div",
+        "lemma_pow2_mul_div_mod_small_mul",
+        "lemma_pow2_mul_div_mod_close_mod",
+        "lemma_pow2_mul_div_mod_small_mod",
+        "lemma_chunk_extraction_commutes_with_mod",
+        "lemma_modular_bit_partitioning",
+        "lemma_pow2_even",
+        "lemma_pow_mod_one",
+        "lemma_pow2_geometric_double",
+        "lemma_pow2_geometric",
+        "lemma_pow_mod_congruent",
+        "lemma_pow_nonnegative",
+        "lemma_pow_mod_composition",
+        "lemma_modular_power_addition",
+        "lemma_pow2_distributivity_over_word"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/common_lemmas/shift_lemmas.rs",
+      "lemmas": [
+        "lemma_u128_shl_is_mul"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/common_lemmas/sum_lemmas.rs",
+      "lemmas": [
+        "lemma_sum_bounds",
+        "lemma_sub_symmetric_bound"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/common_lemmas/to_nat_lemmas.rs",
+      "lemmas": [
+        "lemma_bytes_as_nat_prefix_bounded",
+        "lemma_u8_32_as_nat_lt_pow2_255",
+        "lemma_bytes_seq_as_nat_equals_prefix",
+        "lemma_horner_to_prefix_step",
+        "lemma_decomposition_prefix_rec",
+        "lemma_rec_suffix_divisible",
+        "lemma_u8_32_as_nat_mod_truncates",
+        "lemma_prefix_div_extracts_byte",
+        "lemma_extract_byte_at_index",
+        "lemma_canonical_bytes_equal",
+        "lemma_suffix_zero_when_bytes_zero",
+        "lemma_u8_32_as_nat_with_trailing_zeros",
+        "lemma_u8_32_as_nat_first_byte_only",
+        "lemma_prefix_equal_when_bytes_match",
+        "lemma_from_le_bytes",
+        "lemma_u8_32_as_nat_lower_bound",
+        "lemma_u8_32_as_nat_rec_bound",
+        "lemma_u8_32_as_nat_equals_rec",
+        "lemma_u8_32_as_nat_eq_bytes_seq_as_nat",
+        "lemma_prefix_equals_suffix_partial",
+        "lemma_prefix_equals_suffix_full",
+        "lemma_u8_32_as_nat_equals_suffix_64",
+        "lemma_u8_32_as_nat_identity",
+        "lemma_words_as_nat_upper_bound",
+        "lemma_words_as_nat_equals_bytes",
+        "lemma_words64_from_bytes_to_nat_wide",
+        "lemma_bytes_as_nat_prefix_chunk",
+        "lemma_u64x4_from_le_bytes"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/constants_lemmas.rs",
+      "lemmas": [
+        "lemma_edwards_d_limbs_bounded",
+        "lemma_edwards_d_limbs_bounded_54",
+        "lemma_edwards_d2_limbs_bounded",
+        "lemma_edwards_d2_limbs_bounded_54",
+        "lemma_bridge_local_pow2_d2",
+        "lemma_edwards_d2_is_2d",
+        "lemma_scalar_as_nat_basepoint_order_private_equals_group_order"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/curve_equation_lemmas.rs",
+      "lemmas": [
+        "lemma_identity_on_curve",
+        "lemma_identity_is_valid_extended",
+        "lemma_identity_projective_point_properties",
+        "lemma_negation_preserves_curve",
+        "lemma_negation_preserves_extended_validity",
+        "lemma_affine_to_extended_valid",
+        "lemma_x_zero_implies_y_squared_one",
+        "lemma_z_one_affine_implies_projective",
+        "lemma_affine_curve_implies_projective",
+        "lemma_edwards_double_identity",
+        "lemma_edwards_add_identity_right",
+        "lemma_edwards_add_commutative",
+        "lemma_edwards_double_of_add",
+        "lemma_edwards_add_four_way_swap",
+        "lemma_edwards_scalar_mul_succ",
+        "lemma_edwards_scalar_mul_pow2_succ",
+        "lemma_four_doublings_is_mul_16",
+        "lemma_edwards_add_identity_left",
+        "lemma_scalar_mul_distributes_over_neg",
+        "lemma_neg_distributes_over_add",
+        "lemma_neg_of_signed_scalar_mul",
+        "lemma_edwards_scalar_mul_signed_composition",
+        "lemma_edwards_scalar_mul_additive",
+        "lemma_edwards_scalar_mul_composition",
+        "lemma_edwards_add_identity_right_canonical",
+        "lemma_edwards_scalar_mul_canonical",
+        "lemma_edwards_scalar_mul_signed_canonical",
+        "lemma_edwards_add_canonical",
+        "lemma_identity_affine_niels_is_identity",
+        "lemma_identity_affine_niels_valid",
+        "lemma_negate_affine_niels_preserves_validity",
+        "lemma_negate_affine_niels_is_edwards_neg",
+        "lemma_identity_projective_niels_is_identity",
+        "lemma_negate_projective_niels_is_edwards_neg",
+        "lemma_identity_projective_niels_valid",
+        "lemma_negate_projective_niels_preserves_validity",
+        "lemma_recover_xy_from_niels_encoding",
+        "lemma_projective_niels_affine_equals_edwards_affine",
+        "lemma_unique_x_with_parity",
+        "lemma_valid_extended_point_affine_on_curve",
+        "lemma_affine_niels_affine_equals_edwards_affine",
+        "lemma_completed_point_ratios",
+        "lemma_edwards_to_montgomery_correspondence",
+        "lemma_edwards_affine_when_z_is_one",
+        "lemma_projective_implies_affine_on_curve",
+        "lemma_edwards_scalar_mul_identity",
+        "lemma_double_is_scalar_mul_2",
+        "lemma_double_distributes",
+        "lemma_double_identity"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/decompress_lemmas.rs",
+      "lemmas": [
+        "lemma_sign_bit_after_conditional_negate",
+        "lemma_decompress_field_element_sign_bit",
+        "lemma_decompress_valid_branch",
+        "lemma_decompress_spec_matches_point",
+        "lemma_to_edwards_correctness"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/double_correctness.rs",
+      "lemmas": [
+        "lemma_double_projective_completed_valid"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/mul_base_lemmas.rs",
+      "lemmas": [
+        "lemma_even_sum_up_to_step_even",
+        "lemma_even_sum_up_to_step_odd",
+        "lemma_pippenger_partial_step_even",
+        "lemma_pippenger_partial_step_odd",
+        "lemma_edwards_scalar_mul_signed_of_scalar_mul",
+        "lemma_even_sum_up_to_correct",
+        "lemma_odd_sum_up_to_correct",
+        "lemma_radix16_even_scalar_step",
+        "lemma_radix16_odd_scalar_step",
+        "lemma_reconstruct_radix16_even_odd",
+        "lemma_pippenger_sum_correct_signed",
+        "lemma_pippenger_sum_correct",
+        "lemma_odd_sum_up_to_canonical",
+        "lemma_select_is_signed_scalar_mul",
+        "lemma_basepoint_table_select",
+        "lemma_select_projective_is_signed_scalar_mul"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/niels_addition_correctness.rs",
+      "lemmas": [
+        "lemma_projective_product_factor",
+        "lemma_projective_affine_product_factor",
+        "lemma_cancel_z_from_ratios",
+        "lemma_segre_t_derivation",
+        "lemma_sub_via_negation",
+        "lemma_add_projective_niels_completed_valid",
+        "lemma_sub_projective_niels_completed_valid",
+        "lemma_add_affine_niels_completed_valid",
+        "lemma_sub_affine_niels_completed_valid"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/pippenger_lemmas.rs",
+      "lemmas": [
+        "lemma_pippenger_zero_points_from",
+        "lemma_pippenger_single",
+        "lemma_pippenger_peel_last",
+        "lemma_reconstruct_radix_2w_from_equals_reconstruct",
+        "lemma_reconstruct_radix_2w_from_eq_helper",
+        "lemma_pippenger_horner_correct",
+        "lemma_weighted_from_eq_weighted_bucket_sum",
+        "lemma_intermediate_sum_extend",
+        "lemma_weighted_from_decompose",
+        "lemma_running_sum_eq_weighted_from",
+        "lemma_running_sum_equals_weighted",
+        "lemma_weighted_bucket_sum_agree",
+        "lemma_weighted_bucket_sum_all_identity",
+        "lemma_weighted_bucket_sum_add_to_bucket",
+        "lemma_bucket_weighted_sum_equals_column_sum"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/step1_lemmas.rs",
+      "lemmas": [
+        "lemma_sqrt_ratio_implies_on_curve",
+        "lemma_sqrt_ratio_success_means_valid_y",
+        "lemma_step1_curve_semantics",
+        "lemma_u_zero_implies_identity_point",
+        "lemma_sqrt_ratio_failure_means_invalid_y",
+        "lemma_step1_case_analysis"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/straus_lemmas.rs",
+      "lemmas": [
+        "lemma_select_is_signed_scalar_mul_projective",
+        "lemma_naf_select_is_signed_scalar_mul_projective",
+        "lemma_naf_select_is_signed_scalar_mul_affine8",
+        "lemma_straus_ct_step",
+        "lemma_straus_ct_base",
+        "lemma_straus_vt_step",
+        "lemma_straus_vt_base",
+        "lemma_naf_digit_positive_select_preconditions",
+        "lemma_naf_digit_positive_select_preconditions_width8",
+        "lemma_naf_digit_negative_select_preconditions",
+        "lemma_naf_digit_negative_select_preconditions_width8",
+        "lemma_edwards_point_as_affine_canonical",
+        "lemma_column_sum_canonical",
+        "lemma_column_sum_step_zero_digit",
+        "lemma_column_sum_all_zero",
+        "lemma_straus_vt_zero_suffix",
+        "lemma_column_sum_prefix_eq",
+        "lemma_column_sum_single",
+        "lemma_straus_ct_single",
+        "lemma_straus_ct_partial_peel_last",
+        "lemma_straus_ct_correct",
+        "lemma_straus_ct_zero_points_from",
+        "lemma_reconstruct_radix_16_from_equals_reconstruct",
+        "lemma_reconstruct_radix_16_from_eq_helper",
+        "lemma_straus_vt_single",
+        "lemma_straus_vt_partial_peel_last",
+        "lemma_straus_vt_zero_points_from",
+        "lemma_reconstruct_naf_from_equals_reconstruct",
+        "lemma_reconstruct_naf_from_eq_helper",
+        "lemma_straus_vt_correct"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/torsion_lemmas.rs",
+      "lemmas": [
+        "lemma_on_curve_y_zero_implies_x_sq_neg_one",
+        "lemma_on_curve_x_zero_implies_y_pm_one",
+        "lemma_edwards_add_zero_coord_denom",
+        "lemma_edwards_add_two_torsion_self",
+        "lemma_edwards_add_two_torsion_four_torsion",
+        "lemma_edwards_add_two_torsion_four_torsion_neg",
+        "lemma_edwards_add_four_torsion_with_neg",
+        "lemma_edwards_add_four_torsion_with_two_torsion"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/vartime_double_base_lemmas.rs",
+      "lemmas": [
+        "lemma_vartime_double_base_col_a",
+        "lemma_vartime_double_base_col_ab"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/add_lemmas.rs",
+      "lemmas": [
+        "lemma_field51_add",
+        "lemma_field_element51_eq_from_limbs_eq",
+        "lemma_field_add_16p_no_overflow",
+        "lemma_fe51_limbs_bounded_weaken",
+        "lemma_edwards_point_weaken_to_54",
+        "lemma_add_bounds_propagate",
+        "lemma_sum_of_limbs_bounded_from_fe51_bounded"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/as_bytes_lemmas.rs",
+      "lemmas": [
+        "lemma_as_bytes_boundaries1",
+        "lemma_as_bytes_boundaries2",
+        "lemma_as_bytes_equals_spec_fe51_to_bytes",
+        "lemma_spec_fe51_to_bytes_matches_array",
+        "lemma_seq_eq_implies_array_eq",
+        "lemma_from_bytes_as_bytes_roundtrip",
+        "lemma_as_bytes_from_bytes_roundtrip",
+        "lemma_fe51_to_bytes_equal_implies_field_element_equal",
+        "lemma_field_element_equal_implies_fe51_to_bytes_equal",
+        "lemma_u8_32_as_nat_of_spec_fe51_to_bytes",
+        "lemma_seq_to_array_32_roundtrip",
+        "lemma_canonical_bytes_bit255_zero",
+        "lemma_is_negative_equals_parity",
+        "lemma_xor_sign_bit_preserves_y",
+        "lemma_ct_eq_iff_canonical_nat",
+        "lemma_canonical_check_backward"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/batch_invert_lemmas.rs",
+      "lemmas": [
+        "lemma_is_zero_iff_canonical_nat_zero",
+        "lemma_nat_zero_implies_all_zero_bytes",
+        "lemma_partial_product_nonzeros_is_nonzero",
+        "lemma_backward_step"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/compute_q_lemmas.rs",
+      "lemmas": [
+        "lemma_bounded_shr_51",
+        "lemma_radix51_telescoping_expansion",
+        "lemma_radix51_telescoping_direct",
+        "lemma_radix51_remainder_bound",
+        "lemma_carry_propagation_setup",
+        "lemma_single_stage_division",
+        "lemma_stage_division_theorem",
+        "lemma_carry_propagation_is_division",
+        "lemma_all_carries_bounded_by_3",
+        "lemma_q_is_binary",
+        "lemma_q_biconditional",
+        "lemma_compute_q"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/constants_lemmas.rs",
+      "lemmas": [
+        "lemma_zero_limbs_bounded_51",
+        "lemma_zero_field_element_value",
+        "lemma_one_limbs_bounded_51",
+        "lemma_one_field_element_value",
+        "lemma_minus_one_limbs_bounded_51",
+        "lemma_minus_one_field_element_value",
+        "lemma_bridge_local_pow2",
+        "lemma_one_minus_d_squared_value",
+        "lemma_d_minus_one_squared_value",
+        "lemma_d_plus_one_nonzero",
+        "lemma_montgomery_a_limbs_bounded_51",
+        "lemma_montgomery_a_neg_limbs_bounded_51",
+        "lemma_invsqrt_a_minus_d_limbs_bounded",
+        "lemma_sqrt_ad_minus_one_limbs_bounded",
+        "lemma_one_minus_d_squared_limbs_bounded",
+        "lemma_d_minus_one_squared_limbs_bounded",
+        "lemma_sqrt_ad_minus_one_nonzero",
+        "lemma_elligator_constants_bounded"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/field_algebra_lemmas.rs",
+      "lemmas": [
+        "lemma_field_mul_zero_left",
+        "lemma_field_mul_zero_right",
+        "lemma_field_inv_one",
+        "lemma_neg_square_eq",
+        "lemma_one_and_neg_one_square_to_one",
+        "lemma_field_mul_distributes_over_add",
+        "lemma_field_add_comm",
+        "lemma_field_add_assoc",
+        "lemma_field_add_canonical_left",
+        "lemma_field_sub_add_common_right",
+        "lemma_field_diff_of_squares",
+        "lemma_square_mod_noop",
+        "lemma_square_matches_field_square",
+        "lemma_field_add_sub_recover_double",
+        "lemma_field_add_add_recover_double",
+        "lemma_field_halve_double",
+        "lemma_field_add_sub_rearrange",
+        "lemma_field_element_reduced",
+        "lemma_field_mul_one_left",
+        "lemma_field_mul_one_right",
+        "lemma_inv_mul_cancel",
+        "lemma_affine_zero_implies_proj_zero",
+        "lemma_field_sub_add_cancel",
+        "lemma_field_add_sub_cancel",
+        "lemma_field_sub_antisymmetric",
+        "lemma_field_sub_eq_add_neg",
+        "lemma_field_mul_neg",
+        "lemma_field_mul_distributes_over_sub_right",
+        "lemma_inv_of_product",
+        "lemma_quotient_of_squares",
+        "lemma_product_of_squares_eq_square_of_product",
+        "lemma_inv_of_inv",
+        "lemma_solve_for_left_factor",
+        "lemma_field_mul_assoc",
+        "lemma_field_mul_comm",
+        "lemma_field_mul_exchange",
+        "lemma_field_curve_eq_x2v_eq_u",
+        "lemma_field_curve_point_implies_valid_y",
+        "lemma_field_y_sq_one_implies_x_zero",
+        "lemma_a_times_inv_ab_is_inv_b",
+        "lemma_neg_one_times_is_neg",
+        "lemma_neg_a_times_inv_ab",
+        "lemma_double_negation",
+        "lemma_cancel_common_factor",
+        "lemma_nonzero_product",
+        "lemma_field_sub_self",
+        "lemma_foil_add",
+        "lemma_foil_sub",
+        "lemma_foil_sum_reorder",
+        "lemma_pp_mm_decompose",
+        "lemma_pp_minus_mm",
+        "lemma_pp_plus_mm",
+        "lemma_div_mul_cancel",
+        "lemma_four_factor_rearrange",
+        "lemma_reverse_distribute_add",
+        "lemma_reverse_distribute_sub",
+        "lemma_field_mul_left_cancel",
+        "lemma_add_self_eq_double",
+        "lemma_sub_neg_eq_add",
+        "lemma_pm_mp_neg_setup",
+        "lemma_pm_minus_mp",
+        "lemma_pm_plus_mp",
+        "lemma_field_neg_neg",
+        "lemma_field_neg_nonzero",
+        "lemma_field_neg_mul_left",
+        "lemma_field_inv_neg",
+        "lemma_field_square_of_pow_mod",
+        "lemma_v_times_sq_uv3_eq_u_times_w",
+        "lemma_field_mul_square_canonical",
+        "lemma_factor_result_component_add",
+        "lemma_factor_result_component_sub",
+        "lemma_reassociate_2_z_num",
+        "lemma_two_times_one_plus_t",
+        "lemma_two_times_one_minus_t",
+        "lemma_nonzero_from_mod",
+        "lemma_swap_sub_negates_mul",
+        "lemma_square_sum_expansion",
+        "lemma_cross_mul_iff_div_eq",
+        "lemma_field_square_nonzero",
+        "lemma_mul_one_identity",
+        "lemma_sum_sq_minus_diff_sq",
+        "lemma_field_abs_neg",
+        "lemma_field_abs_mul_sign"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/from_bytes_lemmas.rs",
+      "lemmas": [
+        "lemma_assemble_mod_div",
+        "lemma_assemble_pow_a_pow",
+        "lemma_from_u8_32_as_nat_01",
+        "lemma_from_u8_32_as_nat_012",
+        "lemma_from_u8_32_as_nat_0123",
+        "lemma_from_u8_32_as_nat_01234",
+        "lemma_from_u8_32_as_nat",
+        "lemma_as_nat_32_mod_255"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/invert_lemmas.rs",
+      "lemmas": [
+        "lemma_pow2k_to_field_element",
+        "lemma_invert_zero_case",
+        "lemma_invert_exponent_arithmetic",
+        "lemma_invert_power_chain",
+        "lemma_multiply_by_base_power_addition",
+        "lemma_invert_is_multiplicative_inverse",
+        "lemma_invert_equals_field_inv",
+        "lemma_invert_correctness"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/limbs_to_bytes_lemmas.rs",
+      "lemmas": [
+        "lemma_limbs_to_bytes",
+        "lemma_byte_sum_equals_limb_sum",
+        "lemma_byte_from_limb_shift",
+        "lemma_byte_extraction_commutes_with_mod",
+        "lemma_limb0_contribution_correctness",
+        "lemma_5_bytes_reconstruct",
+        "lemma_5_bytes_scale",
+        "lemma_6_bytes_reconstruct",
+        "lemma_limb1_contribution_correctness",
+        "lemma_limb2_contribution_correctness",
+        "lemma_limb3_contribution_correctness",
+        "lemma_limb4_contribution_correctness",
+        "lemma_boundary_byte_combines",
+        "lemma_sum_equals_byte_nat"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/load8_lemmas.rs",
+      "lemmas": [
+        "lemma_load8_at_rec_version_is_exec",
+        "lemma_load8_at_plus_version_rec_is_bounded",
+        "lemma_load8_at_plus_version_is_spec_aux",
+        "lemma_load8_at_plus_version_is_spec",
+        "lemma_load8_at_versions_equivalent",
+        "lemma_load8_at_plus_fits_u64",
+        "lemma_spec_load8_at_fits_u64",
+        "lemma_load8_plus_ver_div_mod",
+        "lemma_load8_shift_mod_aux",
+        "lemma_load8_shift_mod",
+        "lemma_load8_at_limb_base",
+        "lemma_load8_at_limb_X",
+        "lemma_load8_at_limb0",
+        "lemma_load8_at_limb1",
+        "lemma_load8_at_limb2",
+        "lemma_load8_at_limb3",
+        "lemma_load8_at_limb4"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/mul_lemmas.rs",
+      "lemmas": [
+        "lemma_mul_term_product_bounds",
+        "lemma_mul_c_i_0_bounded",
+        "lemma_mul_c_i_shift_bounded",
+        "lemma_mul_boundary",
+        "lemma_mul_value"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/negate_lemmas.rs",
+      "lemmas": [
+        "lemma_neg_no_underflow",
+        "proof_negate",
+        "lemma_neg"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/pow22501_t19_lemma.rs",
+      "lemmas": [
+        "lemma_pow22501_prove_t19"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/pow22501_t3_lemma.rs",
+      "lemmas": [
+        "lemma_pow22501_prove_t3"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/pow2_51_lemmas.rs",
+      "lemmas": [
+        "lemma_two_factoring_51",
+        "lemma_add_then_shift",
+        "lemma_shr_51_le",
+        "lemma_shr_51_fits_u64",
+        "lemma_cast_then_mod_51",
+        "lemma_mul_sub",
+        "lemma_masked_lt_51",
+        "lemma_u64_div_and_mod_51",
+        "lemma_cast_then_mask_51"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/pow2k_lemmas.rs",
+      "lemmas": [
+        "lemma_term_product_bounds",
+        "lemma_c_i_0_bounded",
+        "lemma_c_i_shift_bounded",
+        "lemma_pow2k_loop_boundary",
+        "lemma_pow2k_loop_value"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/pow_chain_lemmas.rs",
+      "lemmas": [
+        "lemma_prove_pow2k_step",
+        "lemma_prove_geometric_mul_step"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/pow_p58_lemma.rs",
+      "lemmas": [
+        "lemma_pow_p58_prove"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/reduce_lemmas.rs",
+      "lemmas": [
+        "lemma_reduce_boundaries",
+        "proof_reduce",
+        "lemma_reduce_bound_2p"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/sqrt_m1_lemmas.rs",
+      "lemmas": [
+        "lemma_sqrt_m1_limbs_bounded",
+        "lemma_sqrt_m1_nonzero",
+        "lemma_multiply_by_i_flips_sign",
+        "lemma_i_inverse_is_neg_i",
+        "lemma_u_times_inv_iu_is_neg_i",
+        "lemma_neg_u_times_inv_iu_is_i",
+        "lemma_q_times_i_eq_y",
+        "lemma_square_root_of_neg_one",
+        "lemma_fourth_root_of_unity",
+        "lemma_mul_i_squared_is_neg",
+        "lemma_one_minus_x_times_i",
+        "lemma_one_plus_x_times_i"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/sqrt_ratio_lemmas.rs",
+      "lemmas": [
+        "lemma_is_sqrt_ratio_to_field",
+        "lemma_algebraic_chain_base",
+        "lemma_no_square_root_when_times_i",
+        "lemma_sqrt_ratio_check_value",
+        "lemma_conditional_negate_makes_even",
+        "lemma_negate_makes_nonnegative",
+        "lemma_eq_neg_times_i_implies_zero",
+        "lemma_uv7_nonzero",
+        "lemma_check_fourth_root_pattern",
+        "lemma_sqrt_ratio_zero_propagation",
+        "lemma_zero_is_sqrt_ratio",
+        "lemma_sqrt_ratio_correctness",
+        "lemma_nonneg_square_root_unique",
+        "lemma_nat_invsqrt_satisfies_relation",
+        "lemma_invsqrt_unique",
+        "lemma_sqrt_ratio_mutual_exclusion",
+        "lemma_canonical_nat_lt_p",
+        "lemma_invsqrt_matches_spec",
+        "lemma_decode_invsqrt_facts",
+        "lemma_is_negative_bridge",
+        "lemma_sqrt_ratio_lift_to_uv",
+        "lemma_nonneg_preserves_sqrt_ratio",
+        "lemma_nonneg_invsqrt_mul_satisfies_sqrt_ratio",
+        "lemma_nonneg_sqrt_ratio_unique",
+        "lemma_sqrt_ratio_matches_invsqrt_mul"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/to_bytes_reduction_lemmas.rs",
+      "lemmas": [
+        "lemma_reduction_telescoping",
+        "lemma_mul_upper_bound",
+        "lemma_geometric_sum_5_terms",
+        "lemma_as_nat_bound_from_51bit_limbs",
+        "lemma_reduction_carry_propagation_is_division",
+        "lemma_carry_out_equals_q",
+        "lemma_to_bytes_reduction",
+        "lemma_sub_constants_equal_16p",
+        "lemma_p_radix_representation"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/field_lemmas/u64_5_as_nat_lemmas.rs",
+      "lemmas": [
+        "lemma_bridge_pow_as_nat_to_spec",
+        "lemma_u64_5_as_nat_add",
+        "lemma_u64_5_as_nat_sub",
+        "lemma_u64_5_as_nat_k",
+        "lemma_u64_5_as_nat_product",
+        "lemma_fe51_unit_is_one"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/lizard_lemmas.rs",
+      "lemmas": [
+        "lemma_sqrt_id_limbs_bounded_52",
+        "lemma_dp1_over_dm1_limbs_bounded_51",
+        "lemma_mdouble_invsqrt_a_minus_d_bounded_51",
+        "lemma_minvsqrt_one_plus_d_bounded_51",
+        "lemma_midouble_invsqrt_a_minus_d_bounded_51",
+        "lemma_zero_limbs_bounded",
+        "lemma_h_equals_spec_lizard_fe_bytes",
+        "lemma_decode_candidate_preimage",
+        "lemma_coset_bridge",
+        "lemma_invsqrt_bridge",
+        "lemma_spec_lizard_fe_bytes_injective",
+        "lemma_even_is_slot_in_coset",
+        "lemma_odd_is_slot_in_coset",
+        "lemma_jacobi_dual_same_edwards",
+        "lemma_jacobi_to_edwards_affine_s_zero",
+        "lemma_jacobi_to_edwards_affine_y_zero_when_s_sq_one",
+        "lemma_jq_edge_case_values",
+        "lemma_jq_four_torsion_images",
+        "lemma_jacobi_quartic_edge_values",
+        "lemma_elligator_inv_algebraic",
+        "lemma_jacobi_to_edwards_affine_s_canonical_zero",
+        "lemma_candidate_from_jq_spec",
+        "lemma_spec_lizard_fe_bytes_canonical",
+        "lemma_exec_ok_matches_spec_slot",
+        "lemma_partial_count_full"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/montgomery_curve_lemmas.rs",
+      "lemmas": [
+        "lemma_montgomery_add_identity_left",
+        "lemma_montgomery_add_identity",
+        "lemma_montgomery_add_inverse",
+        "lemma_xdbl_degenerate_gives_w_zero",
+        "lemma_projective_represents_implies_u_coordinate",
+        "lemma_montgomery_scalar_mul_one",
+        "lemma_montgomery_scalar_mul_succ",
+        "lemma_montgomery_scalar_mul_add",
+        "lemma_montgomery_scalar_mul_double",
+        "lemma_field_sqrt_zero",
+        "lemma_canonical_sqrt_zero",
+        "lemma_canonical_montgomery_lift_zero",
+        "lemma_montgomery_add_zero_point_doubles_to_infinity",
+        "lemma_montgomery_scalar_mul_zero_point_closed",
+        "lemma_u_coordinate_scalar_mul_canonical_lift_zero",
+        "lemma_canonical_scalar_mul_u_coord_reduced",
+        "lemma_montgomery_add_u_coord_reduced",
+        "lemma_inv_preserves_non_qr",
+        "lemma_montgomery_a_value",
+        "lemma_bridge_local_pow2_m",
+        "lemma_montgomery_a_neg_is_neg_a",
+        "lemma_p_gt_small",
+        "lemma_eps_when_d_is_minus_one",
+        "lemma_nonsquare_branch_r_sq",
+        "lemma_elligator_never_minus_one",
+        "lemma_edwards_basepoint_maps_to_montgomery_basepoint"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/montgomery_lemmas.rs",
+      "lemmas": [
+        "lemma_ladder_invariant_swap",
+        "lemma_zero_limbs_is_zero",
+        "lemma_rr_equals_radix_squared"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/montgomery_pow_chain_lemmas.rs",
+      "lemmas": [
+        "lemma_montgomery_mul_exponent_add",
+        "lemma_montgomery_square_exponent_double",
+        "lemma_square_multiply_exponent_compose",
+        "lemma_exponent_chain_implies_montgomery_inverse",
+        "lemma_chain_exp_is_l_minus_2",
+        "lemma_pow2_chain_multipliers"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/ristretto_lemmas/batch_compress_lemmas.rs",
+      "lemmas": [
+        "lemma_segre_derives_t",
+        "lemma_dt_squared_factor",
+        "lemma_doubled_affine_from_batch_state",
+        "lemma_batch_identity_projective",
+        "lemma_batch_compress_body_inv_zero",
+        "lemma_ristretto_compress_affine_zero_xy",
+        "lemma_degenerate_double_compresses_to_zero",
+        "lemma_curve_eq_batch_identity",
+        "lemma_u1_u2_sq_factoring",
+        "lemma_batch_std_final_matching",
+        "lemma_z_inv_std_is_one",
+        "lemma_no_rotation_algebraic_setup",
+        "lemma_no_rotation_s_matching",
+        "lemma_no_rotation_case",
+        "lemma_rotation_algebraic_setup",
+        "lemma_rotation_s_matching",
+        "lemma_rotation_case",
+        "lemma_rotation_case_body",
+        "lemma_rotation_case_final",
+        "lemma_encoding_equality_core",
+        "lemma_batch_std_case_dispatch",
+        "lemma_batch_encoding_equals_standard_encoding",
+        "lemma_batch_compress_equals_compress_of_double"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/ristretto_lemmas/coset_lemmas.rs",
+      "lemmas": [
+        "lemma_edge_coset_contains_e4"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/ristretto_lemmas/elligator_lemmas.rs",
+      "lemmas": [
+        "lemma_elligator_nonzero_denominators"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_batch_invert_lemmas.rs",
+      "lemmas": [
+        "lemma_partial_product_full",
+        "lemma_partial_product_prefix_eq",
+        "lemma_mul_congruence",
+        "lemma_montgomery_mul_partial_product",
+        "lemma_backward_loop_acc_invariant",
+        "lemma_invert_chain",
+        "lemma_backward_loop_is_inverse"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_byte_lemmas/bytes_to_scalar_lemmas.rs",
+      "lemmas": [
+        "lemma_byte_to_word_step",
+        "lemma_bytes_to_word_equivalence",
+        "lemma_words_to_scalar"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_byte_lemmas/scalar_to_bytes_lemmas.rs",
+      "lemmas": [
+        "lemma_as_bytes_52",
+        "lemma_byte_from_limb_shift_52",
+        "lemma_sum_equals_byte_nat_52",
+        "lemma_boundary_byte_combines_52",
+        "lemma_limb0_contribution_correctness_52",
+        "lemma_limb1_contribution_correctness_52",
+        "lemma_limb2_contribution_correctness_52",
+        "lemma_limb3_contribution_correctness_52",
+        "lemma_limb4_contribution_correctness_52"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_lemmas.rs",
+      "lemmas": [
+        "lemma_spec_mul_internal_commutative",
+        "lemma_square_internal_no_overflow",
+        "lemma_square_internal_correct",
+        "lemma_mul_internal_no_overflow",
+        "lemma_mul_internal_correct",
+        "lemma_nine_limbs_equals_slice128_as_nat",
+        "lemma_five_limbs_equals_to_nat",
+        "lemma_scalar_subtract_no_overflow",
+        "lemma_borrow_and_mask_bounded",
+        "lemma_carry_bounded_after_mask",
+        "lemma_add_loop_bounds",
+        "lemma_add_carry_and_sum_bounds",
+        "lemma_l_value_properties",
+        "lemma_from_montgomery_limbs_conversion",
+        "lemma_limbs_bounded_implies_prod_bounded",
+        "lemma_r_limbs_bounded",
+        "lemma_rr_limbs_bounded",
+        "lemma_l_limbs_bounded",
+        "lemma_limbs_bounded_implies_limbs_bounded_for_sub",
+        "lemma_cancel_mul_montgomery_mod",
+        "lemma_montgomery_inverse",
+        "lemma_montgomery_radix_nonzero_mod_group_order",
+        "lemma_r_equals_spec",
+        "lemma_rr_equals_spec",
+        "lemma_seq_u64_as_nat_subrange_extend",
+        "lemma_mod_cancel",
+        "lemma_bound_scalar",
+        "lemma_general_bound",
+        "lemma_decompose",
+        "lemma_sub_loop1_invariant",
+        "lemma_l_equals_group_order",
+        "lemma_pow252",
+        "lemma_pow2_260_greater_than_2_group_order",
+        "lemma_sub_correct_after_loops",
+        "lemma_add_l_loop_invariant",
+        "lemma_subrange5_eq_scalar52_as_nat",
+        "lemma_conditional_add_l_correct",
+        "lemma_sub_new_correct",
+        "lemma_add_loop_invariant",
+        "lemma_add_sum_simplify",
+        "lemma_group_order_bound",
+        "lemma_scalar52_lt_pow2_256_if_canonical",
+        "lemma_group_order_is_odd",
+        "lemma_cancel_coprime_factor",
+        "lemma_cancel_mul_R_mod_L",
+        "lemma_cancel_mul_L_mod_R",
+        "lemma_cancel_mul_pow2_mod",
+        "lemma_mul_factors_congruent_implies_products_congruent",
+        "lemma_group_order_smaller_than_pow256",
+        "lemma_r_bounded",
+        "lemma_is_canonical_correctness",
+        "lemma_square_multiply_step",
+        "lemma_canonical_bytes_high_bit_clear",
+        "lemma_zero_bounded",
+        "lemma_neg_sum_mod",
+        "lemma_negation_sums_to_zero",
+        "lemma_one_bounded",
+        "lemma_invert_correctness"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_lemmas_/montgomery_reduce_lemmas.rs",
+      "lemmas": [
+        "lemma_two_l_div_pow2_208_eq_pow2_45",
+        "lemma_u128_truncate_and_mask",
+        "lemma_carry_shift_to_nat",
+        "lemma_part1_sum_divisible_by_pow2_52",
+        "lemma_part1_correctness",
+        "lemma_part2_bounds",
+        "lemma_mul_internal_limbs_bounds",
+        "lemma_bounded_product_satisfies_input_bounds",
+        "lemma_canonical_product_satisfies_canonical_bound",
+        "lemma_identity_array_satisfies_input_bounds",
+        "lemma_identity_array_satisfies_canonical_bound",
+        "lemma_l_limb4_is_pow2_44",
+        "lemma_montgomery_reduce_pre_sub",
+        "lemma_carry8_bound",
+        "lemma_montgomery_reduce_post_sub",
+        "lemma_r4_bound_from_canonical"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_lemmas_/montgomery_reduce_part1_chain_lemmas.rs",
+      "lemmas": [
+        "lemma_poly_mul_5x5_decomposition",
+        "lemma_n_times_l_expansion",
+        "lemma_part1_telescoping_expansion",
+        "lemma_part1_chain_divisibility"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_lemmas_/montgomery_reduce_part2_chain_lemmas.rs",
+      "lemmas": [
+        "lemma_part2_carry_cancellation",
+        "lemma_part2_chain_quotient"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_lemmas_/naf_lemmas.rs",
+      "lemmas": [
+        "lemma_reconstruct_split",
+        "lemma_reconstruct_zero_extend",
+        "lemma_naf_even_step",
+        "lemma_naf_odd_step",
+        "lemma_naf_digit_bounds",
+        "lemma_naf_high_bits_zero",
+        "lemma_naf_window_no_overflow",
+        "lemma_naf_wrapping_sub_correct",
+        "lemma_naf_width_properties"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_lemmas_/radix16_lemmas.rs",
+      "lemmas": [
+        "lemma_carry_preserves_reconstruction",
+        "lemma_bytes32_to_radix16_nibbles",
+        "lemma_nibbles_equal_bytes_prefix",
+        "lemma_valid_radix_16_implies_all_bounded"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_lemmas_/radix_2w_lemmas.rs",
+      "lemmas": [
+        "lemma_u64x4_mod_strip_above",
+        "lemma_u64x4_lower_words_bounded",
+        "lemma_reconstruct_radix_2w_split",
+        "lemma_u64x4_bit_extraction",
+        "lemma_u64x4_single_word_decompose_generic",
+        "lemma_u64_shl_low_bits",
+        "lemma_u64x4_cross_word_reduce_to_two",
+        "lemma_u64x4_cross_word_decompose",
+        "lemma_u64x4_cross_word_extraction",
+        "lemma_w_digits_count_concrete",
+        "lemma_as_radix_2w_postconditions",
+        "lemma_digits_count_radix_bounds",
+        "lemma_last_iter_carry_zero",
+        "lemma_radix_2w_digit_bounds",
+        "lemma_radix_2w_loop_reconstruction_step"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_lemmas_extra.rs",
+      "lemmas": [
+        "lemma_word_contribution_decomposition",
+        "lemma_limb_from_adjacent_words",
+        "lemma_bytes_suffix_matches_word_partial",
+        "lemma_low_limbs_encode_low_expr",
+        "lemma_high_limbs_encode_high_expr",
+        "lemma_lo_limbs_bounded",
+        "lemma_hi_limbs_bounded",
+        "lemma_montgomery_reduce_cancels_r",
+        "lemma_high_low_recombine",
+        "lemma_montgomery_reduced_sum_congruent"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/scalar_montgomery_lemmas.rs",
+      "lemmas": [
+        "lemma_from_montgomery_is_product_with_one"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/lizard/jacobi_quartic.rs",
+      "lemmas": [
+        "lemma_elligator_inv_spec_anchor"
+      ],
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/lizard/lizard_ristretto.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/montgomery.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/ristretto.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/scalar.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/scalar_helpers.rs",
+      "lemmas": [
+        "lemma_u8_32_as_nat_zero",
+        "lemma_u8_32_as_nat_one",
+        "lemma_scalar_zero_properties",
+        "lemma_scalar_one_properties"
+      ],
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/specs/edwards_specs.rs",
+      "lemmas": [
+        "lemma_ed25519_basepoint_y",
+        "lemma_unfold_edwards",
+        "lemma_identity_affine_coords"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/specs/field_specs.rs",
+      "lemmas": [
+        "field_inv_property",
+        "lemma_inverse_unique_core",
+        "field_inv_unique",
+        "field_inv_zero",
+        "lemma_fermat_for_p"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/specs/field_specs_u64.rs",
+      "lemmas": [
+        "pow255_gt_19",
+        "p_gt_2",
+        "l51_bit_mask_lt"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/specs/iterator_specs.rs",
+      "lemmas": [
+        "lemma_sum_ristretto_edwards_equiv"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/specs/lizard_specs.rs",
+      "lemmas": [
+        "lemma_lizard_decode_sound",
+        "lemma_lizard_roundtrip",
+        "lemma_lizard_decode_ristretto_sound",
+        "lemma_lizard_roundtrip_ristretto",
+        "lemma_lizard_decode_ristretto_witness",
+        "lemma_lizard_decode_ristretto_none"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/specs/montgomery_specs.rs",
+      "lemmas": [
+        "lemma_x25519_basepoint_u_is_9"
+      ],
+      "proof_op": "none"
+    },
+    {
+      "path": "curve25519-dalek/src/traits.rs",
+      "proof_op": "strip-all"
+    },
+    {
+      "path": "curve25519-dalek/src/window.rs",
+      "proof_op": "strip-all"
+    }
+  ],
+  "depth": 2,
+  "experiment_mode": "field-floor",
+  "pin": "proof",
+  "target": "curve25519-dalek/src/ristretto.rs"
+}

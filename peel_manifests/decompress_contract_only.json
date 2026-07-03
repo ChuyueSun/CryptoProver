@@ -1,0 +1,25 @@
+{
+  "name": "decompress-contract-only",
+  "depth": 2,
+  "experiment_mode": "contract-only",
+  "pin": "proof",
+  "target": "curve25519-dalek/src/edwards.rs",
+  "files": [
+    {
+      "path": "curve25519-dalek/src/edwards.rs",
+      "proof_op": "strip",
+      "strip_proof_fns": [
+        "decompress"
+      ]
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/decompress_lemmas.rs",
+      "proof_op": "none",
+      "lemmas": [
+        "lemma_decompress_valid_branch",
+        "lemma_decompress_field_element_sign_bit",
+        "lemma_sign_bit_after_conditional_negate"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "decompress-proof-only",
+  "depth": 1,
+  "experiment_mode": "proof-only",
+  "pin": "proof",
+  "target": "curve25519-dalek/src/edwards.rs",
+  "files": [
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/decompress_lemmas.rs",
+      "proof_op": "admit"
+    }
+  ]
+}

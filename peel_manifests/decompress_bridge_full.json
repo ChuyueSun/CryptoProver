@@ -1,0 +1,31 @@
+{
+  "name": "decompress-bridge-full",
+  "depth": 2,
+  "experiment_mode": "bridge-full",
+  "pin": "proof",
+  "target": "curve25519-dalek/src/edwards.rs",
+  "files": [
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/decompress_lemmas.rs",
+      "proof_op": "none",
+      "lemmas": [
+        "lemma_decompress_valid_branch",
+        "lemma_to_edwards_correctness",
+        "lemma_decompress_field_element_sign_bit",
+        "lemma_decompress_spec_matches_point",
+        "lemma_sign_bit_after_conditional_negate"
+      ]
+    },
+    {
+      "path": "curve25519-dalek/src/lemmas/edwards_lemmas/curve_equation_lemmas.rs",
+      "proof_op": "none",
+      "lemmas": [
+        "lemma_negation_preserves_curve",
+        "lemma_affine_to_extended_valid",
+        "lemma_edwards_affine_when_z_is_one",
+        "lemma_x_zero_implies_y_squared_one",
+        "lemma_unique_x_with_parity"
+      ]
+    }
+  ]
+}

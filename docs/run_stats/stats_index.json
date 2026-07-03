@@ -1,0 +1,184 @@
+{
+  "gcp14": {
+    "label": "bare-metal clean (control)",
+    "dir_present": true,
+    "result": {
+      "end_reason": "LIMIT",
+      "success": false,
+      "rounds_used": 4,
+      "duration_seconds": 11132.043707,
+      "final_error_count": 23,
+      "final_hard_admits_remaining": 0,
+      "final_spec_drift_count": 0
+    },
+    "whole_crate": {
+      "final_strict_no_rlimit": 214,
+      "final_rlimit_gate": 203,
+      "strict_no_rlimit_series": [
+        2,
+        9,
+        2,
+        237,
+        237,
+        228,
+        214,
+        214
+      ],
+      "rlimit_gate_series": [
+        128,
+        238,
+        215,
+        203
+      ],
+      "transient_min_no_rlimit": 2,
+      "note": "low values in the series can be transient broken-compile states; use final/settled + the canonical result.json metrics, not min.",
+      "total_whole_crate_checks": 12
+    },
+    "usage": {
+      "input_tokens": 5670,
+      "output_tokens": 496942,
+      "cache_read_input_tokens": 56702823,
+      "cache_creation_input_tokens": 1528380,
+      "cost_usd": 53.3258,
+      "rounds_counted": 4,
+      "cost_complete": true
+    }
+  },
+  "ff_docker_resume_001": {
+    "label": "docker resume, seeded + tapped (BEST)",
+    "dir_present": true,
+    "result": {
+      "end_reason": "SIBLING_VERUS_FAIL",
+      "success": false,
+      "rounds_used": 1,
+      "duration_seconds": 5468.321862,
+      "final_error_count": 4,
+      "final_hard_admits_remaining": 66,
+      "final_spec_drift_count": 0
+    },
+    "whole_crate": {
+      "final_strict_no_rlimit": 2,
+      "final_rlimit_gate": 2,
+      "strict_no_rlimit_series": [
+        173,
+        171,
+        171,
+        171,
+        171,
+        67,
+        67,
+        67,
+        67,
+        67,
+        3,
+        3,
+        10,
+        10,
+        4,
+        4,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "rlimit_gate_series": [
+        2
+      ],
+      "transient_min_no_rlimit": 2,
+      "note": "low values in the series can be transient broken-compile states; use final/settled + the canonical result.json metrics, not min.",
+      "total_whole_crate_checks": 25
+    },
+    "usage": {
+      "input_tokens": 1293,
+      "output_tokens": 25189,
+      "cache_read_input_tokens": 76460908,
+      "cache_creation_input_tokens": 1364101,
+      "cost_usd": 0.0,
+      "rounds_counted": 1,
+      "cost_complete": false
+    }
+  },
+  "ff_docker_resume_002": {
+    "label": "docker resume continuation (seeded from run001)",
+    "dir_present": true,
+    "result": null,
+    "whole_crate": {
+      "final_strict_no_rlimit": null,
+      "final_rlimit_gate": null,
+      "strict_no_rlimit_series": [],
+      "rlimit_gate_series": [],
+      "transient_min_no_rlimit": null,
+      "note": "low values in the series can be transient broken-compile states; use final/settled + the canonical result.json metrics, not min.",
+      "total_whole_crate_checks": 0
+    },
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cost_usd": 0.0,
+      "rounds_counted": 0,
+      "cost_complete": true
+    }
+  },
+  "ff_docker_clean_001": {
+    "label": "docker clean (untapped, crashed/killed)",
+    "dir_present": true,
+    "result": null,
+    "whole_crate": {
+      "final_strict_no_rlimit": 127,
+      "final_rlimit_gate": null,
+      "strict_no_rlimit_series": [
+        127,
+        127,
+        127
+      ],
+      "rlimit_gate_series": [],
+      "transient_min_no_rlimit": 127,
+      "note": "low values in the series can be transient broken-compile states; use final/settled + the canonical result.json metrics, not min.",
+      "total_whole_crate_checks": 3
+    },
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cost_usd": 0.0,
+      "rounds_counted": 0,
+      "cost_complete": true
+    }
+  },
+  "ff_docker_resume_001_untapped": {
+    "label": "docker resume, 1st untapped (superseded)",
+    "dir_present": true,
+    "result": null,
+    "whole_crate": {
+      "final_strict_no_rlimit": null,
+      "final_rlimit_gate": null,
+      "strict_no_rlimit_series": [],
+      "rlimit_gate_series": [],
+      "transient_min_no_rlimit": null,
+      "note": "low values in the series can be transient broken-compile states; use final/settled + the canonical result.json metrics, not min.",
+      "total_whole_crate_checks": 0
+    },
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cost_usd": 0.0,
+      "rounds_counted": 0,
+      "cost_complete": true
+    }
+  },
+  "_tap_db_local_copy": {
+    "sessions": 8,
+    "records": 1185,
+    "record_blobs": 2387,
+    "proxy_logs": 2389
+  }
+}

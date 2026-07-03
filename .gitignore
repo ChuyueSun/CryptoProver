@@ -1,0 +1,42 @@
+# Runtime artifacts (regenerated per run)
+catalog_cache.json
+.query_expand_cache.json
+cli.log
+# Per-run output dirs under results/ (cumulative files like
+# failure_memory.json / proven_registry.json stay tracked).
+results/*/
+# ...except curated, path-scrubbed run write-ups shared for review.
+!results/corefloor_006/
+!results/peel_proof_001/
+!results/peel_contract_001/
+!results/peel_bridge_specs_001/
+!results/peel_bridge_full_001/
+!results/no_api_proof_repro/
+!results/peel_ladder/
+# launch.sh detached-run byproducts
+launcher_*.log
+launcher_*.pid
+# Sibling result dirs from layer / A-B / race runs (results-C, results-ab-*,
+# results-race-validate, …). The tracked cumulative dir is plain `results/`.
+results-*/
+# Stray run logs (race_*.log, validation logs, etc.)
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+*.code-workspace
+.idea/
+.vscode/
+
+# Claude Code skills symlink (local-only)
+.claude/
+
+# Local Claude Code wire captures (system prompt / tool defs / skills) — never commit
+wire_capture/
+
+# Shared agent coordination ledger (claude <-> codex) — coordination state, not source
