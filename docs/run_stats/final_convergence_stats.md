@@ -1,5 +1,12 @@
 # Field-floor convergence experiment — FINAL stats (closeout, 2026-06-29)
 
+> **Historical context.** This is the closeout of the *June 2026* field-floor
+> campaign era, which ended in non-convergence and motivated the ladder
+> methodology. The field-floor cut was subsequently **solved** in the July
+> Stage-3 certificate runs (096/097, whole-crate 0 errors, sealed COMPLETE) —
+> see `stage3_certificate_record.md` and `ladder_stage1_results.md`. This
+> record is retained as the failure baseline and gate-validation evidence.
+
 **Outcome: NON-CONVERGENCE (accepted by user as the experiment's result).**
 On the field-floor cut — reconstruct the *entire* above-field proof cone over
 `ristretto.rs` (~26 editable lemma/spec files) from a deleted/admitted starting

@@ -1,4 +1,4 @@
-# Stage-3 certificate run — proof-shape evolution log (LIVING DOC)
+# Stage-3 certificate run — proof-shape evolution log (final)
 
 > Tracks how the agent's proof architecture **emerges over time** in the
 > field-floor certificate run (`field_floor_stage3_096_480_fable`, H0,
@@ -6,7 +6,7 @@
 > the paper's evolution narrative. Sources: `claude_raw/round_N.jsonl` (full
 > edit history + agent narration), `cli.log` (verifier timeline), the
 > AGENT_DEBATE.md ledger (codex's raw-stream watch), span-aware admit
-> inventories. Updated at milestones; final retrospective at seal.
+> inventories. Maintained live during the campaign; now final (sealed 2026-07-03).
 > Mining methodology caveat: "lemma redefined Nx" counts any Edit/Write whose
 > new content contains the definition — whole-file rewrites inflate it;
 > semantic revisions are confirmed by contract-text diff or narration.

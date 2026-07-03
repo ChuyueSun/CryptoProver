@@ -1,5 +1,8 @@
 # Field-floor run stats (session 2026-06-28)
 
+> **Historical context.** June 2026 campaign era (non-convergent; superseded
+> by the July Stage-3 certificate — see `stage3_certificate_record.md`).
+
 Experiment: Verus proof reconstruction of the curve25519-dalek field-floor cut
 (target `ristretto.rs`, reconstruct the whole above-field proof cone, ~26 editable
 files). Scored by **whole-crate verus errors → 0 AND non-axiom admits → 0**.
