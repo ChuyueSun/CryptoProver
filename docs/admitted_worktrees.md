@@ -4,7 +4,7 @@ A run wants the target in its **admitted starting state** — `proof fn`
 bodies replaced by `admit()`, with `spec fn` defs, exec code, and
 `axiom_*` left intact — inside an isolated checkout so the run never
 dirties your main tree. The dalek-lite benchmark repo ships that state pre-built at the
-**`eval/admitted-start`** ref; this repo's [`admit.py`](admit.py) is the
+**`eval/admitted-start`** ref; this repo's [`admit.py`](../admit.py) is the
 single-file tool that recreates it: `admit.py --worktree` does the checkout,
 and its body pass (also `launch.sh --admit`) performs the admission.
 
