@@ -16,8 +16,9 @@ Two harness versions exist:
   the **peel** init-state builder (graded cuts along a depth × span design),
   and whole-crate gating. This version ran the paper's deepest cut — the
   **field-floor certificate** below.
-- **`cryptoprover-core`** — the slim companion harness (proof bodies only,
-  under fixed specifications), which ran the paper's **coverage cut**.
+- **[`CryptoProver-core`](https://github.com/ChuyueSun/CryptoProver-core)** —
+  the slim companion harness (proof bodies only, under fixed specifications),
+  which ran the paper's **coverage cut**.
 
 > This repository is a cleaned public snapshot of the research tree. Run
 > artifacts and internal working notes are not included; the campaign statistics
@@ -53,7 +54,7 @@ agent closed 1,430 of 1,433 non-axiom proof obligations (3 gaps left, all
 shared with the human reference) and re-verified the whole crate, with zero
 fabricated axioms and no active-gate firings. Those numbers are
 paper-sourced; that run's harness and records live in the companion
-`cryptoprover-core` repository.
+[`CryptoProver-core`](https://github.com/ChuyueSun/CryptoProver-core) repository.
 
 ## How it works
 
@@ -122,6 +123,14 @@ the whole cone — `peel_manifests/decompress_proof_only.json` (P1),
 `decompress_bridge_full.json` are ready-made; `peel_manifests/README.md` maps
 each to its experiment mode and soundness pin.
 
+**Containerized runs.** [docker/](docker/README.md) ships an immutable image
+(pinned Rust + Verus + Z3 + the harness, baked-warm cargo caches) and a
+launcher (`docker/run_agents.sh`) for isolated one-container-per-target
+sweeps — sealed worktree per agent, shared CPU pool, `--tap` tracing and
+`--seed-wip` resume options. Image build, sealing, and a full single-container
+proof round are smoke-tested; a full parallel multi-container sweep has not
+been run yet. See [docker/README.md](docker/README.md).
+
 Documentation map:
 - `docs/mvp_spec.md` — the core proof-agent design and rationale
 - `docs/extension_spec.md` — deferred features and their triggers
@@ -141,6 +150,7 @@ cryptoprover/
 ├── peel_run.sh         # one command: manifest → peeled worktree → run.py
 ├── peel_manifests/     # the cuts (field_floor.json, decompress_*.json, …)
 ├── admit.py            # admit() skeleton builder + isolated worktrees
+├── docker/             # containerized parallel sweeps (see docker/README.md)
 ├── strip_specs.py      # spec/lemma strip verbs used by peel
 ├── prompt.md           # the task prompt (template)
 ├── docs/
