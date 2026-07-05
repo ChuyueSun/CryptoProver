@@ -40,3 +40,5 @@ __pycache__/
 wire_capture/
 
 # Shared agent coordination ledger (claude <-> codex) — coordination state, not source
+AGENT_DEBATE.md
+AGENT_DEBATE_ARCHIVE*.md

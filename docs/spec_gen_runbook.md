@@ -45,7 +45,7 @@ command -v python3 cargo-verus claude          # all three must resolve
 The spawned `claude -p` does **not** inherit the desktop app's login. Provide one of:
 
 ```bash
-export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-…  # `claude setup-token` to mint one
+export CLAUDE_CODE_OAUTH_TOKEN=<claude-oauth-token>  # `claude setup-token` to mint one
 # …or do a keychain `claude` → /login once; the headless process picks it up.
 ```
 

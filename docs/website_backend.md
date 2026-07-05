@@ -198,7 +198,7 @@ DALEK_DEMO_TOKEN_FILE=/path/to/token \
 # stdout → RUN_ID / RESULTS / MODE / LOG / PID ; exit 0 = launched
 ```
 - Auth: set `CLAUDE_CODE_OAUTH_TOKEN` or point `DALEK_DEMO_TOKEN_FILE` at a file
-  holding the `sk-ant-oat01-…` token (never inline it).
+  holding the `<claude-oauth-token>` value (never inline it).
 - Give it more headroom than the easier rungs: `--rounds 5 --budget 60`.
 
 **Starting state the user sees** (great for the "before" pane): open

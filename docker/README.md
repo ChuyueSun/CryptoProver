@@ -8,8 +8,7 @@ all agents share one CPU pool. Design rationale recorded in internal review thre
 > launcher plumbing + a real single-container `run.py` proof round all run. (The
 > sample proof task itself ended `PROCESS_CROSSTALK` — the agent backgrounded a
 > verifier, a harness gate, not a Docker issue.) A full *parallel* multi-container
-> sweep hasn't been run yet. Doc TODO: `run_agents.sh`'s `--tap` / `--seed-wip` flags
-> need a README section (see the script header for now).
+> sweep hasn't been run yet.
 
 ## The two requirements, and how they map
 
@@ -43,7 +42,7 @@ this (matches `_is_sealed_worktree`, run.py:1181-1198, and the `git fsck
 - **`Dockerfile`** — immutable image: pinned rust+verus+z3, python, claude CLI,
   read-only harness at `/opt/harness`, and **baked-warm** `CARGO_HOME` +
   `CARGO_TARGET_DIR`. Never overwrite the harness on a live container
-  (memory:no-midrun-harness-hot-deploy → TOOLING_DRIFT); rebuild the image.
+  (that would trip `TOOLING_DRIFT`); rebuild the image.
 - **`install-verus.sh`** — Verus provisioning hook (point at the **same** build the
   VM uses so bake-time fingerprints == run-time; keeps the warm caches valid).
 - **`seal_into_volume.sh`** — peeled worktree → isolated-store sealed `/work` volume.
@@ -103,6 +102,23 @@ launcher merges each agent's `result.json` into a host-side `_sweep_ledger.json`
 exit 42 → the launcher halts the sweep (re-run with `--skip-existing` once the
 window reopens).
 
+## Tap and seed options
+
+- **`--tap`** routes each container's `claude` through a per-agent host-side
+  `claude-tap` proxy for inspectable traces and a live dashboard. It is
+  best-effort: if the proxy cannot start or the Docker bridge is unavailable,
+  the agent runs without tap. Use **`--require-tap`** when missing traces should
+  fail the agent instead.
+- **`--seed-wip <patch>`** applies a guarded WIP diff after peel and before seal,
+  limited to the manifest's editable files. Use a distinct `--run-id` and
+  `--work-base` for resumed seeded sweeps so their host ledger cannot collide
+  with a clean run.
+- **`--failure-memory-seed <failure_memory.json>`** copies prior retry guidance
+  into each agent's private `/results` before prompt rendering.
+- **`--operator-seed <patch>`** applies operator-owned scaffolding as part of the
+  sealed baseline. It may touch frozen files, so treat those runs as diagnostic
+  or non-scoreable unless the seed provenance is explicitly part of the claim.
+
 ## Quickstart
 
 ```bash
@@ -127,7 +143,7 @@ docker run --rm --init -e CARGO_NET_OFFLINE=true -e CARGO_HOME=/opt/cargo-home \
     dalek-harness:v1 bash /opt/harness/docker/preflight.sh /work/curve25519-dalek
 
 # 3. fan out the sweep (CPU shared, worktrees isolated)
-export CLAUDE_CODE_OAUTH_TOKEN=...      # memory:run-claude-auth
+export CLAUDE_CODE_OAUTH_TOKEN=...      # or use an authenticated keychain login
 docker/run_agents.sh --image dalek-harness:v1 \
     --gitroot /path/to/dalek-lite --ref eval/admitted-start \
     --run-id sweep_001 --manifests-file /tmp/manifests.txt

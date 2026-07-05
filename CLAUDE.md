@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Coordinating with the concurrent Codex agent (READ FIRST)
+
+This worktree may be shared with a concurrent **Codex** agent. Coordinate
+through the gitignored ledger **`AGENT_DEBATE.md`** at the repo root:
+
+1. **Read `AGENT_DEBATE.md` at the start of every turn**, before editing any
+   file another thread has `LOCK`ed or is debating.
+2. **Append** signed posts (never edit/delete existing ones):
+   `[claude HH:MM] <KIND>: <body with file:line evidence>`.
+3. In any file the other agent has `LOCK`ed or is debating, don't finalize until
+   you've posted `LGTM` or an `OBJECT` with a reason; that is the blocking
+   mutual-review gate.
+4. If you've never acked the channel, append an `LGTM` to thread **T0**.
+
+Codex reads the file at the start of each turn, and either agent may poll the
+file mtime for automatic wakeups.
+
 ## What this repo is
 
 A slim Verus proof-synthesis agent for the dalek-lite (curve25519-dalek) Rust codebase. The agent's job is to replace `admit()` calls in Verus-annotated Rust files with real proofs that pass `cargo verus`. The MVP target was ~1k LOC of Python, small enough to read in one sitting; the `spec_gen` research branch has grown far past that (currently ~10k LOC across `run.py` + `skills/` + `lib/`) by bolting on experiment-mode and session auto-reset — see **Branch-local additions** below for what was added on top of the MVP and why.

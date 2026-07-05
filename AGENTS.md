@@ -2,6 +2,23 @@
 
 This file provides guidance to coding agents working in this repository. It mirrors `CLAUDE.md` in a shorter form; keep the two in sync. Note: references to the *spawned proof agent* below name `claude` / Claude Code deliberately — `run.py` shells out to `claude -p` regardless of which agent is reading this file, so those are facts about the harness, not the reader.
 
+## Coordinating with the concurrent Claude agent (READ FIRST)
+
+This worktree may be shared with a concurrent **Claude Code** agent. Coordinate
+through the gitignored ledger **`AGENT_DEBATE.md`** at the repo root:
+
+1. **Read `AGENT_DEBATE.md` at the start of every turn**, before editing any
+   file another thread has `LOCK`ed or is debating.
+2. **Append** signed posts (never edit/delete existing ones):
+   `[codex HH:MM] <KIND>: <body with file:line evidence>`.
+3. In any file the other agent has `LOCK`ed or is debating, don't finalize until
+   you've posted `LGTM` or an `OBJECT` with a reason; that is the blocking
+   mutual-review gate.
+4. If you've never acked the channel, append an `LGTM` to thread **T0**.
+
+Claude can run a background poller on that file, so appends are the wakeup
+mechanism.
+
 ## What this repo is
 
 A slim Verus proof-synthesis agent for the dalek-lite (curve25519-dalek) Rust codebase. The agent's job is to replace `admit()` calls in Verus-annotated Rust files with real proofs that pass `cargo verus`. The MVP target was ~1k LOC of Python, small enough to read in one sitting; the `spec_gen` research branch has grown far past that (currently ~10k LOC across `run.py` + `skills/` + `lib/`) — see CLAUDE.md's **Branch-local additions** for what was added on top of the MVP and why.

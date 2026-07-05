@@ -7,10 +7,9 @@ Agentic Verus proof- and spec-synthesis harness for the dalek-lite
 init-state builder that generates graded proof-reconstruction tasks up to
 the full **field-floor** cut evaluated in the paper.
 
-> This repository is a cleaned public snapshot of the research tree
-> (single-commit history). Run artifacts and internal working notes are
-> not included; the campaign statistics backing the paper live in
-> `docs/run_stats/`.
+> This repository is a cleaned public snapshot of the research tree. Run
+> artifacts and internal working notes are not included; the campaign statistics
+> backing the paper live in `docs/run_stats/`.
 
 Start here:
 - `docs/mvp_spec.md` — the core proof-agent design and rationale
@@ -23,7 +22,7 @@ Start here:
 
 ```
 cryptoprover/
-├── run.py              # the driver — ~250 LOC (one target per invocation)
+├── run.py              # the driver — one target per invocation
 ├── run_layer.py        # iterate one of layer-sets A/B/C/D sequentially
 ├── launch.sh           # arbitrary target lists + Claude-Code-safe --detach
 ├── prompt.md           # the task prompt (template)
@@ -38,10 +37,11 @@ cryptoprover/
     ├── SKILL.md
     ├── verus_check.py
     ├── spec_check.py
-    ├── name_validate.py
+    ├── admit_inventory.py
     ├── search_semantic.py
     ├── search_module.py
     ├── search_macro.py
+    ├── check_false_contract.py
     └── search_proven.py
 ```
 
@@ -58,13 +58,14 @@ Claude Code auto-discovers skills under `.claude/skills/`. Symlink this
 project's `skills/` there:
 
 ```bash
-cd /path/to/dalek-lite-mvp
+cd /path/to/CryptoProver
 mkdir -p .claude/skills
 ln -sfn "$(pwd)/skills" ".claude/skills/dalek-lite-mvp"
 ```
 
 Verify by running `claude` in this directory and typing `/skills`. You
-should see `dalek-lite-mvp` listed.
+should see `dalek-lite-mvp` listed. The skill keeps that historical name
+because the harness targets dalek-lite.
 
 ## Running it
 
@@ -315,9 +316,10 @@ add them on speculation.
   the project.
 - **"verus: command not found"**: Verus isn't installed or `cargo verus`
   isn't a cargo subcommand in your environment.
-- **Agent keeps hallucinating lemma names**: ask it in the prompt to run
-  `name_validate` before declaring COMPLETE. Check `cli.log` for which
-  search skills it actually used.
+- **Agent keeps hallucinating lemma names**: nudge it to use
+  `search_semantic.py`, `search_module.py`, and `search_macro.py`, then inspect
+  the returned signatures before editing. Check `cli.log` for which search
+  skills it actually used.
 - **Spec drift fires every round**: the prompt isn't strict enough about
   "don't touch specs" — emphasize rule #1 more; or this is the trigger
   to add the E5 full tracker with auto-restore.
