@@ -11,6 +11,29 @@ the full **field-floor** cut evaluated in the paper.
 > artifacts and internal working notes are not included; the campaign statistics
 > backing the paper live in `docs/run_stats/`.
 
+## Headline result
+
+From the canonical run record ([docs/run_stats/stage3_certificate_record.md](docs/run_stats/stage3_certificate_record.md)):
+
+> Given only the user-facing API contracts, frozen specifications, a trusted
+> arithmetic floor, and the measured pin set (124 frozen call sites + file
+> skeleton + declared priors), a claude-fable-5 agent under this harness
+> (`a56f284`) reconstructed the entire deleted proof cone of the dalek-lite
+> **field-floor cut** — +11,024/−22,753 lines over the 26 editable files
+> (48.5% of the ground truth's proof mass), 196 lemmas vs GT's 235 — to
+> **whole-crate 0 errors** at default SMT limits, in 11.4 agent-hours across
+> two pre-registered attempts, with zero integrity violations, verified
+> independently on two machines (2,031 declarations verified).
+
+The cut deletes all 22 lemma homes (235 lemmas: signature + contract + body)
+and proof-strips all 4 API files (100 inline proof blocks) from a proven tip;
+everything outside those 26 files is frozen. An earlier June-2026 campaign on
+the same cut did not converge — that record ships too
+([docs/run_stats/final_convergence_stats.md](docs/run_stats/final_convergence_stats.md))
+as the failure baseline that motivated the staged methodology. The full
+verification battery (independent two-machine re-verify, exec-immutability
+audit, axiom/admit inventories, rlimit stratification) is in the record.
+
 Start here:
 - `docs/mvp_spec.md` — the core proof-agent design and rationale
 - `docs/extension_spec.md` — deferred features and their triggers
