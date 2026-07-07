@@ -48,18 +48,35 @@ as the failure baseline that motivated the staged methodology. The full
 verification battery (independent two-machine re-verify, exec-immutability
 audit, axiom/admit inventories, rlimit stratification) is in the record.
 
-**Cross-model replication.** A second, independent arm on the identical cut
-— `claude-opus-4-8` under the same harness and gates, H0/unassisted —
-also converged to **whole-crate 0 errors** (2,114 declarations verified;
-harness-sealed COMPLETE plus a fresh-container re-verify), taking 9
-seed-chained attempts / 62.3 agent-hours vs fable-5's 2 attempts / 11.4 h.
-Both arms hit the same hardest obligation (the ristretto batch-compress
-loop) and independently rediscovered the ground truth's resolution —
-fine-grained lemma decomposition over SMT-budget raises. Full record with
-per-attempt table, integrity batteries, and disclosures:
-([docs/run_stats/stage3_opus48_arm_record.md](docs/run_stats/stage3_opus48_arm_record.md)).
+**2. Cross-model replication (opus-4.8, same cut).** From the arm record
+([docs/run_stats/stage3_opus48_arm_record.md](docs/run_stats/stage3_opus48_arm_record.md)):
 
-**2. The coverage cut (companion harness).** With every specification kept
+> Under the identical field-floor cut, the same harness and gates, and the
+> same H0/unassisted protocol, a `claude-opus-4-8` agent reconstructed the
+> same deleted proof cone to **whole-crate 0 errors** at default SMT limits
+> (2,114 declarations verified; harness-sealed COMPLETE plus an independent
+> fresh-container re-verify), in 9 seed-chained attempts / 62.3 agent-hours
+> (fable-5: 2 attempts / 11.4 h), adding ≈15.8k lines of specification-
+> and-proof text (patch-sum) across the 26 editable files.
+
+The arm's error frontier ran 202 → 177 → 58 → 20 → … → 2 → 0 across the
+seed chain, and its endgame is the paper's sharpest hardness datum: after
+round 13 of the final attempt, **zero logical verification failures
+remained crate-wide** — the entire residual was one SMT resource-limit
+diagnostic on the ristretto batch-compress `while` loop, the *same*
+hardest obligation the fable-5 arm faced. Budget raises alone did not close
+the wall (monolithic attempts and rlimit probes from 80 through the final
+compress raise to 1000 all left it standing); the record logs five
+decompose-beats-budget pivots to fine-grained lemma decomposition, the
+last hoisting all algebra into a single loop-step composition lemma so
+the loop body verifies with one cheap call per iteration — independently
+rediscovering the ground truth's own proof engineering. The record ships the full per-attempt table,
+integrity batteries, rlimit-footprint disclosure, an in-arm confabulation
+incident caught by the counter discipline, and the two dual-reviewed
+mid-arm harness fixes; evidence is archived with self-verifying
+checksums (`SHA256SUMS` + manifest, tarball sha256 `908b6527…`).
+
+**3. The coverage cut (companion harness).** With every specification kept
 and every proof body stripped crate-wide, the accompanying paper reports the
 agent closed 1,430 of 1,433 non-axiom proof obligations (3 gaps left, all
 shared with the human reference) and re-verified the whole crate, with zero
@@ -113,6 +130,9 @@ Inspect first — the shipping records are the claim:
 - [docs/run_stats/stage3_certificate_record.md](docs/run_stats/stage3_certificate_record.md)
   — the certificate: cut, measured pins, sterility evidence, both attempts,
   the verification battery, and the result statement quoted above.
+- [docs/run_stats/stage3_opus48_arm_record.md](docs/run_stats/stage3_opus48_arm_record.md)
+  — the opus-4.8 replication arm: nine-attempt table, endgame trace,
+  certificate battery, disclosures, and the fable-5 comparison.
 - [docs/run_stats/](docs/run_stats/) — the surrounding campaign records,
   including the June non-convergence baseline that motivated the staged
   methodology.
