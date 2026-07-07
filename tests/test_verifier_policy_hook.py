@@ -86,7 +86,33 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
         ("raw rg admit count", "Bash",
          {"command": "rg -c 'admit\\(\\)' /work/curve25519-dalek/src -g '*.rs'"},
          True),
+        # --- stage3 A6 r16 loophole: stdout redirect to NON-/tmp file ---
+        ("a6r16 whole-crate stdout -> /work/wc.json", "Bash",
+         {"command": "python3 /opt/harness/skills/verus_check.py "
+                     "/work/curve25519-dalek/src/ristretto.rs "
+                     "--project /work/curve25519-dalek --whole-crate > /work/wc.json"},
+         True),
+        ("verifier stdout append -> /work log", "Bash",
+         {"command": "python3 verus_check.py x --project /p >> /work/wc.log"}, True),
+        ("verifier both streams -> file (&>)", "Bash",
+         {"command": "python3 verus_check.py x --project /p &> /work/all.txt"}, True),
+        ("spec_check stdout -> cwd file", "Bash",
+         {"command": "python3 /opt/harness/skills/spec_check.py verify x "
+                     "--against snap.json > out.json"}, True),
+        # explicit fd-1 stdout forms (codex 02:37 objection: 1> bypassed bare->)
+        ("verifier explicit 1> no space", "Bash",
+         {"command": "python3 verus_check.py x --project /p 1>/work/wc.json"}, True),
+        ("verifier explicit 1> with space", "Bash",
+         {"command": "python3 verus_check.py x --project /p 1> /work/wc.json"}, True),
+        ("verifier explicit 1>> append", "Bash",
+         {"command": "python3 verus_check.py x --project /p 1>> /work/wc.log"}, True),
         # --- legitimate, must be ALLOWED ---
+        ("verifier stdout -> /dev/null", "Bash",
+         {"command": "python3 verus_check.py x --project /p > /dev/null"}, False),
+        ("verifier stderr-only -> /work file", "Bash",
+         {"command": "python3 verus_check.py x --project /p 2> /work/err.log"}, False),
+        ("non-verifier redirect untouched", "Bash",
+         {"command": "echo hi > /work/x.json"}, False),
         ("fg verus_check with --timeout", "Bash",
          {"command": "python3 skills/verus_check.py ristretto --project /p --timeout 400"}, False),
         ("fg verus_check module", "Bash",

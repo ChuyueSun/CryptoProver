@@ -77,6 +77,10 @@ class RoundResult:
     diagnostic_kind_counts: dict = field(default_factory=dict)
     has_build_wrapper: bool = False
     compile_blocked_or_indeterminate: bool = False
+    # True when the gate verus_check exited without Verus' final
+    # "verification results" summary (internal panic / build abort / kill):
+    # every count above is then a lower bound, not the frontier.
+    truncated: bool = False
     verus_errors: list[dict] = field(default_factory=list)
     spec_drift: list[dict] = field(default_factory=list)
     claude_usage: dict = field(default_factory=dict)

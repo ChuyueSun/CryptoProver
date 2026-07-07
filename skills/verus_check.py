@@ -109,6 +109,50 @@ def parse_verification_summary(stdout: str, stderr: str) -> dict:
     }
 
 
+def assess_truncation(raw_summary: dict, returncode: int,
+                      error_messages: list) -> tuple[bool, list[dict]]:
+    """Detect a verifier run that died before reporting completion.
+
+    Verus prints "verification results:: N verified, M errors" exactly once
+    per completed run; when that line is absent the run aborted
+    mid-verification (internal worker panic, build failure, crash) and every
+    error parsed from it is a LOWER BOUND, not the remaining frontier.
+    Observed live: a vir/src/poly.rs worker panic truncated whole-crate runs
+    for ~40 rounds across three attempts while the parsed queue said "only 1
+    error remains" (field_floor stage3, 2026-07-04).
+
+    Returns (truncated, extra_messages). extra_messages carries a labeled
+    note for the agent/feedback path — and, when the dead run would otherwise
+    look green (rc==0, zero errors), a fail-closed error so a run that never
+    reported completing can never read as verified.
+    """
+    truncated = raw_summary.get("verified_count") is None
+    if not truncated:
+        return False, []
+    extra: list[dict] = []
+    has_real_error = any(
+        isinstance(m, dict) and m.get("severity") == "error"
+        for m in error_messages
+    )
+    if returncode == 0 and not has_real_error:
+        extra.append({
+            "file": "", "line": 0, "column": 0, "severity": "error",
+            "data": ("[verus_check] verifier exited 0 but never printed its "
+                     "'verification results' summary — treating as NOT "
+                     "verified (fail closed)."),
+        })
+    extra.append({
+        "file": "", "line": 0, "column": 0, "severity": "note",
+        "data": ("[verus_check] TRUNCATED RUN: the verifier exited without "
+                 "its final 'verification results' summary (internal panic "
+                 "or build failure). The error list above is PARTIAL — a "
+                 "lower bound, not the remaining frontier. Do NOT conclude "
+                 "'only these remain'; re-check each editable file with a "
+                 "module-scoped verus_check."),
+    })
+    return True, extra
+
+
 def extract_verus_panic_messages(stderr: str) -> list[dict]:
     """Promote Verus interpreter-panic spans from stderr into structured errors.
 
@@ -248,6 +292,7 @@ def with_errors_alias(result: dict) -> dict:
     """Expose structured diagnostics plus text aliases for legacy consumers."""
     result.setdefault("verified_count", None)
     result.setdefault("raw_verus_error_count", None)
+    result.setdefault("truncated", False)
     result.setdefault("num_errors", result.get("error_count"))
     result.setdefault("num_verified", result.get("verified_count"))
     messages = result.get("messages", [])
@@ -342,6 +387,8 @@ def run(target: Path, project_root: Path, module: str | None, timeout: int,
             "warning_count": 0,
             "failed_declarations": [],
             "returncode": -9,
+            # A killed run never reported completing; its counts are partial.
+            "truncated": True,
             "stderr_tail": "",
         })
 
@@ -384,8 +431,19 @@ def run(target: Path, project_root: Path, module: str | None, timeout: int,
                      "crate::lemmas::common_lemmas::mul_lemmas). Avoid "
                      "`broadcast use` here. See docs/diagnostics.md §3."),
         }]
+    # Truncation policy: a run with no final Verus summary never reported
+    # completing — flag it so run.py holds it indeterminate (like a timeout)
+    # instead of scoring its partial error list as the frontier, and fail
+    # closed if it would otherwise look green.
+    truncated, truncation_msgs = assess_truncation(
+        raw_summary, proc.returncode, errors)
+    if truncation_msgs:
+        errors = errors + truncation_msgs
+        has_error = has_error or any(
+            m.get("severity") == "error" for m in truncation_msgs)
     return with_errors_alias({
         "okay": not has_error,
+        "truncated": truncated,
         "error_count": sum(1 for m in errors if m.get("severity") == "error"),
         # Grouped, COMPLETE error view — read this (or `messages`), not a
         # truncated `cargo verus | grep | head`.

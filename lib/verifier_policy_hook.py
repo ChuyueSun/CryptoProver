@@ -51,6 +51,14 @@ _CARGO_GREP = re.compile(r"cargo(?:-|\s+)verus\b.*\|\s*(?:grep|head)\b")
 _MERGED_STDERR_JSON = re.compile(
     r"(?:2\s*>\s*&\s*1|\|&)[\s\S]*json\s*\.\s*load"
 )
+# Verifier/skill stdout redirected to ANY file, not just shared /tmp: a
+# pollable on-disk artifact reintroduces exactly what the policy text forbids
+# (backgrounded verifier + file-polling + parse-when-ready), as observed live
+# in stage3 A6 r16 where blocking only /tmp pushed the same pattern to
+# /work/wc.json. Allows stderr-only redirects (2>), /dev/null, and >&2.
+_STDOUT_FILE_REDIRECT = re.compile(
+    r"(?:&>>?|(?<![\w&])1>{1,2}(?!&)|(?<![0-9&])>{1,2}(?!&))\s*(?!/dev/null\b)\S+"
+)
 _HARNESS_SKILL = re.compile(
     r"\b(?:verus_check|spec_check|admit_inventory|search_semantic|search_module|"
     r"search_macro|search_proven)\.py\b"
@@ -174,6 +182,9 @@ def evaluate(tool_name, tool_input):
         reasons.append("verifier output to shared /tmp/*.{json,out,log,err}")
     if (is_verifier or is_harness_skill) and _MERGED_STDERR_JSON.search(cmd):
         reasons.append("merged stderr into harness-skill JSON parser")
+    if (is_verifier or is_harness_skill) and _STDOUT_FILE_REDIRECT.search(cmd):
+        reasons.append(
+            "verifier/skill stdout redirected to a file (read JSON stdout directly)")
     if is_verifier and _VERIFIER_OUTPUT_SLICE.search(cmd):
         reasons.append("verifier output piped through head/tail/grep")
     if _is_raw_admit_count(cmd):

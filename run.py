@@ -2242,6 +2242,13 @@ def _compile_blocked_or_indeterminate(verus_result: dict) -> bool:
     """
     if verus_result.get("okay", False):
         return False
+    # A truncated run (verifier died before its final summary — e.g. the
+    # vir/src/poly.rs worker panic) has a PARTIAL error list; scoring it as
+    # the frontier manufactured a false "only 1 remains" plateau for ~40
+    # rounds (field_floor stage3, 2026-07-04). Hold it indeterminate, same
+    # as a timeout.
+    if verus_result.get("truncated", False):
+        return True
     counts = _diagnostic_kind_counts(verus_result)
     if counts.get("compile", 0) or counts.get("missing-module", 0):
         return True
@@ -2259,7 +2266,12 @@ def _plateau_metric_indeterminate(
         experiment_mode in _WHOLE_CRATE_MODES
         and admits_left == 0
         and not verus_result.get("okay", False)
-        and _verification_error_count(verus_result) == 0
+        and (
+            _verification_error_count(verus_result) == 0
+            # Truncated runs DO carry source-span errors, but the count is a
+            # lower bound of an aborted sweep — not a plateau measurement.
+            or verus_result.get("truncated", False)
+        )
     )
 
 
@@ -2386,6 +2398,7 @@ def build_failure_queue_block(
     work_files: Optional[list[Path]] = None,
     max_source: int = 12,
     max_meta: int = 6,
+    truncated: bool = False,
 ) -> str:
     """Group stored Verus diagnostics into the queue the next agent should work.
 
@@ -2453,6 +2466,15 @@ def build_failure_queue_block(
 
     out = [
         "### Whole-crate failure queue",
+    ]
+    if truncated:
+        out.append(
+            "WARNING: the gate run was TRUNCATED — the verifier aborted before "
+            "printing its final summary, so this queue is PARTIAL (a lower "
+            "bound, NOT the full frontier). Re-check each editable file with a "
+            "module-scoped verus_check before concluding what remains."
+        )
+    out += [
         "Gate scope, not target-local scope. Work the source-span verification "
         "errors first; fix build/meta diagnostics as blockers, but do not treat "
         "a timeout/build wrapper as one remaining proof obligation.",
@@ -2566,10 +2588,12 @@ def build_round_history_block(
         verus_errors: list[str] = []
         raw_verus_messages: list = []
         end_reason = None
+        gate_truncated = False
         try:
             rr = json.loads(round_json.read_text())
             verus_okay = rr.get("verus_okay")
             end_reason = rr.get("end_reason")
+            gate_truncated = bool(rr.get("truncated", False))
             # verus_check stores each diagnostic under "data" (not "message")
             # with file/line/column — render "file:line:col: data" so the agent
             # actually SEES the error. The old m.get("message") always returned
@@ -2650,7 +2674,8 @@ def build_round_history_block(
 
         failure_queue = ""
         if work_files:
-            failure_queue = build_failure_queue_block(raw_verus_messages, work_files)
+            failure_queue = build_failure_queue_block(
+                raw_verus_messages, work_files, truncated=gate_truncated)
 
         # Render section. If file_diffs is empty AFTER filtering AND
         # there were edits originally, note that. Otherwise standard
@@ -5488,6 +5513,7 @@ def run_task(
             compile_blocked_or_indeterminate=(
                 _compile_blocked_or_indeterminate(verus_result)
             ),
+            truncated=bool(verus_result.get("truncated", False)),
             # Diversify across files (not first-20) so a whole-crate check whose
             # first 20 errors are all one module doesn't drop every other
             # module's diagnostics — the corefloor_006 truncation bug.
