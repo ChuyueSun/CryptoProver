@@ -48,6 +48,17 @@ as the failure baseline that motivated the staged methodology. The full
 verification battery (independent two-machine re-verify, exec-immutability
 audit, axiom/admit inventories, rlimit stratification) is in the record.
 
+**Cross-model replication.** A second, independent arm on the identical cut
+— `claude-opus-4-8` under the same harness and gates, H0/unassisted —
+also converged to **whole-crate 0 errors** (2,114 declarations verified;
+harness-sealed COMPLETE plus a fresh-container re-verify), taking 9
+seed-chained attempts / 62.3 agent-hours vs fable-5's 2 attempts / 11.4 h.
+Both arms hit the same hardest obligation (the ristretto batch-compress
+loop) and independently rediscovered the ground truth's resolution —
+fine-grained lemma decomposition over SMT-budget raises. Full record with
+per-attempt table, integrity batteries, and disclosures:
+([docs/run_stats/stage3_opus48_arm_record.md](docs/run_stats/stage3_opus48_arm_record.md)).
+
 **2. The coverage cut (companion harness).** With every specification kept
 and every proof body stripped crate-wide, the accompanying paper reports the
 agent closed 1,430 of 1,433 non-axiom proof obligations (3 gaps left, all
