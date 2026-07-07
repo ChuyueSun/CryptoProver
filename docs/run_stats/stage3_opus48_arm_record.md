@@ -218,10 +218,12 @@ where solver cost meets invented decomposition").
    "decompose-beats-budget" rediscovery claim in this record is scoped to
    the *specific* decompositions invented (roadmaps, lemma splits,
    loop-step hoist), not to the decompose-vs-budget policy, which the
-   environment's error surfaces actively recommend. The ladder text
-   itself credits "the GT proof notes" as its source — an
-   operator-encoded GT-derived prior, disclosed here alongside the
-   "dozens per file" / "fine-grained chains" prompt priors.
+   environment's error surfaces actively recommend. The guidance content
+   is generic Verus proof-engineering practice for crypto-scale nonlinear
+   arithmetic (assert-by scoping, explicit triggers, decomposition,
+   budget-last) — it names no specific lemma split or proof shape;
+   disclosed here alongside the "dozens per file" / "fine-grained
+   chains" prompt priors.
 
 ## Incident ledger (arm-scoped)
 
