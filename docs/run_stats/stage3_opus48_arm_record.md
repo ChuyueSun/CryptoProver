@@ -207,6 +207,21 @@ where solver cost meets invented decomposition").
    cut (shared init state) — same visibility caveat applies.
 8. **Duplicated whole-crate inefficiency**: A9 r19 ran two overlapping
    crate verifies (agent + gate); harmless but wasteful — harness lesson.
+9. **Standing harness hint texts (declared priors, both arms)**: two
+   harness surfaces carry generic decompose-over-budget guidance that
+   fires on rlimit/timeout errors — `lib/failure_memory.py`'s remediation
+   ladder ("scope lemma calls → triggers → decompose via mul_lemmas →
+   raise rlimit only as last resort") and `skills/verus_check.py`'s
+   rlimit hint. Both predate the arms (commits ca84eec / 65c142c, present
+   in the a56f284 image) and are identical for fable-5 and opus-4.8, so
+   cross-arm comparisons are unaffected; but every
+   "decompose-beats-budget" rediscovery claim in this record is scoped to
+   the *specific* decompositions invented (roadmaps, lemma splits,
+   loop-step hoist), not to the decompose-vs-budget policy, which the
+   environment's error surfaces actively recommend. The ladder text
+   itself credits "the GT proof notes" as its source — an
+   operator-encoded GT-derived prior, disclosed here alongside the
+   "dozens per file" / "fine-grained chains" prompt priors.
 
 ## Incident ledger (arm-scoped)
 

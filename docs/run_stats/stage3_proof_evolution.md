@@ -193,8 +193,15 @@ agent time, first-measured 166 verification errors → 0.
   agent narrates "single-query body is too big" → structural extraction
   (`lemma_ed0_closed_form` + sublemma split, attrs reduced to 300) → two
   reassociation fixes → green 06:04Z. *Decomposition beat budget on the
-  agent's own initiative — the solver taught it GT's proof-engineering
-  lesson without hints.*
+  agent's own initiative — no operator or GT-specific hint pointed at this
+  decomposition.* [Provenance note, added 2026-07-07: the standing harness
+  surfaces did carry generic decompose-over-budget guidance predating both
+  arms — `lib/failure_memory.py`'s rlimit remediation ladder and
+  `skills/verus_check.py`'s rlimit hint (commits ca84eec / 65c142c, both
+  in the a56f284 image) — so "without hints" is scoped to *which*
+  decomposition, not to the decompose-vs-budget policy itself. Same
+  disclosure applies to the opus-4.8 arm; see
+  `stage3_opus48_arm_record.md` Disclosures #9.]
 - Whole-crate red-6 interlude: the crate gate caught staleness in three
   foundation homes re-edited during the edwards push (module checks had
   never re-covered them) — repaired in ~6 min. The whole-crate gate doing
