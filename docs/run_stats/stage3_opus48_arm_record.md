@@ -172,9 +172,22 @@ where solver cost meets invented decomposition").
    `rlimit(200)` `lemma_generic_rotate_false`, add `rlimit(400)`
    `lemma_generic_rotate_true`, **raise `RistrettoPoint::compress`
    400→1000** (site pre-carried 400 from A7). Cumulative agent-added
-   census (12 new sites + 1 raise, per-file list in the tracking file);
-   **load-bearing analysis (fable-style single-attr-removal gates) NOT yet
-   run** — open item before any "beyond-GT budget" claim is finalized.
+   census (12 new sites + 1 raise, per-file list in the tracking file).
+   **Load-bearing gates (fable-style single-attr-removal, module scope,
+   run 2026-07-07 UTC on a scratch copy of the sealed tree, per-site JSONs
+   in VM1 `rlimit_gates_a9/`): exactly 2 of 13 sites are load-bearing** —
+   `ristretto::elligator_ristretto_flavor` `rlimit(200)` (removal → 4
+   errors, fn-body + while-loop rlimit) and
+   `montgomery::differential_add_and_double` `rlimit(100)` (removal → 2
+   errors, fn-body rlimit); both failure signatures are pure
+   resource-limit. The other 11 drop cleanly under their module gates,
+   including the `compress` `rlimit(1000)` endgame raise (decomposition
+   made it unnecessary), both batch-compress lemma attrs (200/400), and
+   the `montgomery.rs:521` raise (restores to base 20). Caveat: gates are
+   single-removal at module scope (fable-parity convention); joint
+   removal of all 11 was not tested. Under this fable-parity
+   single-removal/module-scope analysis, the load-bearing budget
+   footprint is **two functions** (10× and 5× default).
 2. **Two added `assert(false)` contradiction-closers**
    (`lemma_field_inv_nonzero` zero-branch; sqrt-helper `root%p==0`
    branch): proven contradictions inside impossible branches — proof-style
@@ -239,7 +252,7 @@ final-round costs unrecorded — the H2 gap); round JSONs expose
 | attempts / agent-hours | 2 / 11.4 h | 9 / 62.28 h (Σ result.json durations) |
 | first-measured → sealed | 166 → 0 | 166-class start (202 raw) → 0 |
 | verified at seal | 2031 (second-machine 2031) | 2114 — same whole-crate Verus counter but NOT the same declaration set (opus tree: 859 `proof fn`/20 `spec fn`; fable tree: 822/19); read as same-counter different-tree, not a productivity metric |
-| beyond-GT rlimit at seal | 2×20 within-GT + 3×150 + 4×300; exactly 1 load-bearing | 12 new + 1 raise (incl. compress→1000); load-bearing gates not yet run |
+| beyond-GT rlimit at seal | 2×20 within-GT + 3×150 + 4×300; exactly 1 load-bearing | 12 new + 1 raise (incl. compress→1000); **exactly 2 load-bearing** (elligator 200, differential_add_and_double 100); compress-1000 + both batch-compress attrs droppable |
 | hardest spot | ristretto batch-compress assembly | same (identical obligation, `ristretto.rs:1731`) |
 | resolution mechanism | decompose-beats-budget (agent-initiated) | same, ×5 instances |
 | headline pathology | (none of this class) | A5 de-novo confabulated green memory |
@@ -281,10 +294,10 @@ proof engineering lesson, discovered three independent ways.
   A5=23, A6=113, A7=68, A8=78, A9=69 (sum 723). Late attempts shifted
   from crate-polling to module-focused checking as truncation-honest
   labels landed (A6+) — visible in the A5→A6 module-start jump.
-- **Open item for the paper's budget claim**: fable-style load-bearing
-  gates (single-attr-removal per rlimit site) have not been run on the
-  opus tree; until then the beyond-GT budget footprint is an upper bound
-  (13 sites), not a load-bearing count.
+- **Budget claim resolved (2026-07-07 UTC)**: the fable-style load-bearing
+  gates were run post-endpoint (see Disclosures #1): 2 of 13 sites
+  load-bearing. The earlier 13-site figure is the search-process
+  footprint; the proof-artifact footprint is 2 functions.
 
 
 ## Claim boundary

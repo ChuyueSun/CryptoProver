@@ -71,9 +71,13 @@ decompose-beats-budget pivots to fine-grained lemma decomposition, the
 last hoisting all algebra into a single loop-step composition lemma so
 the loop body verifies with one cheap call per iteration — independently
 rediscovering the ground truth's own proof engineering. The record ships the full per-attempt table,
-integrity batteries, rlimit-footprint disclosure, an in-arm confabulation
-incident caught by the counter discipline, and the two dual-reviewed
-mid-arm harness fixes; evidence is archived with self-verifying
+integrity batteries, and the rlimit-footprint disclosure — single-attr
+removal gates show exactly **2 of the 13 agent-added budget attributes
+are load-bearing** (the batch-compress attrs, including the endgame
+`rlimit(1000)` raise, each drop cleanly in those single-removal module
+gates once the decomposition exists) —
+plus an in-arm confabulation incident caught by the counter discipline
+and the two dual-reviewed mid-arm harness fixes; evidence is archived with self-verifying
 checksums (`SHA256SUMS` + manifest, tarball sha256 `908b6527…`).
 
 **3. The coverage cut (companion harness).** With every specification kept
