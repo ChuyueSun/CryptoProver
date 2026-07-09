@@ -2,7 +2,7 @@
 
 Counting method: `wc -l` per file; attribution inside `run.py` by
 top-level `def`/`class` extents. **Measured at CryptoProver commit
-`787356d`** (the public tree carrying both dual-signed mid-arm fixes;
+`a8ea1aa`** (the public tree carrying both dual-signed mid-arm fixes;
 re-run the same method at any pinned commit to reproduce — the mvp
 research tree carries additional uncommitted work and will not match).
 Dual-use files are counted **once**, in the bucket whose harness-side
