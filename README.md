@@ -1,131 +1,111 @@
 # CryptoProver
 
-**CryptoProver** is a *gated* LLM proof-synthesis agent for
-[Verus](https://github.com/verus-lang/verus)-annotated Rust: it writes the
-machine-checked specifications, lemmas, and proofs that connect a
-cryptographic crate's public API to the arithmetic beneath it. Because a
-green verifier run is cheap to fake, the agent's one small driver loop is
-wrapped in integrity gates that make every success claim mechanically
-checkable. This is the artifact accompanying the paper **"Building a
-Verified Cryptographic Crate with a Gated LLM Agent"**, evaluated on
-dalek-lite (a Verus port of curve25519-dalek).
+**CryptoProver** is an AI-based system that writes formal specifications and
+proofs for cryptographic Rust libraries. A human supplies the high-level API
+contracts that say what the library must do and a trusted collection of
+low-level arithmetic facts. The agent writes the internal specifications and
+proofs between them, and [Verus](https://github.com/verus-lang/verus) checks
+the result. The executable Rust code stays unchanged.
 
-Two harness versions exist:
+This repository accompanies the paper **"AI Approach to Production
+Cryptographic Libraries."** The paper asks whether an AI agent can work at
+the scale of a production crate, where one proof depends on definitions and
+lemmas spread across many files. Most earlier proof-synthesis evaluations give
+the model one theorem, function, or module with the relevant specification
+already in scope. CryptoProver instead treats the library as the unit of work.
 
-- **This repository** — the full harness: spec-synthesis experiment modes,
-  the **peel** init-state builder (graded cuts along a depth × span design),
-  and whole-crate gating. This version ran the paper's deepest cut — the
-  **field-floor certificate** below.
-- **[`CryptoProver-core`](https://github.com/ChuyueSun/CryptoProver-core)** —
-  the slim companion harness (proof bodies only, under fixed specifications),
-  which ran the paper's **coverage cut**.
+> CryptoProver proves code relative to the supplied contracts and trusted
+> facts. It does not decide whether those contracts fully capture the intended
+> cryptographic protocol.
 
-> This repository is a cleaned public snapshot of the research tree. Run
-> artifacts and internal working notes are not included; the campaign statistics
-> backing the paper live in `docs/run_stats/`.
+## What CryptoProver does
 
-## Headline results
+1. **People define the boundary.** Public API contracts describe the conditions
+   callers must meet and what each function guarantees. The trusted floor
+   provides field and number-theory facts that the experiment does not ask the
+   agent to re-prove.
+2. **The agent fills in the middle.** Within a fixed vocabulary of logical
+   definitions, it writes the intermediate specifications, helper lemmas, and
+   proof code needed to connect the API to that floor.
+3. **Verus checks the crate.** A run succeeds only when the required scope
+   verifies, no unfinished `admit()` remains, and every integrity check passes.
 
-**1. The field-floor certificate (this harness).** From the canonical run
-record ([docs/run_stats/stage3_certificate_record.md](docs/run_stats/stage3_certificate_record.md)):
+The system does not accept a green verifier result at face value. An agent
+could make a proof easier by weakening a specification, adding an axiom,
+changing the checker, breaking a neighboring module, or recovering a reference
+proof. CryptoProver checks for these failure modes after every round and runs
+the agent in an isolated environment without the reference proof.
 
-> Given only the user-facing API contracts, frozen specifications, a trusted
-> arithmetic floor, and the measured pin set (124 frozen call sites + file
-> skeleton + declared priors), a claude-fable-5 agent under this harness
-> (`a56f284`) reconstructed the entire deleted proof cone of the dalek-lite
-> **field-floor cut** — +11,024/−22,753 lines over the 26 editable files
-> (48.5% of the ground truth's proof mass), 196 lemmas vs GT's 235 — to
-> **whole-crate 0 errors** at default SMT limits, in 11.4 agent-hours across
-> two pre-registered attempts, with zero integrity violations, verified
-> independently on two machines (2,031 declarations verified).
+## Results in brief
 
-The cut deletes all 22 lemma homes (235 lemmas: signature + contract + body)
-and proof-strips all 4 API files (100 inline proof blocks) from a proven tip;
-everything outside those 26 files is frozen. An earlier June-2026 campaign on
-the same cut did not converge — that record ships too
-([docs/run_stats/final_convergence_stats.md](docs/run_stats/final_convergence_stats.md))
-as the failure baseline that motivated the staged methodology. The full
-verification battery (independent two-machine re-verify, exec-immutability
-audit, axiom/admit inventories, rlimit stratification) is in the record.
+We evaluated CryptoProver on two production cryptographic libraries without
+changing their executable code:
 
-**2. Cross-model replication (opus-4.8, same cut).** From the arm record
-([docs/run_stats/stage3_opus48_arm_record.md](docs/run_stats/stage3_opus48_arm_record.md)):
+- **dalek-lite.** CryptoProver reconstructed the internal specifications and
+  proofs of an independent, human-led verification. That public effort spanned
+  eight months and five main contributors, including specification and
+  infrastructure work. Given the API contracts and trusted floor,
+  CryptoProver completed the reconstruction in 11.4 agent-hours and $466.99
+  of recorded API cost. The final crate verified on two machines with no
+  integrity violations.
+- **RustCrypto ChaCha20.** CryptoProver verified a previously unverified
+  RFC 8439 soft-core fork while leaving the executable implementation
+  unchanged.
 
-> Under the identical field-floor cut, the same harness and gates, and the
-> same H0/unassisted protocol, a `claude-opus-4-8` agent reconstructed the
-> same deleted proof cone to **whole-crate 0 errors** at default SMT limits
-> (2,114 declarations verified; harness-sealed COMPLETE plus an independent
-> fresh-container re-verify), in 9 seed-chained attempts / 62.3 agent-hours
-> (fable-5: 2 attempts / 11.4 h), adding ≈15.8k lines of specification-
-> and-proof text (patch-sum) across the 26 editable files.
+The detailed dalek-lite evidence is available in the checked-in run records:
 
-The arm's error frontier ran 202 → 177 → 58 → 20 → … → 2 → 0 across the
-seed chain, and its endgame is the paper's sharpest hardness datum: after
-round 13 of the final attempt, **zero logical verification failures
-remained crate-wide** — the entire residual was one SMT resource-limit
-diagnostic on the ristretto batch-compress `while` loop, the *same*
-hardest obligation the fable-5 arm faced. Budget raises alone did not close
-the wall (monolithic attempts and rlimit probes from 80 through the final
-compress raise to 1000 all left it standing); the record logs five
-decompose-beats-budget pivots to fine-grained lemma decomposition, the
-last hoisting all algebra into a single loop-step composition lemma so
-the loop body verifies with one cheap call per iteration — independently
-rediscovering the ground truth's own proof engineering. The record ships the full per-attempt table,
-integrity batteries, and the rlimit-footprint disclosure — single-attr
-removal gates show exactly **2 of the 13 agent-added budget attributes
-are load-bearing** (the batch-compress attrs, including the endgame
-`rlimit(1000)` raise, each drop cleanly in those single-removal module
-gates once the decomposition exists) —
-plus an in-arm confabulation incident caught by the counter discipline
-and the two dual-reviewed mid-arm harness fixes; evidence is archived with self-verifying
-checksums (`SHA256SUMS` + manifest, tarball sha256 `908b6527…`).
+- [Field-floor certificate](docs/run_stats/stage3_certificate_record.md): the
+  primary `claude-fable-5` run reached whole-crate zero errors in two attempts
+  and 11.4 agent-hours.
+- [Cross-model replication](docs/run_stats/stage3_opus48_arm_record.md): a
+  `claude-opus-4-8` run reached the same whole-crate result in nine attempts and
+  62.3 agent-hours.
+- [Earlier non-convergent campaign](docs/run_stats/final_convergence_stats.md):
+  the failure baseline that motivated the later staged method.
+- [CryptoProver-core](https://github.com/ChuyueSun/CryptoProver-core): the
+  companion proof-only experiment, which kept all specifications fixed and
+  removed proof bodies across the crate.
 
-**3. The coverage cut (companion harness).** With every specification kept
-and every proof body stripped crate-wide, the accompanying paper reports the
-agent closed 1,430 of 1,433 non-axiom proof obligations (3 gaps left, all
-shared with the human reference) and re-verified the whole crate, with zero
-fabricated axioms and no active-gate firings. Those numbers are
-paper-sourced; that run's harness and records live in the companion
-[`CryptoProver-core`](https://github.com/ChuyueSun/CryptoProver-core) repository.
+This repository contains the full harness used for internal-specification and
+proof synthesis. `CryptoProver-core` contains the smaller proof-only harness.
+This checkout is a cleaned public snapshot: campaign statistics are included
+under [`docs/run_stats/`](docs/run_stats/), but raw run artifacts and internal
+working notes are not.
 
-## How it works
+## How a run works
 
 ```
-prompt.md ──rendered──▶ claude -p   (agent edits proofs, runs skills/*.py via Bash)
-                            │
-        each round: spec_check verify ▸ cargo verus ▸ integrity gates
-                            │
-        COMPLETE only if: verifier green in scope
-                          AND zero hard admit()s remain
-                          AND no integrity gate drifted
+fixed code + API contracts + specification vocabulary + trusted floor
+                              │
+                              ▼
+                    agent writes specs and proofs
+                              │
+                              ▼
+                    Verus checks the requested scope
+                              │
+                              ▼
+                  integrity gates inspect the changes
+                              │
+                              ▼
+                 COMPLETE only if every check passes
 ```
 
-One driver loop (`run.py` — no orchestration class hierarchy) renders
-`prompt.md`, invokes the Claude Code CLI headless, and after every round
-re-verifies the tree and re-checks a bank of integrity gates. The four core
-gates — each traced to a false-success mode observed in a real campaign:
+`run.py` is the driver. It renders `prompt.md`, starts a headless Claude Code
+session, and checks the resulting tree after every round. The checks cover:
 
-- **Spec integrity** (`SPEC_DRIFT`) — every `fn` header, `requires`/`ensures`,
-  and (when enabled) every `spec fn` *body* is snapshot-pinned before the run;
-  any drift fails the round. Weakening the spec is the cheapest fake green.
-- **Axiom integrity** (`AXIOM_DRIFT`) — a new `axiom_*` name vs the baseline
-  fails the round (axiom admits are excluded from the done-counter, so a new
-  axiom would otherwise be a free postcondition).
-- **Tooling integrity** (`TOOLING_DRIFT`) — every harness/skill file is
-  SHA-pinned; a doctored checker fails the round.
-- **Forbidden constructs** (`FORBIDDEN_CONSTRUCT`) — any new `assume(...)` or
-  `#[verifier::external_body]` fails the round.
+- weakened contracts or changed specification definitions;
+- new axioms, `assume(...)`, or `#[verifier::external_body]` escapes;
+- unfinished `admit()` calls;
+- failures in touched files, sibling files, or the whole crate;
+- edits to frozen source files or to the checking tools; and
+- attempts to recover a reference proof from git history.
 
-Further checks back these up — final-state admit counting, the frozen-file
-guard for whole-crate modes, sibling-file scans, spec-definition freezing —
-see `CLAUDE.md` for the full bank.
-
-**Peel** (`peel.py` + `peel_manifests/`) builds the graded starting states: a
-JSON manifest names, per file, what to strip along a cumulative depth axis —
-P1 proof bodies → P2 helper lemmas → P3 spec definitions → P4 contracts —
-and every file not listed stays frozen. A pin rule refuses unsound cuts (a
-P3/P4 strip must declare what still constrains the reconstruction). The
-**field-floor** manifest is the deepest evaluated cut.
+For controlled evaluations, `peel.py` creates a starting state with selected
+internal specifications or proofs removed. A JSON manifest records exactly
+what the agent receives, what it may edit, and what stays frozen. The
+field-floor manifest defines the reconstruction used for the paper's primary
+dalek-lite result. See [`peel_manifests/README.md`](peel_manifests/README.md)
+for the exact boundaries.
 
 ## Reproducing the paper results
 
