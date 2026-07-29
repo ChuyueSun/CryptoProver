@@ -40,38 +40,49 @@ the agent in an isolated environment without the reference proof.
 
 ## Results in brief
 
+### Strongest accepted VM1 result by declared scope
+
+After the field-floor evaluation reported in the paper, CryptoProver completed
+a cumulative verification continuation under the declared trusted-core
+manifest. The manifest is a strict proof-obligation superset of field-floor: it
+assigns every in-repository non-axiom proof artifact to the agent while
+continuing to freeze executable code, public API contracts, specification
+definitions, axioms, and external `vstd`. The terminal tree passed the
+runner-owned whole-crate verification gate with zero failures and was accepted
+for promotion.
+
+This is the strongest accepted VM1 result in declared proof-obligation scope,
+but it is not a cold-start trusted-core result. The successful chain began from
+a field-floor peel and later reused that partially reconstructed tree under the
+trusted-core manifest; no starting-tree-equivalence receipt establishes a fresh
+trusted-core peel. The result therefore demonstrates package verification by
+cumulative continuation under the broader declared scope, not reconstruction
+of the entire trusted-core peel from scratch. See the
+[trusted-core continuation record](docs/run_stats/trusted_core_continuation_record.md)
+and [field-layer census](docs/run_stats/field_layer_agent_vs_gt_gcp31.md).
+
+### Paper evaluation
+
 We evaluated CryptoProver on two production cryptographic libraries without
 changing their executable code:
 
-- **dalek-lite proof-and-spec synthesis (main experiment).** With executable
-  code, public API contracts, the internal specification vocabulary, and the
-  trusted library fixed, CryptoProver synthesized every intermediate internal
-  specification and proof connecting the Edwards, Montgomery, Ristretto, and
-  scalar API contracts to that library. It completed the task in 11.4 hours of
-  elapsed agent time with $466.99 in recorded API cost. Independent whole-crate
-  checks on two machines reported 2,031 checks verified and zero errors; the
-  final tree had no unresolved proof obligations, executable-code changes, or
-  integrity violations, and all 48 axioms were already present in the trusted
-  library. The earlier public human-led effort spanned eight months and five
-  main contributors, including specification and infrastructure work; that
-  calendar window is not directly comparable to elapsed agent time.
+- **dalek-lite proof-and-spec synthesis (the paper's main field-floor
+  experiment).** With executable code, public API contracts, the internal
+  specification vocabulary, and the trusted library fixed, CryptoProver
+  synthesized every intermediate internal specification and proof connecting
+  the Edwards, Montgomery, Ristretto, and scalar API contracts to that library.
+  It completed the task in 11.4 hours of elapsed agent time with $466.99 in
+  recorded API cost. Independent whole-crate checks on two machines reported
+  2,031 checks verified and zero errors; the final tree had no unresolved proof
+  obligations, executable-code changes, or integrity violations, and all 48
+  axioms were already present in the trusted library. The earlier public
+  human-led effort spanned eight months and five main contributors, including
+  specification and infrastructure work; that calendar window is not directly
+  comparable to elapsed agent time.
 - **RustCrypto ChaCha20.** CryptoProver verified RustCrypto's previously
   unverified `chacha20` v0.10.1 implementation against RFC 8439. The evaluation
   fork adds specifications while leaving the executable implementation
   unchanged.
-
-A later dalek-lite continuation completed a runner-owned zero-error whole-crate
-gate under the **declared trusted-core scope**. Its manifest expands the
-editable surface from 26 files and 235 named lemma deletions to 86 files and
-815 deletions: **+60 files (3.31x)** and **+580 lemmas (3.47x)**. These are
-task-surface figures, not a claim that the trusted library was 3.47x larger.
-Of the added deletions, 428 are field/common trusted proof facts across 35
-mixed-content files; the remainder was other previously frozen proof surface.
-The lineage reused a field-floor worktree rather than starting from a cold
-trusted-core cut; 21 of 27 field-layer files stayed byte-identical to the human
-reference. See the
-[trusted-core continuation record](docs/run_stats/trusted_core_continuation_record.md)
-and [field-layer census](docs/run_stats/field_layer_agent_vs_gt_gcp31.md).
 
 The detailed dalek-lite evidence is available in the checked-in run records:
 
