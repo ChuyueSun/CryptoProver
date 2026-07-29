@@ -2,17 +2,18 @@
 
 **CryptoProver** is an AI-based system that writes formal specifications and
 proofs for cryptographic Rust libraries. A human supplies the high-level API
-contracts that say what the library must do and a trusted collection of
-low-level arithmetic facts. The agent writes the internal specifications and
-proofs between them, and [Verus](https://github.com/verus-lang/verus) checks
-the result. The executable Rust code stays unchanged.
+contracts that say what the library must do and a trusted library of field
+specifications, field/common arithmetic facts, intentional axioms, and
+[`vstd`](https://github.com/verus-lang/verus). The agent writes the internal
+specifications and proofs between them, and Verus checks the result. The
+executable Rust code stays unchanged.
 
-This repository accompanies the paper **"AI Approach to Production
-Cryptographic Libraries."** The paper asks whether an AI agent can work at
-the scale of a production crate, where one proof depends on definitions and
-lemmas spread across many files. Most earlier proof-synthesis evaluations give
-the model one theorem, function, or module with the relevant specification
-already in scope. CryptoProver instead treats the library as the unit of work.
+This repository accompanies the paper **"An AI Approach to Verified Production
+Cryptographic Libraries."** The paper asks whether an AI agent can work at the
+scale of a production crate, where one proof depends on definitions and lemmas
+spread across many files. Most earlier proof-synthesis evaluations give the
+model one theorem, function, or module with the relevant specification already
+in scope. CryptoProver instead treats the library as the unit of work.
 
 > CryptoProver proves code relative to the supplied contracts and trusted
 > facts. It does not decide whether those contracts fully capture the intended
@@ -21,12 +22,13 @@ already in scope. CryptoProver instead treats the library as the unit of work.
 ## What CryptoProver does
 
 1. **People define the boundary.** Public API contracts describe the conditions
-   callers must meet and what each function guarantees. The trusted floor
-   provides field and number-theory facts that the experiment does not ask the
-   agent to re-prove.
+   callers must meet and what each function guarantees. The trusted library
+   provides field specifications, field/common arithmetic facts, intentional
+   axioms, and `vstd` facts that an experiment does not ask the agent to
+   re-prove.
 2. **The agent fills in the middle.** Within a fixed vocabulary of logical
    definitions, it writes the intermediate specifications, helper lemmas, and
-   proof code needed to connect the API to that floor.
+   proof code needed to connect the API to that trusted library.
 3. **Verus checks the crate.** A run succeeds only when the required scope
    verifies, no unfinished `admit()` remains, and every integrity check passes.
 
@@ -41,16 +43,31 @@ the agent in an isolated environment without the reference proof.
 We evaluated CryptoProver on two production cryptographic libraries without
 changing their executable code:
 
-- **dalek-lite.** CryptoProver reconstructed the internal specifications and
-  proofs of an independent, human-led verification. That public effort spanned
-  eight months and five main contributors, including specification and
-  infrastructure work. Given the API contracts and trusted floor,
-  CryptoProver completed the reconstruction in 11.4 agent-hours and $466.99
+- **dalek-lite.** CryptoProver synthesized the internal specifications and
+  proofs of a new independent verification. The earlier public human-led effort
+  spanned eight months and five main contributors, including specification and
+  infrastructure work. Given the API contracts and trusted library,
+  CryptoProver completed its field-floor run in 11.4 agent-hours and $466.99
   of recorded API cost. The final crate verified on two machines with no
-  integrity violations.
-- **RustCrypto ChaCha20.** CryptoProver verified a previously unverified
-  RFC 8439 soft-core fork while leaving the executable implementation
+  integrity violations. The calendar and agent-time figures cover different
+  work and are not directly comparable.
+- **RustCrypto ChaCha20.** CryptoProver verified RustCrypto's previously
+  unverified `chacha20` v0.10.1 implementation against RFC 8439. The evaluation
+  fork adds specifications while leaving the executable implementation
   unchanged.
+
+A later dalek-lite continuation completed a runner-owned zero-error whole-crate
+gate under the **declared trusted-core scope**. Its manifest expands the
+editable surface from 26 files and 235 named lemma deletions to 86 files and
+815 deletions: **+60 files (3.31x)** and **+580 lemmas (3.47x)**. These are
+task-surface figures, not a claim that the trusted library was 3.47x larger.
+Of the added deletions, 428 are field/common trusted proof facts across 35
+mixed-content files; the remainder was other previously frozen proof surface.
+The lineage reused a field-floor worktree rather than starting from a cold
+trusted-core cut; 21 of 27 field-layer files stayed byte-identical to the human
+reference. See the
+[trusted-core continuation record](docs/run_stats/trusted_core_continuation_record.md)
+and [field-layer census](docs/run_stats/field_layer_agent_vs_gt_gcp31.md).
 
 The detailed dalek-lite evidence is available in the checked-in run records:
 
@@ -62,6 +79,12 @@ The detailed dalek-lite evidence is available in the checked-in run records:
   62.3 agent-hours.
 - [Earlier non-convergent campaign](docs/run_stats/final_convergence_stats.md):
   the failure baseline that motivated the later staged method.
+- [Trusted-core-scope continuation](docs/run_stats/trusted_core_continuation_record.md):
+  the larger declared task surface, valid-state lineage accounting, terminal
+  zero-error result, and cold-start limitation.
+- [GCP31 field-layer census](docs/run_stats/field_layer_agent_vs_gt_gcp31.md):
+  the byte-level evidence that the executed lineage retained an effective
+  field floor.
 - [CryptoProver-core](https://github.com/ChuyueSun/CryptoProver-core): the
   companion proof-only experiment, which kept all specifications fixed and
   removed proof bodies across the crate.
@@ -75,7 +98,7 @@ working notes are not.
 ## How a run works
 
 ```
-fixed code + API contracts + specification vocabulary + trusted floor
+fixed code + API contracts + specification vocabulary + trusted library
                               │
                               ▼
                     agent writes specs and proofs
@@ -103,7 +126,7 @@ session, and checks the resulting tree after every round. The checks cover:
 For controlled evaluations, `peel.py` creates a starting state with selected
 internal specifications or proofs removed. A JSON manifest records exactly
 what the agent receives, what it may edit, and what stays frozen. The
-field-floor manifest defines the reconstruction used for the paper's primary
+field-floor manifest defines the synthesis task used for the paper's primary
 dalek-lite result. See [`peel_manifests/README.md`](peel_manifests/README.md)
 for the exact boundaries.
 
