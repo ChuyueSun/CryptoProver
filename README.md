@@ -43,14 +43,18 @@ the agent in an isolated environment without the reference proof.
 We evaluated CryptoProver on two production cryptographic libraries without
 changing their executable code:
 
-- **dalek-lite.** CryptoProver synthesized the internal specifications and
-  proofs of a new independent verification. The earlier public human-led effort
-  spanned eight months and five main contributors, including specification and
-  infrastructure work. Given the API contracts and trusted library,
-  CryptoProver completed its field-floor run in 11.4 agent-hours and $466.99
-  of recorded API cost. The final crate verified on two machines with no
-  integrity violations. The calendar and agent-time figures cover different
-  work and are not directly comparable.
+- **dalek-lite proof-and-spec synthesis (main experiment).** With executable
+  code, public API contracts, the internal specification vocabulary, and the
+  trusted library fixed, CryptoProver synthesized every intermediate internal
+  specification and proof connecting the Edwards, Montgomery, Ristretto, and
+  scalar API contracts to that library. It completed the task in 11.4 hours of
+  elapsed agent time with $466.99 in recorded API cost. Independent whole-crate
+  checks on two machines reported 2,031 checks verified and zero errors; the
+  final tree had no unresolved proof obligations, executable-code changes, or
+  integrity violations, and all 48 axioms were already present in the trusted
+  library. The earlier public human-led effort spanned eight months and five
+  main contributors, including specification and infrastructure work; that
+  calendar window is not directly comparable to elapsed agent time.
 - **RustCrypto ChaCha20.** CryptoProver verified RustCrypto's previously
   unverified `chacha20` v0.10.1 implementation against RFC 8439. The evaluation
   fork adds specifications while leaving the executable implementation
