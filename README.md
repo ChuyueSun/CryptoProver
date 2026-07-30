@@ -176,6 +176,13 @@ the whole cone — `peel_manifests/decompress_proof_only.json` (P1),
 `decompress_bridge_full.json` are ready-made; `peel_manifests/README.md` maps
 each to its experiment mode and soundness pin.
 
+The experimental
+`peel_manifests/abstraction_floor_v1.json` cut goes deeper than field-floor:
+it removes selected internal curve-layer specification definitions together
+with the above-field proof cone. Frozen consumers pin the API behavior while
+`run.py --experiment-mode spec-floor` applies the whole-crate and integrity
+gates. This is an experiment definition, not a claimed successful result.
+
 **Containerized runs.** [docker/](docker/README.md) ships an immutable image
 (pinned Rust + Verus + Z3 + the harness, baked-warm cargo caches) and a
 launcher (`docker/run_agents.sh`) for isolated one-container-per-target

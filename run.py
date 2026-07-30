@@ -2733,7 +2733,7 @@ _BRIDGE_MODES = ("bridge-specs", "bridge-full")
 # FROZEN_EDIT guard over everything outside the editable set): the bridge rungs
 # plus the field-floor cut, whose pins (frozen spec vocabulary + frozen contracts)
 # also span the whole crate. Keyed here once so every gate site stays in sync.
-_WHOLE_CRATE_MODES = _BRIDGE_MODES + ("field-floor",)
+_WHOLE_CRATE_MODES = _BRIDGE_MODES + ("field-floor", "spec-floor")
 
 # Whole-crate-mode verus checks (field-floor / bridge-*) verify the full ~2090-fn
 # crate and run ~590s in practice; verus_check's default --timeout 300 (sized for
@@ -3293,6 +3293,103 @@ Rewrite every stripped proof in:
     )
 
 
+def _spec_floor_experiment_block(allow_edit: list[Path]) -> str:
+    """Prompt for the abstraction_floor_v1 cut (co-invention): the field-floor
+    proof cone is deleted AND the curve/encoding-layer spec vocabulary
+    (edwards_specs / ristretto_specs peel set, 43 names + 15 dropped dead
+    names) is deleted. The agent must INVENT the intermediate spec definitions
+    and the proof cone that connects the frozen field layer (below) to the
+    gate-frozen API contracts (above) through its own vocabulary. Surviving
+    spec fns in the editable spec files (the axiom-referenced group-law set)
+    are frozen by the spec gate; redefining one is SPEC_DRIFT. Ruling of
+    record: AGENT_DEBATE 2026-07-07 (claude-relaunch RFC + codex 16:19/16:24
+    adjudication); pin inventory:
+    stage3_local_evidence/abstraction_floor_pin_inventory.py."""
+    edit_paths = [p.as_posix() for p in allow_edit]
+    spec_files = [p for p, sp in zip(allow_edit, edit_paths) if "/specs/" in sp]
+    lemma_files = [p for p, sp in zip(allow_edit, edit_paths) if "/lemmas/" in sp]
+    api_files = [p for p, sp in zip(allow_edit, edit_paths)
+                 if "/specs/" not in sp and "/lemmas/" not in sp]
+    spec_bullets = "\n".join(f"- `{p}`" for p in spec_files) or "- _(none)_"
+    lemma_bullets = "\n".join(f"- `{p}`" for p in lemma_files) or "- _(none)_"
+    api_bullets = "\n".join(f"- `{p}`" for p in api_files) or "- _(none)_"
+    return _floor_reconstruction_prompt(
+        rung_title="spec-floor (abstraction co-invention)",
+        scope_sentence=(
+            "the field-floor cut PLUS the curve-layer spec vocabulary: you "
+            "invent the intermediate ABSTRACTION LAYER (spec definitions) and "
+            "the proof cone that uses it."
+        ),
+        by_design_body=(
+            "A set of `spec fn` definitions has been DELETED from the editable "
+            "spec files below, and the entire above-field proof cone is gone "
+            "(lemma files emptied, API inline proofs stripped). Frozen "
+            "consumers still reference the deleted spec names — the crate "
+            "does not even compile until you re-define them with compatible "
+            "signatures. That is the task: re-invent the missing definitions, "
+            "then rebuild the proofs."
+        ),
+        scope_block=(
+            "**Editable spec files (define the missing `spec fn`s here; the "
+            "spec fns still present in them are FROZEN — do not touch):**\n"
+            f"{spec_bullets}\n\n"
+            "**Editable lemma files (empty; rebuild the cone):**\n"
+            f"{lemma_bullets}\n\n"
+            "**Editable API files (contracts frozen; rebuild inline proofs):**\n"
+            f"{api_bullets}"
+        ),
+        reconstruction_block=(
+            "1. Compile first: `cargo verus verify` errors name every deleted "
+            "spec fn a frozen consumer still references. Re-define each with a "
+            "signature the call sites accept.\n"
+            "2. Your definitions must MEAN the right thing, not merely "
+            "typecheck: the frozen field layer below and the frozen API "
+            "contracts above pin them. After the run, every re-invented "
+            "definition is checked for semantic equivalence against reference "
+            "definitions — a green crate with wrong definitions is NOT "
+            "success and will be scored COMPLETE_NONEQUIV.\n"
+            "3. Then reconstruct the proof cone exactly as in a field-floor "
+            "run: helper lemmas in the lemma files, inline proofs in the API "
+            "files."
+        ),
+        frozen_block=(
+            "Everything not in the editable list is frozen (FROZEN_EDIT on "
+            "violation): the whole field layer (specs + lemmas + u64 backend), "
+            "all other spec files, every `axiom_*`, all exec code. The spec "
+            "fns REMAINING in the editable spec files (the group-law / "
+            "decode vocabulary: `edwards_add`, `is_on_edwards_curve`, "
+            "`edwards_scalar_mul`, `ristretto_decode_*`, ...) are frozen by "
+            "the spec-definition gate — any edit to them is SPEC_DRIFT and "
+            "ends the run."
+        ),
+        pins_block=(
+            "Pins you can lean on: frozen API `requires`/`ensures` reference "
+            "the deleted names (their meaning constrains yours); frozen "
+            "lizard/backend proofs and exec contracts consume several of "
+            "them; the frozen field layer fixes the semantic bottom "
+            "(`fe51_as_canonical_nat`, `p()`, `field_mul`, ...)."
+        ),
+        write_rule=(
+            "Work spec-first: define the minimal missing vocabulary, get the "
+            "crate compiling, then prove. Do not redefine or specialize any "
+            "frozen definition to make a proof easier — the equivalence check "
+            "catches it after the run even when the gates cannot."
+        ),
+        verify_command=(
+            "python3 {SKILLS_ROOT}/verus_check.py <absolute-file.rs> "
+            "--project {PROJECT_ROOT} --whole-crate"
+        ),
+        extra_rules=[
+            "New helper `spec fn`s are allowed in editable files; new "
+            "`proof fn axiom_*`, `assume(...)`, `admit()` in non-axiom "
+            "bodies, and `#[verifier::external_body]` remain forbidden.",
+            "END_REASON:COMPLETE only at whole-crate zero errors AND zero "
+            "hard admits across the editable set; semantic equivalence is "
+            "scored after the run and is not yours to claim.",
+        ],
+    )
+
+
 def build_experiment_block(
     target: Path, allow_edit: list[Path], mode: str = "spec-proof"
 ) -> str:
@@ -3373,6 +3470,8 @@ the anchor's proof body or the helper file.
 """
     if mode == "field-floor":
         return _field_floor_experiment_block(allow_edit)
+    if mode == "spec-floor":
+        return _spec_floor_experiment_block(allow_edit)
     if mode == "bridge-full" and target.stem == "ristretto" and len(allow_edit) > 1:
         # The full-stack rung (--no-fullstack-proof): the WHOLE decompress proof
         # tree across all THREE layers is reconstructed at once — ristretto
@@ -6432,7 +6531,8 @@ def main() -> int:
                          "prompt and frozen-file guard allow edits only here.")
     ap.add_argument("--experiment-mode",
                     choices=["spec-proof", "proof-only", "contract-only",
-                             "bridge-specs", "bridge-full", "field-floor"],
+                             "bridge-specs", "bridge-full", "field-floor",
+                             "spec-floor"],
                     default="spec-proof",
                     help="Which experiment shape to run. "
                          "'spec-proof' (default): dep fns have no Verus "

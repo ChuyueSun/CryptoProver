@@ -215,10 +215,10 @@ Each of these is a deferred extension in `docs/extension_spec.md` with a documen
 ### Branch-local additions (`spec_gen`)
 
 The `spec_gen` branch deliberately crosses several non-goals above; CLAUDE.md → **Branch-local additions** is the authoritative list. The pieces you are most likely to meet:
-- **Experiment-mode** (`--experiment-mode spec-proof|proof-only|contract-only|bridge-specs|bridge-full|field-floor`, requires `--experiment-allow-edit`) and its build-side init-state builder **`peel.py`** + `peel_manifests/*.json` (one *peel-depth* axis P1 proofs → P4 contract, with a pin rule). `peel_run.sh` chains `peel.py --worktree` → `run.py`.
+- **Experiment-mode** (`--experiment-mode spec-proof|proof-only|contract-only|bridge-specs|bridge-full|field-floor|spec-floor`, requires `--experiment-allow-edit`) and its build-side init-state builder **`peel.py`** + `peel_manifests/*.json` (one *peel-depth* axis P1 proofs → P4 contract, with a pin rule). `spec-floor` is the P3 abstraction-co-invention cut: it removes selected internal curve-layer specification definitions together with the above-field proof cone while frozen consumers pin the resulting API behavior. `peel_run.sh` chains `peel.py --worktree` → `run.py`.
 - **In-loop recovery / escalation** beyond the MVP loop: session **auto-reset** (`--auto-reset`, on stall/bloat) and **`NEEDS_DECOMP`** escalation (declare a proof blocked on missing infrastructure; a fresh retry gets +2 rounds / 1.5× wall-clock).
 - **Run-mode `end_reason`s** the final-state gate (`run._final_end_reason`) preserves above any green: `RATE_LIMITED` (instant 429, exit 42, breaks the sweep), `RETRY_EXHAUSTED` / `USER_INTERRUPTED` / `TRANSPORT_ERROR` (nonzero/no-result `claude` exits, classified before the spec/verus gates), and `NEEDS_DECOMP`. Resume an interrupted sweep with `launch.sh --skip-existing`.
-- **Whole-crate verification** for whole-crate modes (`field-floor` and `bridge-*`): `verus_check.py --whole-crate` verifies the whole package with a **900s** timeout (vs 300s for module checks).
+- **Whole-crate verification** for whole-crate modes (`field-floor`, `spec-floor`, and `bridge-*`): `verus_check.py --whole-crate` verifies the whole package with a **900s** timeout (vs 300s for module checks).
 
 ## Repo conventions
 

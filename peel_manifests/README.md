@@ -45,6 +45,23 @@ See the CryptoProver paper for the breadth-not-depth argument and the
 `field_floor.json` (classified from the proven tip `103b92b9`) lives alongside the
 curated manifests here.
 
+## Abstraction co-invention: `abstraction_floor_v1.json`
+
+`abstraction_floor_v1.json` is a P3 `spec-floor` experiment. It composes the
+field-floor proof cut with deletion of 58 selected curve/encoding-layer
+`spec fn` definitions across `edwards_specs.rs` and `ristretto_specs.rs`. The
+agent must invent the missing intermediate abstraction vocabulary and rebuild
+the proof cone that connects it to frozen field facts and frozen API
+contracts.
+
+The manifest declares a `consumer:` pin. Surviving specification definitions,
+axioms, executable code, and files outside the editable list remain frozen.
+The runner treats `spec-floor` as a whole-crate mode and distinguishes a
+successful equivalent endpoint from a verifier-green but non-equivalent one;
+equivalence still requires the separate scoring and human-review procedure.
+The committed manifest and mode are an experiment definition, not evidence
+that the experiment completed successfully.
+
 ## The deeper floors: `number-theory` and `trusted-core`
 
 `--classify` takes a `--classify-floor` (`_CLASSIFY_FLOORS` in `peel.py`):
