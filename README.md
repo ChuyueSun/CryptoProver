@@ -189,7 +189,10 @@ launcher (`docker/run_agents.sh`) for isolated one-container-per-target
 sweeps — sealed worktree per agent, shared CPU pool, `--tap` tracing and
 `--seed-wip` resume options. Image build, sealing, and a full single-container
 proof round are smoke-tested; a full parallel multi-container sweep has not
-been run yet. See [docker/README.md](docker/README.md).
+been run yet. This is an operational container profile, not yet a
+`scoreable:true` evaluation boundary: general container egress is still open
+and the Docker launcher does not yet seal a launch-wide `usage_audit.json`.
+See [docker/README.md](docker/README.md).
 
 Documentation map:
 - `docs/mvp_spec.md` — the core proof-agent design and rationale

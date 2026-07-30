@@ -1,56 +1,92 @@
-# Field-Layer Census: Sealed GCP31 Tree vs. Human Reference
+# Field-layer census: sealed GCP31 tree vs human ground truth
 
-This is a file- and lemma-level comparison of the 27 field-layer files in the
-sealed GCP31 tree against the documented human reference
-`ChuyueSun/dalek-lite@d74d6892`. Round snapshots were hash-checked against the
-sealed GCP31 receipt.
+> **Claim scope**: file-level and lemma-level comparison of the 27 field-layer
+> files in the GCP31 sealed final tree (`4c8c0931…`, dual-countersigned,
+> round_37_agent snapshots hash-verified against the receipt) against the
+> campaign's true ground-truth base `ChuyueSun/dalek-lite@103b92b9`
+> (`corefloor-base-103b92b9` — see **Correction 2**; the original analysis used
+> `main`/`d74d6892` per diagnostics.md). Analysis 2026-07-19, re-based
+> 2026-07-29, mac-local, from
+> `results/campaign_traces/peel_corefloor_006_gcp31_resume/full-artifacts.tar.gz`.
+
+> **Correction 2 (2026-07-29, ledger T136; independently countersigned).** The
+> peeled baseline `637ff753` was blob-hash-proven to be built from
+> `corefloor-base-103b92b9`, NOT `main`/`d74d6892` (all 26 pre-image blob
+> hashes of `field_floor_start_state.diff` match `103b92b9`; its post-images
+> match the archived GCP14 `snapshots/round_0` 26/26). Re-basing this census
+> onto the true reference removes two files from the "agent delta" set —
+> `backend/serial/u64/field.rs` and `sqrt_m1_lemmas.rs` differ between the two
+> human branches and are byte-identical to `103b92b9` in the sealed tree — and
+> reattributes three field_algebra lemmas plus the `lemma_neg_neg →
+> lemma_field_neg_neg` rename to the humans. All numbers below are the
+> corrected, receipt-verified values (round_37 snapshots re-hash-verified
+> against the receipt 87/87 during both recomputations).
 
 ## Headline
 
-The field layer is overwhelmingly inherited human text, not agent
-regeneration. **21 of 27 field-layer files** are byte-identical to the human
-reference at both GCP31 round 0 and round 37. Those files include
-`field_specs.rs`, `field_specs_u64.rs`, and `src/field.rs`.
+**The field layer of the sealed tree is overwhelmingly the human text, not
+agent regeneration.** 23 of 27 field-layer files (count corrected twice: 20→21
+per codex's independent recomputation, T127 2026-07-19; 21→23 per the re-based
+reference, Correction 2) — including both spec files (`field_specs.rs`,
+`field_specs_u64.rs`), `src/field.rs`, and `backend/serial/u64/field.rs` — are
+**byte-identical to GT at GCP31 round 0 and still at round 37**. The
+`trusted_core_floor.json` manifest *declares* 277 field-layer lemma deletions,
+but the executed chain never performed that peel: GCP14 reset gcp8 to the
+**field-floor** cold cut (field layer = floor, kept), and GCP15+ reused that
+worktree under the trusted-core declaration without re-peeling (the receipted
+seam behind the "no cold trusted-core start" retraction, mvp ledger T127
+2026-07-18). The field layer is therefore part of the **effective floor** of
+the executed campaign.
 
-The trusted-core manifest declares field-layer deletions, but the executed
-lineage never performed that cold peel: GCP14 started from a field-floor cut,
-and later segments reused that worktree under the trusted-core declaration.
-The field layer therefore remained part of the effective inherited floor.
+Consequences for any prose:
 
-Consequences:
+- "The agent synthesized the field specifications" is **false** for the
+  executed chain. The field spec vocabulary is 100% human.
+- Signature-fidelity numbers over the 277 manifest-listed field lemmas
+  (~272/277 identical by parse) **must not** be read as regeneration fidelity —
+  those lemmas were never deleted in the run that executed.
+- This is *consistent* with the paper's main field-floor framing (field
+  specs/arithmetic facts are trusted-floor inputs there by design), and it
+  concretely reinforces the ruled wording: "cumulative continuation under the
+  declared trusted-core scope," never a trusted-core-completion claim.
 
-- The executed lineage did not synthesize the human field-specification
-  vocabulary.
-- Manifest scope must not be presented as proof that every declared deletion
-  happened in the starting bytes.
-- The result is a continuation under the declared trusted-core scope, not a
-  cold trusted-core completion.
+## Genuine agent field-layer work (delta vs GT in the sealed tree)
 
-## Genuine Agent Field-Layer Delta
+**+320/−5 lines across 4 files; 7 new lemma statements; 0 renames; 0 spec-fn
+changes; 0 axiom changes** (corrected from ~+451/−47 across 6 files / 10 new
+names — see Correction 2; the removed portion was human branch drift between
+`main` and `corefloor-base`). Only `field_algebra_lemmas.rs` also changed
+*during* GCP31 (r0 ≠ r37); the rest was inherited from earlier arms of the
+chain.
 
-The sealed tree differs from the human reference by approximately +451/-47
-lines across six files. It contains ten new lemma statements, no changed spec
-function, and no changed axiom. Only `field_algebra_lemmas.rs` changed during
-GCP31 itself; the other differences were inherited from earlier segments.
+| file | +/− vs GT@103b92b9 | agent-new lemma statements / changes |
+|---|---|---|
+| `field_algebra_lemmas.rs` | +185/−0 | 4 new: `lemma_diff_of_squares_zero_when_prod_zero`, `lemma_proj_u_zero_implies_prod_zero`, `lemma_square2_matches_two_field_square`, `lemma_edwards_to_montgomery_u` |
+| `sqrt_ratio_lemmas.rs` | +67/−0 | 2 new: `lemma_is_sqrt_ratio_one_implies_square`, `lemma_is_sqrt_ratio_times_i_one_implies_nonsquare` |
+| `as_bytes_lemmas.rs` | +67/−5 | 1 new: `lemma_canonical_bytes_of_from_bytes` (byte round-trip used by ristretto decompress) |
+| `limbs_to_bytes_lemmas.rs` | +1/−0 | signature strengthening of `lemma_limb0_contribution_correctness` |
 
-| File | Delta vs. human reference | Agent-era statement change |
-|---|---:|---|
-| `field_algebra_lemmas.rs` | +313/-41 | Seven new lemmas; one lemma renamed |
-| `sqrt_ratio_lemmas.rs` | +67/-0 | Two new lemmas |
-| `as_bytes_lemmas.rs` | +67/-5 | One new byte-round-trip lemma |
-| `limbs_to_bytes_lemmas.rs` | +1/-0 | One signature strengthening |
-| `sqrt_m1_lemmas.rs` | +1/-1 | One callee-rename repair |
-| `backend/serial/u64/field.rs` | +2/-0 | Two added lines |
+Reattributed to the humans by Correction 2 (present in `103b92b9`, so branch
+drift, not agent work): `lemma_one_and_neg_one_square_to_one`,
+`lemma_affine_zero_implies_proj_zero`, `lemma_field_inv_neg`, the
+`lemma_neg_neg → lemma_field_neg_neg` rename (and its `sqrt_m1_lemmas.rs`
+callee fix), and the `backend/serial/u64/field.rs` two-line delta.
 
-The ten new statements support the above-floor Ristretto and Montgomery proof
-endgame and were proved before use. They are genuine agent-authored internal
-specifications; they do not change the inherited field-specification
-vocabulary.
+These seven statements are genuine agent-authored *internal specifications* at
+the field layer — invented to support the above-floor Ristretto/Montgomery
+endgame, then proved and consumed by fixed callers.
 
-## Caveat
+## Caveats
 
-The byte comparison uses `d74d6892`, the reference pinned by the experiment
-diagnostics. The peeled base `637ff753` belongs to the experiment fork. Its
-exact relation to `d74d6892` should be established before making paper-grade
-per-line authorship claims. The byte-identity result itself is
-parser-independent.
+- Diffs are measured against `103b92b9` (`corefloor-base`), the blob-hash-
+  proven source of the peeled base `637ff753` (Correction 2) — the previously
+  open source-fork caveat is now CLOSED. The seven new lemma names are
+  agent-era (absent from GT at the true base, referenced by GCP31's own round
+  diffs).
+- Parser granularity: lemma inventory via `proof fn`/`spec fn` regex + brace
+  matching; byte-identity comparisons are exact and parser-independent.
+- **Where real spec regeneration happened**: the above-floor layers
+  (Edwards/Montgomery/Ristretto/scalar lemma files), where the executed
+  deletions and the 191→0 receipted frontier live. The meaningful
+  agent-vs-human internal-specification comparison for the paper is over those
+  files, not the field layer.

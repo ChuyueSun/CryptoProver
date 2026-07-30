@@ -9,6 +9,12 @@ all agents share one CPU pool. Design rationale recorded in internal review thre
 > sample proof task itself ended `PROCESS_CROSSTALK` — the agent backgrounded a
 > verifier, a harness gate, not a Docker issue.) A full *parallel* multi-container
 > sweep hasn't been run yet.
+>
+> **Claim boundary:** this is an operational isolation profile, not yet a
+> `scoreable:true` campaign profile. Containers retain general network egress
+> (including public-source hosts), and `run_agents.sh` does not yet run and seal
+> `usage_audit.py` across every exit path. Do not use this profile alone as
+> evidence for an oracle-free or cost-complete evaluation.
 
 ## The two requirements, and how they map
 
@@ -74,7 +80,10 @@ skill). Each container:
   both are **per-container** (never shared-writable; satisfies the no-shared-target
   rule, docs/diagnostics.md:414-422) yet start **warm**, and `target/` stays out of
   the `/work` volume;
-- runs with `CARGO_NET_OFFLINE=true` → no network, no ro-index mutation.
+- runs with `CARGO_NET_OFFLINE=true` → Cargo does not fetch dependencies and
+  does not mutate a read-only index. This does **not** disable general container
+  networking; a scoreable campaign still needs provider-only egress controls
+  and negative reachability receipts.
 
 The ro shared-registry bind-mount is a **pure disk-dedup optimization**, attempted
 only after `preflight.sh` proves the offline cache resolves with the exact mounted
