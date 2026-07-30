@@ -39,7 +39,8 @@ this (matches `_is_sealed_worktree`, run.py:1181-1198, and the `git fsck
 
 ## Files
 
-- **`Dockerfile`** — immutable image: pinned rust+verus+z3, python, claude CLI,
+- **`Dockerfile`** — immutable image: pinned rust+verus+z3, Python, Node 22,
+  and the Claude CLI,
   read-only harness at `/opt/harness`, and **baked-warm** `CARGO_HOME` +
   `CARGO_TARGET_DIR`. Never overwrite the harness on a live container
   (that would trip `TOOLING_DRIFT`); rebuild the image.
@@ -110,9 +111,14 @@ window reopens).
   the agent runs without tap. Use **`--require-tap`** when missing traces should
   fail the agent instead.
 - **`--seed-wip <patch>`** applies a guarded WIP diff after peel and before seal,
-  limited to the manifest's editable files. Use a distinct `--run-id` and
-  `--work-base` for resumed seeded sweeps so their host ledger cannot collide
-  with a clean run.
+  limited to the manifest's editable files. A normal resume must also pass
+  **`--seed-receipt <promotion_receipt.json>`**: the launcher accepts only an
+  immutable `ACCEPTED` promotion receipt and requires the resulting full
+  source-tree hash to match it exactly. Use
+  **`--seed-override-reason <text>`** only for a deliberately new,
+  non-identical seed; the disclosed reason and both tree hashes are written to
+  `seed_provenance.json`. Use a distinct `--run-id` and `--work-base` for
+  resumed seeded sweeps so their host ledger cannot collide with a clean run.
 - **`--failure-memory-seed <failure_memory.json>`** copies prior retry guidance
   into each agent's private `/results` before prompt rendering.
 - **`--operator-seed <patch>`** applies operator-owned scaffolding as part of the

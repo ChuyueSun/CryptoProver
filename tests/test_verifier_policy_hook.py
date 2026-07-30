@@ -119,8 +119,8 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
          {"command": "python3 skills/verus_check.py src/x.rs --project /p --module x"}, False),
         ("fg verus_check stdout-only json parser", "Bash",
          {"command": "python3 /opt/harness/skills/verus_check.py x --project /p "
-                     "| python3 -c 'import json,sys; json.load(sys.stdin)'"},
-         False),
+          "| python3 -c 'import json,sys; json.load(sys.stdin)'"},
+         True),
         ("fg verus_check help slice", "Bash",
          {"command": "python3 /opt/harness/skills/verus_check.py --help 2>&1 | head -40"},
          False),
@@ -208,6 +208,25 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
 
                 src.write_text("proof fn lemma_x() { assert(true); }\n")
                 self.assertEqual(evaluate("Bash", verus_cmd), [])
+
+    def test_runner_owned_whole_crate_and_timeout_cap_are_enforced(self):
+        env = {
+            "DALEK_RUNNER_OWNS_WHOLE_CRATE": "1",
+            "DALEK_AGENT_MAX_VERIFIER_TIMEOUT": "300",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            whole = evaluate("Bash", {
+                "command": "python3 /opt/harness/skills/verus_check.py x --project /p --whole-crate"
+            })
+            slow = evaluate("Bash", {
+                "command": "python3 /opt/harness/skills/verus_check.py x --project /p --timeout 301"
+            })
+            focused = evaluate("Bash", {
+                "command": "python3 /opt/harness/skills/verus_check.py x --project /p --timeout 300"
+            })
+        self.assertIn("whole-crate verifier is runner-owned for this experiment", whole)
+        self.assertIn("agent verifier timeout exceeds runner policy cap", slow)
+        self.assertEqual(focused, [])
 
 
 if __name__ == "__main__":

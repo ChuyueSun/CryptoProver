@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse Bash hook: hard-block verifier commands that the prompt forbids.
 
-Rationale (internal review, T-crosstalk): `prompt.md` already tells the agent to run
+Rationale (AGENT_DEBATE T-crosstalk): `prompt.md` already tells the agent to run
 verifier skills in the FOREGROUND (no `run_in_background`), with no shell
 `timeout` wrapper, no fixed `/tmp/*.json` verifier files, no broad
 `pkill`/`killall`/`pgrep -f`, no merged-stderr JSON parser, no verifier
@@ -64,6 +64,9 @@ _HARNESS_SKILL = re.compile(
     r"search_macro|search_proven)\.py\b"
 )
 _VERIFIER_OUTPUT_SLICE = re.compile(r"\|\s*(?:head|tail|grep)\b")
+# Any pipe makes verifier stdout a secondary protocol and encourages sliced or
+# delayed parsing. `||` remains ordinary shell control flow, not a pipeline.
+_VERIFIER_PIPE = re.compile(r"\|&|(?<!\|)\|(?!\|)")
 _VERUS_CHECK_HELP = re.compile(r"\bverus_check\.py\b[\s\S]*?(?:^|\s)(?:-h|--help)(?:\s|$)")
 _RAW_ADMIT_COUNT_FLAG = re.compile(r"\b(?:grep|rg)\b[\s\S]*\s(?:-[A-Za-z]*c[A-Za-z]*|--count)\b")
 _RAW_ADMIT_COUNT_PIPE = re.compile(r"\|\s*wc\s+-l\b")
@@ -135,6 +138,20 @@ def _pre_edit_guard_has_diff():
     project_root = os.environ.get("DALEK_AGENT_PROJECT_ROOT", "").strip()
     return any(_path_has_git_diff(project_root, path) for path in paths)
 
+
+def _agent_timeout_exceeds_cap(cmd):
+    raw_cap = os.environ.get("DALEK_AGENT_MAX_VERIFIER_TIMEOUT", "").strip()
+    if not raw_cap:
+        return False
+    try:
+        cap = float(raw_cap)
+    except ValueError:
+        return False
+    for value in re.findall(r"(?:^|\s)--timeout\s+([0-9]+(?:\.[0-9]+)?)", cmd):
+        if float(value) > cap:
+            return True
+    return False
+
 _MSG = (
     "BLOCKED by proof-harness policy ({reasons}). Per prompt.md: run "
     "`python3 {verus_check} <target> --project <root>` in the FOREGROUND "
@@ -142,12 +159,13 @@ _MSG = (
     "`--rlimit N`) instead of a shell `timeout` wrapper; do NOT use "
     "run_in_background, do NOT redirect verifier output to /tmp/*.json|out|log, "
     "do NOT pipe merged stderr into a JSON parser, "
-    "do NOT pipe verifier output through head/tail/grep, "
+    "do NOT pipe verifier output to another command, "
     "do NOT use raw grep/rg counts for admits (use admit_inventory.py over the "
     "full editable scope), "
     "do NOT pkill/killall/pgrep -f, and never substitute raw `cargo verus` "
     "(or `cargo verus | grep/head`) for verus_check.py. The harness owns this "
-    "round's timeout + cleanup."
+    "round's timeout + cleanup; in whole-crate experiment modes the runner "
+    "also owns the package gate."
 )
 
 _PRE_EDIT_MSG = (
@@ -187,6 +205,13 @@ def evaluate(tool_name, tool_input):
             "verifier/skill stdout redirected to a file (read JSON stdout directly)")
     if is_verifier and _VERIFIER_OUTPUT_SLICE.search(cmd):
         reasons.append("verifier output piped through head/tail/grep")
+    if is_verifier and _VERIFIER_PIPE.search(cmd):
+        reasons.append("verifier output piped to another command (read JSON stdout directly)")
+    if is_verifier and _agent_timeout_exceeds_cap(cmd):
+        reasons.append("agent verifier timeout exceeds runner policy cap")
+    if (is_verifier and os.environ.get("DALEK_RUNNER_OWNS_WHOLE_CRATE") == "1"
+            and "--whole-crate" in cmd):
+        reasons.append("whole-crate verifier is runner-owned for this experiment")
     if _is_raw_admit_count(cmd):
         reasons.append("raw admit count (use admit_inventory.py)")
     if _BROAD_PROC.search(cmd):

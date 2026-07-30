@@ -45,20 +45,24 @@ FROM scratch AS warm
 # GCP VM has). Without it, the install-verus.sh URL hook is used instead.
 FROM scratch AS verus
 
+FROM node:22-bookworm-slim AS node
+
 FROM rust:${RUST_TOOLCHAIN}-bookworm AS base
 
 # --- system deps -----------------------------------------------------------
-# z3 + python3.11 + git/tar (seal recipe) + nodejs/npm (claude CLI).
+# z3 + python3.11 + git/tar (seal recipe). Node/npm come from the official
+# Node 22 stage because current Claude Code requires Node >=22; Debian
+# Bookworm's nodejs package is Node 18.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv python3-pip \
         z3 \
         git ca-certificates curl tar xz-utils \
-        nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 # --- claude CLI ------------------------------------------------------------
 # OAuth token is injected at RUN time (-e CLAUDE_CODE_OAUTH_TOKEN), never baked
 # (memory:run-claude-auth).
+COPY --from=node /usr/local/ /usr/local/
 RUN npm install -g @anthropic-ai/claude-code
 
 # --- verus -----------------------------------------------------------------
@@ -82,7 +86,7 @@ ENV PATH="/opt/verus:${PATH}"
 # --- harness (read-only) ---------------------------------------------------
 # Copy only the code the agent runs; results/ and worktrees live on mounted vols.
 WORKDIR /opt/harness
-COPY run.py admit.py peel.py replay.py prompt.md prompt_decompose.md ./
+COPY run.py run_layer.py launch.sh usage_audit.py admit.py peel.py replay.py prompt.md prompt_decompose.md ./
 COPY skills/ ./skills/
 COPY lib/ ./lib/
 COPY peel_manifests/ ./peel_manifests/

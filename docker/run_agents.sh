@@ -29,14 +29,19 @@
 #
 #   manifests.txt: one per line  ->  <manifest.json> [| pin | depth | minutes]
 #
-# RESUME (--seed-wip <patch>): apply a WIP unified git diff into each peeled
+# RESUME (--seed-wip <patch> --seed-receipt <promotion_receipt.json>): apply a WIP unified git diff into each peeled
 # host worktree AFTER peel, BEFORE seal, so the container resumes from partially-
-# reconstructed proofs. The patch is GUARDED to touch only the manifest's
-# editable_files and must apply cleanly. Use a SEPARATE --run-id/--work-base from
-# the clean sweep (the host ledger keys status by target_id, so a same-target
-# clean+resume in one sweep would clobber each other). Typical:
+# reconstructed proofs. A normal resume additionally requires an immutable
+# ACCEPTED promotion receipt and the resulting full source-tree hash must match
+# it exactly. The patch is GUARDED to touch only the manifest's editable_files
+# and must apply cleanly. `--seed-override-reason` makes a deliberate new seed
+# explicit rather than silently reusing an unbound residue. Use a SEPARATE
+# --run-id/--work-base from the clean sweep (the host ledger keys status by
+# target_id, so a same-target clean+resume in one sweep would clobber each
+# other). Typical:
 #   git -C <peeled-repo> diff <baseline> <wip-ref> > /tmp/wip.patch
-#   docker/run_agents.sh ... --run-id resume_001 --seed-wip /tmp/wip.patch
+#   docker/run_agents.sh ... --run-id resume_001 --seed-wip /tmp/wip.patch \
+#       --seed-receipt /path/to/promotion_receipt.json
 #
 # To carry prior retry guidance into a resumed isolated agent, pass:
 #   --failure-memory-seed /path/to/previous/results/failure_memory.json
@@ -65,6 +70,8 @@ IMAGE=dalek-harness:v1
 GITROOT=""; REF="eval/admitted-start"; RUN_ID=""
 MANIFESTS_FILE=""
 SEED_WIP=""                      # optional resume seed: guarded to editable files
+SEED_RECEIPT=""                  # immutable ACCEPTED promotion receipt for --seed-wip
+SEED_OVERRIDE_REASON=""          # disclosed reason for a deliberately non-identical/new seed
 FAILURE_MEMORY_SEED=""           # optional prior failure_memory.json copied into private /results
 OPERATOR_SEED=""                 # optional operator seed: source-only, may touch frozen files
 TAP=0                            # --tap: route each container's claude through a per-agent claude-tap proxy
@@ -95,6 +102,8 @@ while [ $# -gt 0 ]; do
         --run-id) RUN_ID="$2"; shift 2 ;;
         --manifests-file) MANIFESTS_FILE="$2"; shift 2 ;;
         --seed-wip) SEED_WIP="$2"; shift 2 ;;
+        --seed-receipt) SEED_RECEIPT="$2"; shift 2 ;;
+        --seed-override-reason) SEED_OVERRIDE_REASON="$2"; shift 2 ;;
         --failure-memory-seed) FAILURE_MEMORY_SEED="$2"; shift 2 ;;
         --operator-seed) OPERATOR_SEED="$2"; shift 2 ;;
         --tap) TAP=1; shift ;;
@@ -116,10 +125,20 @@ done
 [ -n "$RUN_ID" ] || die "--run-id required"
 [ -n "$MANIFESTS_FILE" ] || die "--manifests-file required"
 [ -z "$SEED_WIP" ] || [ -f "$SEED_WIP" ] || die "--seed-wip patch not found: $SEED_WIP"
+[ -z "$SEED_RECEIPT" ] || [ -f "$SEED_RECEIPT" ] || die "--seed-receipt not found: $SEED_RECEIPT"
 [ -z "$FAILURE_MEMORY_SEED" ] || [ -f "$FAILURE_MEMORY_SEED" ] || die "--failure-memory-seed not found: $FAILURE_MEMORY_SEED"
 [ -z "$OPERATOR_SEED" ] || [ -f "$OPERATOR_SEED" ] || die "--operator-seed patch not found: $OPERATOR_SEED"
+[ -z "$SEED_WIP" ] || [ -n "$SEED_RECEIPT" ] || [ -n "$SEED_OVERRIDE_REASON" ] \
+    || die "--seed-wip requires --seed-receipt or an explicit --seed-override-reason"
+[ -z "$SEED_RECEIPT" ] || [ -n "$SEED_WIP" ] \
+    || die "--seed-receipt is meaningful only with --seed-wip"
 [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || die "CLAUDE_CODE_OAUTH_TOKEN not set (memory:run-claude-auth)"
 command -v docker >/dev/null || die "docker not on PATH"
+SEED_RECEIPT_TREE_HASH=""
+if [ -n "$SEED_RECEIPT" ]; then
+    SEED_RECEIPT_TREE_HASH="$(python3 "$repo/lib/provenance.py" --accepted-tree-hash "$SEED_RECEIPT")" \
+        || die "--seed-receipt must be an immutable ACCEPTED promotion receipt"
+fi
 if [ -n "$FAILURE_MEMORY_SEED" ]; then
     python3 - "$FAILURE_MEMORY_SEED" <<'PY' || die "--failure-memory-seed is not valid JSON with a records array: $FAILURE_MEMORY_SEED"
 import json
@@ -361,6 +380,47 @@ PY
         cp "$SEED_WIP" "$agent_dir/seed.patch"
         sha256sum "$SEED_WIP" | awk '{print $1}' > "$agent_dir/seed.sha256"
         echo "SEED applied idx=$idx sha=$(cat "$agent_dir/seed.sha256") src=$SEED_WIP" >&2
+
+        # A source patch alone proves only that it applied. Bind the sealed
+        # baseline to an ACCEPTED predecessor tree, or disclose that this is a
+        # deliberately new seed before a container has any chance to run.
+        local actual_seed_tree_hash=""
+        actual_seed_tree_hash="$(python3 "$repo/lib/provenance.py" "$host_wt" --tree-hash)" \
+            || { echo "SEED receipt hash FAIL idx=$idx" >&2; ledger_set "agent_$idx" "SEED_RECEIPT_FAIL"; return 1; }
+        if [ -n "$SEED_RECEIPT_TREE_HASH" ] && [ "$actual_seed_tree_hash" != "$SEED_RECEIPT_TREE_HASH" ] \
+                && [ -z "$SEED_OVERRIDE_REASON" ]; then
+            echo "SEED receipt mismatch idx=$idx expected=$SEED_RECEIPT_TREE_HASH actual=$actual_seed_tree_hash" >&2
+            ledger_set "agent_$idx" "SEED_RECEIPT_MISMATCH"; return 1
+        fi
+        if [ -z "$SEED_RECEIPT_TREE_HASH" ] && [ -z "$SEED_OVERRIDE_REASON" ]; then
+            echo "SEED receipt missing idx=$idx" >&2
+            ledger_set "agent_$idx" "SEED_RECEIPT_REQUIRED"; return 1
+        fi
+        if [ -n "$SEED_RECEIPT" ]; then
+            cp "$SEED_RECEIPT" "$agent_dir/seed_promotion_receipt.json"
+            sha256sum "$SEED_RECEIPT" | awk '{print $1}' > "$agent_dir/seed_promotion_receipt.sha256"
+        fi
+        python3 - "$agent_dir/seed_provenance.json" "$SEED_RECEIPT" \
+                "$SEED_RECEIPT_TREE_HASH" "$actual_seed_tree_hash" "$SEED_OVERRIDE_REASON" <<'PY'
+import json
+import sys
+
+path, receipt_path, expected, actual, override = sys.argv[1:]
+json.dump({
+    "schema_version": 1,
+    "kind": "seed_provenance",
+    "promotion_receipt_path": receipt_path or None,
+    "expected_tree_hash": expected or None,
+    "actual_tree_hash": actual,
+    "exact_match": bool(expected) and expected == actual,
+    "override_reason": override or None,
+}, open(path, "w"), indent=2, sort_keys=True)
+PY
+        if [ -n "$SEED_OVERRIDE_REASON" ]; then
+            echo "SEED override idx=$idx reason=$SEED_OVERRIDE_REASON expected=${SEED_RECEIPT_TREE_HASH:-none} actual=$actual_seed_tree_hash" >&2
+        else
+            echo "SEED receipt verified idx=$idx tree=$actual_seed_tree_hash" >&2
+        fi
     fi
 
     # 2) seal the peeled tree into an isolated-store /work volume.

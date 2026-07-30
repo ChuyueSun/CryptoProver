@@ -1117,6 +1117,9 @@ class RawUsageSummary(unittest.TestCase):
         )
         self.assertEqual(summary["result_events"], 1)
         self.assertEqual(summary["result_total_cost_usd_max"], 4.25)
+        self.assertEqual(summary["result_cost_reported_events"], 1)
+        self.assertEqual(summary["result_cost_unreported_events"], 0)
+        self.assertTrue(summary["result_cost_complete"])
         self.assertEqual(
             summary["model_usage_by_model_max"]["claude-opus-4-8"]
             ["cache_creation_input_tokens"],
@@ -1134,6 +1137,10 @@ class RawUsageSummary(unittest.TestCase):
         self.assertEqual(summary["jsonl_lines"], 0)
         self.assertEqual(summary["assistant_usage_events"], 0)
         self.assertEqual(summary["result_events"], 0)
+        self.assertIsNone(summary["result_total_cost_usd_max"])
+        self.assertEqual(summary["result_cost_reported_events"], 0)
+        self.assertEqual(summary["result_cost_unreported_events"], 0)
+        self.assertFalse(summary["result_cost_complete"])
         self.assertEqual(
             summary["assistant_usage_event_sums"]
             ["cache_creation_input_tokens"],
@@ -1353,6 +1360,65 @@ class ForbiddenConstructCounter(unittest.TestCase):
         from lib.admits import count_forbidden_constructs
         c = count_forbidden_constructs("assume_specification foo();\n")
         self.assertEqual(c["assume"], 0)
+
+    def test_counts_verifier_rlimit_attribute(self):
+        # `#[verifier::rlimit(N)]` lifts one function's solver budget above
+        # the package gate's CLI --rlimit — config, not proof (gcp27 R1).
+        from lib.admits import count_forbidden_constructs
+        src = (
+            "#[verifier::rlimit(400)]\n"
+            "fn compress() {}\n"
+            "#[verifier :: rlimit(80)]\n"  # whitespace around the path sep
+            "fn step_2() {}\n"
+        )
+        c = count_forbidden_constructs(src)
+        self.assertEqual(c["rlimit"], 2)
+
+    def test_rlimit_in_comments_strings_cli_not_matched(self):
+        from lib.admits import count_forbidden_constructs
+        src = (
+            "// use #[verifier::rlimit(400)] is forbidden\n"
+            'let s = "verifier::rlimit in a string";\n'
+            "// verus_check.py --rlimit 80 is the CLI flag, not the attribute\n"
+            "fn ok() {}\n"
+        )
+        c = count_forbidden_constructs(src)
+        self.assertEqual(c["rlimit"], 0)
+
+    def test_gate_flags_post_baseline_rlimit_and_tolerates_seeded(self):
+        # Exercise the REAL gate functions run_task uses (run.py's
+        # _count_forbidden_in_files / _forbidden_delta): a pre-existing
+        # #[verifier::rlimit] in the seed is tolerated (baseline-diff), an
+        # agent-introduced one is flagged; a nonempty delta is exactly the
+        # condition run_task's loop breaks on with FORBIDDEN_CONSTRUCT
+        # (terminality of that reason: test_forbidden_construct_is_terminal).
+        import run
+        with tempfile.TemporaryDirectory() as td:
+            seeded = Path(td) / "seeded.rs"
+            seeded.write_text(
+                "#[verifier::rlimit(120)]\n"   # pre-existing: tolerated
+                "fn legacy() {}\n"
+            )
+            fresh = Path(td) / "fresh.rs"
+            fresh.write_text("fn clean() {}\n")
+            files = [seeded, fresh]
+
+            baseline = run._count_forbidden_in_files(files)
+            self.assertEqual(baseline["rlimit"], 1)
+            # No change -> nothing introduced (seeded attribute tolerated).
+            self.assertEqual(run._forbidden_delta(files, baseline), [])
+
+            # Agent lifts a budget post-baseline -> flagged.
+            fresh.write_text(
+                "#[verifier::rlimit(400)]\n"
+                "fn compress() {}\n"
+            )
+            self.assertEqual(
+                run._forbidden_delta(files, baseline), ["rlimit (+1)"])
+
+            # Removing it again clears the delta (revert path).
+            fresh.write_text("fn compress() {}\n")
+            self.assertEqual(run._forbidden_delta(files, baseline), [])
 
     def test_introduced_detected_by_count_diff(self):
         from lib.admits import count_forbidden_constructs
@@ -2130,6 +2196,8 @@ class FieldFloorPromptScope(unittest.TestCase):
         self.assertNotIn("{SKILLS_ROOT}", out)
         self.assertNotIn("{SKILL_DOC}", out)
         self.assertIn("If even one NON-AXIOM `admit()` remains in the target", out)
+        self.assertIn("returns `{\"okay\": true}`", out)
+        self.assertIn("Run `python3", out)
         self.assertIn(
             f"python3 {run.HERE / 'skills' / 'admit_inventory.py'} {self._BASE / 'ristretto.rs'}",
             out,
@@ -2195,12 +2263,27 @@ class FieldFloorPromptScope(unittest.TestCase):
         self.assertNotIn("{SKILL_DOC}", out)
         self.assertIn("target path plus every other editable file", out)
         self.assertIn("--whole-crate --timeout", out)
-        self.assertNotIn("--rlimit 80.0", out)
+        self.assertIn("--rlimit 80.0", out)
         self.assertIn("any editable file listed in", out)
         self.assertIn("full editable", out)
         self.assertIn("--siblings <editable-a.rs>", out)
         self.assertIn("no new `admit()`", out)
+        self.assertIn("solver-budget-lifting", out)
         self.assertIn("let Verus report the remaining obligations", out)
+        self.assertIn(
+            "the runner-owned package gate's latest matching receipt is green",
+            out,
+        )
+        self.assertIn(
+            "Run only `spec_check verify` and `admit_inventory` immediately "
+            "before emitting COMPLETE.",
+            out,
+        )
+        self.assertNotIn("`the runner-owned package gate", out)
+        self.assertNotIn("do not invoke it yourself) returns", out)
+        self.assertNotIn("Run all three checks immediately before emitting COMPLETE.", out)
+        self.assertNotIn("{COMPLETE_VERIFY_CONDITION}", out)
+        self.assertNotIn("{PRE_COMPLETE_CHECKS}", out)
         self.assertIn("## General proof-craft rules", out)
         self.assertIn("Never add a new `axiom_*`", out)
         self.assertIn("use `use_type_invariant(...)`", out)
@@ -2382,7 +2465,7 @@ class FeedbackVisibilityHelpers(unittest.TestCase):
             "COMPLETE",
         )
 
-    def test_harness_whole_crate_command_uses_default_rlimit_first(self):
+    def test_harness_whole_crate_command_keeps_configured_rlimit(self):
         import run
         target = Path("/wt/curve25519-dalek/src/ristretto.rs")
         project = Path("/wt/curve25519-dalek")
@@ -2392,7 +2475,8 @@ class FeedbackVisibilityHelpers(unittest.TestCase):
 
         self.assertIn("--whole-crate", cmd)
         self.assertIn("--timeout", cmd)
-        self.assertNotIn("--rlimit", cmd)
+        self.assertIn("--rlimit", cmd)
+        self.assertIn("80.0", cmd)
 
     def test_harness_module_command_keeps_configured_rlimit(self):
         import run

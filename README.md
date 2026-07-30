@@ -206,6 +206,7 @@ cryptoprover/
 ├── run.py              # the driver — one target per invocation
 ├── run_layer.py        # iterate one of layer-sets A/B/C/D sequentially
 ├── launch.sh           # arbitrary target lists + Claude-Code-safe --detach
+├── usage_audit.py      # provider-cost receipt completeness and reconciliation
 ├── peel.py             # init-state builder: manifest → graded peeled cut
 ├── peel_run.sh         # one command: manifest → peeled worktree → run.py
 ├── peel_manifests/     # the cuts (field_floor.json, decompress_*.json, …)
@@ -219,6 +220,7 @@ cryptoprover/
 ├── lib/                # support modules (not skills)
 │   ├── catalog.py      # canonical symbol catalog (shared by search skills)
 │   ├── failure_memory.py  # per-function persistent failure records
+│   ├── provenance.py   # content-addressed source-tree and promotion receipts
 │   └── results.py      # result-dir helpers + dataclasses
 └── skills/             # CLIs the agent invokes via Bash
     ├── SKILL.md
@@ -235,7 +237,8 @@ cryptoprover/
 ## Prerequisites
 
 - Python 3.11+
-- Claude Code CLI (`claude`) on PATH, authenticated
+- One authenticated agent CLI on PATH: Claude Code (`claude`, the default) or
+  Codex (`codex`, selected with `--backend codex`)
 - Verus / `cargo verus` installed and on PATH
 - A Verus-annotated Rust project with at least one `admit()` to fill in
 
@@ -265,7 +268,10 @@ python run.py /path/to/dalek-lite/curve25519-dalek/src/specs/field_specs.rs
 # Budget + explicit run id + results dir
 python run.py <target> --rounds 5 --run-id baseline_001 --results ./results
 
-# Cheaper model for simpler modules
+# Use Codex's noninteractive backend (`codex exec --json`)
+python run.py <target> --backend codex
+
+# Select a model understood by the chosen backend
 python run.py <target> --model sonnet    # haiku | sonnet | opus | claude-sonnet-4-6
 
 # Include vstd in the catalog so skills find vstd lemmas
@@ -282,6 +288,23 @@ python run.py <target> --project /path/to/cargo/root
 
 The target file must live inside a buildable Cargo project (an ancestor
 directory has `Cargo.toml`). `run.py` detects this automatically.
+
+`--backend claude` remains the default. The Codex backend starts with
+`codex exec --json`, captures the emitted thread ID, and continues later
+rounds with `codex exec resume <thread-id>`. It normalizes Codex JSONL into
+the existing round/result schema and records `agent_backend` in `result.json`.
+The raw directory remains named `claude_raw/` for compatibility with existing
+analysis scripts.
+
+Codex terminal events currently report tokens but not provider dollar cost.
+Those receipts therefore use `total_cost_usd: null` with
+`cost_reported: false`; aggregate summaries preserve the recorded-cost lower
+bound and count unresolved receipts instead of presenting missing cost as
+`$0.00`. Both backends run without interactive approval inside the proof
+harness, so use an isolated worktree or container. Claude rounds also install
+the verifier-policy pre-tool hook; Codex relies on the prompt plus the
+runner's post-round process, git-recovery, tooling, spec, axiom, and
+forbidden-construct gates.
 
 ### Layer Set A (the field-layer benchmark)
 
@@ -334,6 +357,16 @@ EOF
 # Watch: each completed target emits one MARKER line
 tail -f launcher_rerun_002.log | grep --line-buffered '^MARKER'
 ```
+
+The launcher starts cost accounting before the first agent process. It writes
+`launch_envelope.json`, a pre-spawn `round_N.lifecycle.json` for every
+attempted stream, and a sealed `usage_audit.json`. Before a resumed launch
+reuses a run/task path, the prior task directory moves into append-only
+`_usage_history/` so round numbering cannot overwrite billing evidence.
+MARKER lines report the cumulative provider-reported cost floor,
+`cost_status=complete|lower_bound|unknown`, and unresolved-stream count.
+Tokens are never locally repriced as an exact charge; interrupted or
+ambiguous streams remain visibly unresolved until provider reconciliation.
 
 `launch.sh` is sequential by design — for one project worktree you do
 not want parallel `run.py`s (cargo-lock contention plus
@@ -391,7 +424,8 @@ results/<run_id>/<target_id>/
 ├── prompt_rendered.md       # exact prompt Claude received (for reproducibility)
 ├── spec_snapshot.json       # signature baseline (spec_check reference)
 └── claude_raw/
-    ├── round_1.jsonl        # raw Claude stream-json
+    ├── round_1.lifecycle.json # written before spawn, sealed after exit
+    ├── round_1.jsonl        # raw agent JSONL
     └── round_2.jsonl
 ```
 
@@ -400,7 +434,8 @@ Aggregate state across runs:
 ```
 results/
 ├── failure_memory.json      # per-(module,function) prior failures
-└── proven_registry.json     # cumulative list of proven targets
+├── proven_registry.json     # cumulative list of proven targets
+└── <run_id>/usage_audit.json # cost floor and unresolved-stream inventory
 ```
 
 ## Observability

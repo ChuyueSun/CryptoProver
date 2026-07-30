@@ -190,21 +190,31 @@ def axiom_fn_names(text: str) -> set[str]:
 # the `_`), so the assume-expression form is matched on its own.
 _ASSUME_RE = re.compile(r"\bassume\s*\(")
 _EXTERNAL_BODY_RE = re.compile(r"\bexternal_body\b")
+# `#[verifier::rlimit(N)]` lifts one function's solver budget above the
+# runner's package-gate `--rlimit` (the attribute overrides the CLI flag
+# per-function), so an agent can turn a resource-limit failure "green"
+# without a proof change — poisoning config-identity of the canonical
+# error vector. Matched on the attribute path so `--rlimit` CLI mentions
+# in strings/comments never trip it (strip_comments_strings removes those
+# anyway).
+_VERIFIER_RLIMIT_RE = re.compile(r"\bverifier\s*::\s*rlimit\b")
 
 
 def count_forbidden_constructs(text: str) -> dict[str, int]:
     """Count proof-bypass constructs in `text`, ignoring comments and string
     literals (so a mention in prose / a URL never trips the count).
 
-    Returns ``{"assume": int, "external_body": int}``. Used by the harness's
-    forbidden-construct integrity gate (run.py), which diffs these counts
-    against a pre-run baseline — only AGENT-introduced constructs fail a round,
-    so a pre-existing `external_body` in seeded dalek source is tolerated.
+    Returns ``{"assume": int, "external_body": int, "rlimit": int}``. Used by
+    the harness's forbidden-construct integrity gate (run.py), which diffs
+    these counts against a pre-run baseline — only AGENT-introduced constructs
+    fail a round, so a pre-existing `external_body` or `#[verifier::rlimit]`
+    in seeded dalek source is tolerated.
     """
     code = strip_comments_strings(text)
     return {
         "assume": len(_ASSUME_RE.findall(code)),
         "external_body": len(_EXTERNAL_BODY_RE.findall(code)),
+        "rlimit": len(_VERIFIER_RLIMIT_RE.findall(code)),
     }
 
 

@@ -29,6 +29,13 @@ class FailureRecord:
     # --- Feature 1: near-miss memory. Defaults keep old records loadable. ---
     failed_decls: list[str] = field(default_factory=list)  # decls verus rejected last
     near_miss: str = ""             # the agent's final proof source for those decls
+    # Receipt context was absent in early traces. Defaults make old records
+    # loadable, while new prompts can mark them archival rather than pretending
+    # they describe the candidate/configuration currently under repair.
+    tree_hash: str = ""
+    gate_signature: str = ""
+    diagnostic_kind_counts: dict[str, int] = field(default_factory=dict)
+    receipt_path: str = ""
 
 
 def path_for(results_root: Path) -> Path:
@@ -66,6 +73,10 @@ def record(
     end_reason: str = "LIMIT",
     failed_decls: Optional[list[str]] = None,
     near_miss: str = "",
+    tree_hash: str = "",
+    gate_signature: str = "",
+    diagnostic_kind_counts: Optional[dict[str, int]] = None,
+    receipt_path: str = "",
 ) -> None:
     """Append one failure record. Truncate the error blob to keep the file small."""
     records = load(results_root)
@@ -80,6 +91,10 @@ def record(
         end_reason=end_reason,
         failed_decls=failed_decls or [],
         near_miss=near_miss[:4000],
+        tree_hash=tree_hash,
+        gate_signature=gate_signature,
+        diagnostic_kind_counts=dict(diagnostic_kind_counts or {}),
+        receipt_path=receipt_path,
     ))
     save(results_root, records)
 
@@ -92,7 +107,10 @@ def query(results_root: Path, module: str, function: str) -> list[FailureRecord]
     return matches
 
 
-def as_prompt_block(records: list[FailureRecord], max_entries: int = 3) -> str:
+def as_prompt_block(
+    records: list[FailureRecord], max_entries: int = 3,
+    *, current_tree_hash: str = "", current_gate_signature: str = "",
+) -> str:
     """Render the most recent failures as a markdown block the prompt can include.
 
     The caller's template owns the `## Prior failed attempts` heading; this
@@ -104,6 +122,23 @@ def as_prompt_block(records: list[FailureRecord], max_entries: int = 3) -> str:
     for r in records[:max_entries]:
         lines.append(f"### Attempt on {r.timestamp} (run {r.run_id}, {r.rounds_used} rounds)")
         lines.append(f"- **End reason**: {r.end_reason}")
+        compatible = bool(
+            r.tree_hash and r.gate_signature
+            and r.tree_hash == current_tree_hash
+            and r.gate_signature == current_gate_signature
+        )
+        if compatible:
+            lines.append("- **Receipt compatibility**: current candidate and runner gate")
+        elif r.tree_hash or r.gate_signature:
+            lines.append("- **Receipt compatibility**: archival (different source tree or gate config)")
+        else:
+            lines.append("- **Receipt compatibility**: archival (legacy record has no source/gate receipt)")
+        if r.diagnostic_kind_counts:
+            lines.append(
+                "- **Diagnostic kinds**: " + ", ".join(
+                    f"{kind}={count}" for kind, count in sorted(r.diagnostic_kind_counts.items())
+                )
+            )
         if r.tried_strategies:
             lines.append(f"- **Tried strategies**: {'; '.join(r.tried_strategies)}")
         if r.failed_decls:

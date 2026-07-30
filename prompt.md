@@ -31,11 +31,17 @@ Per-run paths — substitute these into skill commands (syntax in `skills/SKILL.
 2. **No `#[verifier::external_body]`.** It silently bypasses SMT verification.
    This is harness-enforced: a new `external_body` fn (or `assume(...)`, below)
    fails the round, the same way spec/axiom drift does.
+   **No `#[verifier::rlimit(...)]` (a solver-budget-lifting attribute)**
+   either: a per-function rlimit overrides the authoritative gate's `--rlimit`,
+   turning a resource-limit failure "green" by configuration instead of proof.
+   Also harness-enforced; fails the round as FORBIDDEN_CONSTRUCT. If an
+   obligation exhausts the budget, decompose the assertion (see below), don't
+   raise the budget.
 3. {TEMP_ADMIT_RULE}
 4. {EDIT_SCOPE_RULE}
 5. **Compile AND fill every NON-AXIOM admit before declaring victory.**
    Emit `END_REASON:COMPLETE` ONLY when ALL THREE hold:
-   - `{COMPLETE_VERIFY_COMMAND}` returns `{"okay": true}`
+   - {COMPLETE_VERIFY_CONDITION}
    - `spec_check verify` returns no drift
    - **Every `admit()` outside `proof fn axiom_*` bodies has been
      replaced with a real proof.**
@@ -59,9 +65,10 @@ Per-run paths — substitute these into skill commands (syntax in `skills/SKILL.
 ## General proof-craft rules
 
 Keep these rules generic and local to the current obligation:
-1. Never add a new `axiom_*`, `assume(...)`, `external_body`, or non-axiom
-   `admit()` to make progress look green. If the next proof obligation is hard,
-   let Verus report it.
+1. Never add a new `axiom_*`, `assume(...)`, `external_body`, non-axiom
+   `admit()`, or `#[verifier::rlimit(...)]` (solver-budget-lifting) attribute
+   to make progress look green. If the next proof obligation is hard,
+   let Verus report it; if it runs out of budget, decompose it.
 2. For opaque structs, wrapper types, or values with type invariants, first look
    for existing local patterns and use `use_type_invariant(...)` / established
    invariant-opening helpers before inventing new facts.
@@ -250,11 +257,13 @@ signature, `requires`/`ensures`, and body. Work these dependency-first:
       description of what you want.
    e. Draft the proof. Reference catalog entries by their exact name.
    f. Run `python3 {SKILLS_ROOT}/verus_check.py <absolute-file.rs> --project {PROJECT_ROOT}`
-      (add `--whole-crate` for whole-crate truth, never `cargo verus | grep | head`).
+      for focused foreground feedback (never `cargo verus | grep | head`). If
+      EXPERIMENT MODE says the package gate is runner-owned, do **not** add
+      `--whole-crate`: the runner records that authoritative receipt after the
+      round.
       If errors, read the grouped `summary` / `messages[]` carefully and iterate.
-3. **Before declaring COMPLETE**, run both
-   `{COMPLETE_VERIFY_COMMAND}`
-   and `spec_check verify`. Both must succeed.
+3. **Before declaring COMPLETE**, ensure {COMPLETE_VERIFY_CONDITION}
+   and that `spec_check verify` shows no drift.
 
 {DECOMPOSE_BLOCK}
 
@@ -316,13 +325,10 @@ Your **last line** must be exactly one of:
 ```
 END_REASON:COMPLETE
 ```
-Emit this ONLY when:
-`{COMPLETE_VERIFY_COMMAND}`
-returns `okay:true` AND `spec_check`
+Emit this ONLY when {COMPLETE_VERIFY_CONDITION} AND `spec_check`
 shows no drift AND `admit_inventory` reports `non_axiom_count: 0`
 (every non-axiom admit has been replaced with a real proof; admits
-inside `proof fn axiom_*` bodies don't count). Run all three checks
-immediately before emitting COMPLETE.
+inside `proof fn axiom_*` bodies don't count). {PRE_COMPLETE_CHECKS}
 
 ```
 END_REASON:LIMIT

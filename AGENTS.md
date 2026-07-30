@@ -155,7 +155,7 @@ mkdir -p .claude/skills && ln -sfn "$(pwd)/skills" ".claude/skills/dalek-lite-mv
 `run.py` is the entire orchestrator (~6.2k LOC on `spec_gen`; the MVP baseline was ~550). It:
 1. Snapshots function signatures (`spec_check.py snapshot`).
 2. Renders `prompt.md` with target/project/module/snapshot/cache/failure-memory + scope placeholders, writes `prompt_rendered.md` for reproducibility.
-3. Loops up to N rounds. Round 1 invokes `claude -p --session-id <uuid> --verbose --output-format stream-json`; later rounds invoke `claude --resume <session_id> -p` with structured round-history feedback as the continue message. The session is pinned by **explicit UUID**, not `-c`'s mtime-based lookup, which a concurrent interactive Claude Code session in the same dir would silently hijack (`run_claude_round`, `run.py:3759-3770`).
+3. Loops up to N rounds using the selected backend: Claude Code by default, or noninteractive Codex with `--backend codex`. Continuations use the backend's explicit session/thread ID rather than a global “most recent” lookup.
 4. After each round: spec-drift gate → verus check → record `round_N.json`.
 5. Decides whether to continue: an agent `COMPLETE` claim that verus corroborates (zero hard `admit()`, no integrity drift) breaks early; a cheat/integrity drift (`SPEC_DRIFT`, …) breaks; otherwise continue.
 6. On exit: the pure `run._final_end_reason` gate records the authoritative end_reason. **`COMPLETE` is recorded only when Verus is okay for the configured gate scope, no integrity gate drifted, AND zero hard `admit()` remain in scope** — `admit()` makes Verus accept any postcondition trivially, so verus_okay alone is insufficient. The gate can **promote** an over-cautious `LIMIT`/empty claim to `COMPLETE` when truly green (it does *not* require the agent to have claimed done); infrastructure + cheat labels (`RATE_LIMITED`/`RETRY_EXHAUSTED`/`USER_INTERRUPTED`/`TRANSPORT_ERROR`, `SPEC_DRIFT`/`AXIOM_DRIFT`/…) stay non-promotable.
@@ -164,7 +164,7 @@ There is no orchestration class hierarchy. No `VerusAgent`, no `RepairLoop`, no 
 
 ### Process-group lifecycle (important)
 
-`claude` is spawned with `start_new_session=True` so all descendants live in one process group. `run.py` installs a SIGTERM/SIGINT/SIGHUP handler that `killpg`s that group, and post-completion always `killpg`s again. Without this, killing `run.py` orphans `claude` plus its async subprocesses (cargo verus, z3, Monitor poll loops) — they will run forever. Preserve this behaviour when editing the subprocess management code.
+The selected agent CLI is spawned with `start_new_session=True` so all descendants live in one process group. `run.py` installs a SIGTERM/SIGINT/SIGHUP handler that `killpg`s that group, and post-completion always `killpg`s again. Without this, killing `run.py` can orphan the agent plus async subprocesses (cargo verus, z3, Monitor poll loops). Preserve this behaviour when editing subprocess management.
 
 ### Skills as CLIs (not Python imports)
 

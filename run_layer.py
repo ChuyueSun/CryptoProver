@@ -206,6 +206,68 @@ def _previously_successful(results_root: Path, run_id: str, module: str,
         return False
 
 
+def _aggregate_usage_receipts(round_results) -> dict:
+    """Aggregate tokens and only provider-reported dollar receipts.
+
+    Older Claude artifacts predate ``cost_reported``; a numeric cost remains a
+    valid legacy receipt.  Explicit false/null values are unknown, not zero.
+    """
+    totals = {
+        "recorded_cost_usd": 0.0,
+        "unknown_cost_rounds": 0,
+        "cache_creation_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+    for rr in round_results:
+        usage = rr.claude_usage or {}
+        cost = usage.get("total_cost_usd")
+        marker = usage.get("cost_reported")
+        numeric_cost = (
+            isinstance(cost, (int, float)) and not isinstance(cost, bool)
+        )
+        if marker is True and numeric_cost:
+            totals["recorded_cost_usd"] += float(cost)
+        elif marker is None and numeric_cost:
+            # Backward-compatible interpretation for pre-marker Claude runs.
+            totals["recorded_cost_usd"] += float(cost)
+        else:
+            totals["unknown_cost_rounds"] += 1
+        totals["cache_creation_tokens"] += (
+            usage.get("cache_creation_input_tokens", 0) or 0)
+        totals["input_tokens"] += usage.get("input_tokens", 0) or 0
+        totals["output_tokens"] += usage.get("output_tokens", 0) or 0
+    totals["cost_complete"] = totals["unknown_cost_rounds"] == 0
+    totals["cost_usd"] = (
+        totals["recorded_cost_usd"] if totals["cost_complete"] else None)
+    return totals
+
+
+def _cost_label(recorded_cost_usd: float, unknown_cost_rounds: int,
+                unknown_cost_modules: int = 0) -> str:
+    if unknown_cost_rounds or unknown_cost_modules:
+        gaps = []
+        if unknown_cost_rounds:
+            gaps.append(f"{unknown_cost_rounds} round(s) unreported")
+        if unknown_cost_modules:
+            gaps.append(f"{unknown_cost_modules} module result(s) unreceipted")
+        return (
+            f"unknown (recorded >=${recorded_cost_usd:.2f}; "
+            f"{', '.join(gaps)})"
+        )
+    return f"${recorded_cost_usd:.2f}"
+
+
+def _summary_cost_label(summary: dict) -> str:
+    if summary.get("cost_status") == "not_run":
+        return "n/a (not run)"
+    return _cost_label(
+        summary.get("recorded_cost_usd", summary.get("cost_usd", 0) or 0),
+        summary.get("unknown_cost_rounds", 0),
+        summary.get("unknown_cost_modules", 0),
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("layer_set", choices=sorted(LAYER_SETS.keys()))
@@ -284,7 +346,9 @@ def main() -> int:
     summary: list[dict] = []
     # S3 — cumulative tracking. No abort cap; we're on a fixed plan so the
     # API enforces its own rate limits.
-    cum_cost = 0.0
+    cum_recorded_cost = 0.0
+    cum_unknown_cost_rounds = 0
+    cum_unknown_cost_modules = 0
     cum_input = 0
     cum_cache_creation = 0
     cum_output = 0
@@ -299,7 +363,11 @@ def main() -> int:
         except FileNotFoundError as e:
             print(f"[run_layer] SKIP: {e}")
             summary.append({"module": module, "success": False,
-                            "reason": "file_not_found"})
+                            "reason": "file_not_found",
+                            "cost_status": "not_run",
+                            "cost_usd": None,
+                            "recorded_cost_usd": 0.0,
+                            "unknown_cost_rounds": 0})
             continue
 
         # Auto-budget per module: max(floor, slope * admits)
@@ -323,24 +391,23 @@ def main() -> int:
                 skip_failure_memory=args.no_failure_memory,
                 vstd_root=args.vstd_root.resolve() if args.vstd_root else None,
             )
-            # Accumulate S3 stats from each round's claude_usage.
-            this_cost = 0.0
-            this_cc = 0
-            this_in = 0
-            this_out = 0
-            for rr in result.round_results:
-                u = rr.claude_usage or {}
-                this_cost += u.get("total_cost_usd", 0) or 0
-                this_cc += u.get("cache_creation_input_tokens", 0) or 0
-                this_in += u.get("input_tokens", 0) or 0
-                this_out += u.get("output_tokens", 0) or 0
-            cum_cost += this_cost
+            # Accumulate S3 stats without treating absent provider cost as $0.
+            usage_totals = _aggregate_usage_receipts(result.round_results)
+            this_recorded_cost = usage_totals["recorded_cost_usd"]
+            this_unknown_cost_rounds = usage_totals["unknown_cost_rounds"]
+            this_cc = usage_totals["cache_creation_tokens"]
+            this_in = usage_totals["input_tokens"]
+            this_out = usage_totals["output_tokens"]
+            cum_recorded_cost += this_recorded_cost
+            cum_unknown_cost_rounds += this_unknown_cost_rounds
             cum_cache_creation += this_cc
             cum_input += this_in
             cum_output += this_out
-            print(f"[run_layer] module cost ${this_cost:.2f} "
+            print(f"[run_layer] module cost "
+                  f"{_cost_label(this_recorded_cost, this_unknown_cost_rounds)} "
                   f"(cc={this_cc/1000:.0f}k out={this_out/1000:.1f}k) | "
-                  f"cumulative ${cum_cost:.2f}")
+                  f"cumulative "
+                  f"{_cost_label(cum_recorded_cost, cum_unknown_cost_rounds)}")
 
             summary.append({
                 "module": module,
@@ -350,14 +417,29 @@ def main() -> int:
                 "rounds_used": result.rounds_used,
                 "duration_seconds": result.duration_seconds,
                 "admit_classification": result.admit_classification,
-                "cost_usd": this_cost,
+                "cost_usd": usage_totals["cost_usd"],
+                "recorded_cost_usd": this_recorded_cost,
+                "cost_complete": usage_totals["cost_complete"],
+                "cost_status": (
+                    "complete" if usage_totals["cost_complete"]
+                    else "unknown"),
+                "unknown_cost_rounds": this_unknown_cost_rounds,
                 "cache_creation_tokens": this_cc,
                 "output_tokens": this_out,
             })
         except Exception as e:
             print(f"[run_layer] ERROR: {e}", file=sys.stderr)
+            # The exception may follow one or more provider calls whose round
+            # receipt was never returned to this wrapper.  Preserve that gap
+            # as unknown rather than printing or aggregating exact $0.00.
+            cum_unknown_cost_modules += 1
             summary.append({"module": module, "success": False,
-                            "reason": f"exception: {e!r}"})
+                            "reason": f"exception: {e!r}",
+                            "cost_status": "unknown",
+                            "cost_usd": None,
+                            "recorded_cost_usd": 0.0,
+                            "unknown_cost_rounds": 0,
+                            "unknown_cost_modules": 1})
 
     duration_all = time.time() - start_all
 
@@ -367,7 +449,9 @@ def main() -> int:
     ok = sum(1 for s in summary if s.get("success"))
     print(f"Verified: {ok}/{len(summary)}")
     print(f"Total duration: {duration_all/60:.1f} min")
-    print(f"Total cost: ${cum_cost:.2f}")
+    total_cost_label = _cost_label(
+        cum_recorded_cost, cum_unknown_cost_rounds, cum_unknown_cost_modules)
+    print(f"Total cost: {total_cost_label}")
     print(f"Total cache_creation: {cum_cache_creation/1000:.0f}k tokens")
     print(f"Total output: {cum_output/1000:.1f}k tokens")
     print()
@@ -379,26 +463,36 @@ def main() -> int:
         cls_note = ""
         if cls.get("total", 0) > 0:
             cls_note = f" admits[hard={cls.get('hard',0)},int={cls.get('intentional',0)}]"
-        cost = s.get("cost_usd", 0)
+        cost = _summary_cost_label(s)
         print(f"  {status}  {s['module']:55s}  rounds={rounds}  "
-              f"dur={dur:.0f}s  ${cost:>5.2f}{cls_note}  "
+              f"dur={dur:.0f}s  cost={cost}{cls_note}  "
               f"({s.get('end_reason', s.get('reason', ''))})")
 
     # Persist the layer-run summary
     summary_path = results_root / run_id / "layer_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps({
+    layer_summary = {
         "layer_set": args.layer_set,
         "run_id": run_id,
         "total": len(summary),
         "verified": ok,
         "duration_seconds_total": duration_all,
-        "cumulative_cost_usd": cum_cost,
+        "cumulative_recorded_cost_usd": cum_recorded_cost,
+        "cumulative_cost_complete": (
+            cum_unknown_cost_rounds == 0 and cum_unknown_cost_modules == 0),
+        "unknown_cost_rounds": cum_unknown_cost_rounds,
+        "unknown_cost_modules": cum_unknown_cost_modules,
         "cumulative_cache_creation_tokens": cum_cache_creation,
         "cumulative_input_tokens": cum_input,
         "cumulative_output_tokens": cum_output,
         "targets": summary,
-    }, indent=2))
+    }
+    # Preserve the legacy exact-cost field only when every round has a receipt.
+    # Paper macro consumers can therefore never mistake a partial sum for a
+    # fully recorded total.
+    if cum_unknown_cost_rounds == 0 and cum_unknown_cost_modules == 0:
+        layer_summary["cumulative_cost_usd"] = cum_recorded_cost
+    summary_path.write_text(json.dumps(layer_summary, indent=2))
     print(f"\n[run_layer] summary saved to {summary_path}")
 
     return 0 if ok == len(summary) else 1

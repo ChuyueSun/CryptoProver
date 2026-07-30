@@ -67,6 +67,8 @@
 set -u
 set -o pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 usage() {
   sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
   cat <<EOF
@@ -255,6 +257,99 @@ say() {
   fi
 }
 
+LAUNCH_STARTED_AT="$(date -u +%FT%TZ)"
+LAUNCH_INSTANCE_ID="${RUN_ID}.$$.$(date -u +%Y%m%dT%H%M%SZ)"
+export USAGE_LAUNCH_INSTANCE_ID="$LAUNCH_INSTANCE_ID"
+AUDIT_ROOTS=()
+for spec in "${SPEC_LINES[@]}"; do
+  IFS='|' read -r audit_results_dir _ <<< "$spec"
+  [ -z "${audit_results_dir:-}" ] && audit_results_dir="$RESULTS_DEFAULT"
+  already_seen=0
+  for existing in "${AUDIT_ROOTS[@]:-}"; do
+    [ "$existing" = "$audit_results_dir" ] && already_seen=1
+  done
+  [ "$already_seen" = "1" ] || AUDIT_ROOTS+=("$audit_results_dir")
+done
+
+audit_command() {
+  local results_root="$1" ended_at="${2:-}" launcher_rc="${3:-}"
+  local archive_task_id="${4:-}"
+  local cmd=(
+    python3 "$SCRIPT_DIR/usage_audit.py"
+    --results-root "$results_root"
+    --run-id "$RUN_ID"
+    --started-at "$LAUNCH_STARTED_AT"
+    --project "$PROJECT"
+    --launch-instance-id "$LAUNCH_INSTANCE_ID"
+  )
+  [ -n "$ended_at" ] && cmd+=(--ended-at "$ended_at")
+  [ -n "$launcher_rc" ] && cmd+=(--launcher-rc "$launcher_rc")
+  [ -n "$archive_task_id" ] && cmd+=(--archive-task-id "$archive_task_id")
+  "${cmd[@]}"
+}
+
+audit_marker() {
+  local results_root="$1" ended_at="${2:-}" launcher_rc="${3:-}"
+  local task_id="${4:-}" output audit_rc marker
+  output="$(audit_command "$results_root" "$ended_at" "$launcher_rc" 2>&1)"
+  audit_rc=$?
+  if [ "$audit_rc" -ne 0 ]; then
+    say "MARKER usage_audit_error=1 results=$results_root rc=$audit_rc detail=$(printf '%q' "$output")"
+    return "$audit_rc"
+  fi
+  marker="$(python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+task_id = sys.argv[2]
+if task_id:
+    task = next((t for t in d.get("tasks", []) if t.get("task_id") == task_id), None)
+    if task is None:
+        print("task_cost_status=unknown task_cumulative_recorded_cost_usd=0 task_unresolved_streams=0")
+    else:
+        print("task_cost_status={} task_cumulative_recorded_cost_usd={} task_unresolved_streams={}".format(
+            task.get("cost_status"), task.get("recorded_cost_usd_decimal"),
+            task.get("unresolved_streams")))
+else:
+    print("cost_status={} recorded_cost_usd={} stream_attempts={} unresolved_streams={}".format(
+        d.get("cost_status"), d.get("recorded_cost_usd"),
+        d.get("stream_attempts"), d.get("unresolved_streams")))
+print("usage_audit={}".format(d.get("audit_path")))
+' "$output" "$task_id")"
+  while IFS= read -r line; do
+    say "MARKER results=$results_root $line"
+  done <<< "$marker"
+}
+
+# Create the launch envelope before the first model invocation. Cost
+# accounting is mandatory: do not spend if the receipt surface cannot start.
+for audit_root in "${AUDIT_ROOTS[@]}"; do
+  if ! audit_command "$audit_root" "" "" >/dev/null; then
+    echo "error: could not initialize usage audit under $audit_root/$RUN_ID" >&2
+    exit 3
+  fi
+done
+
+AUDIT_FINALIZED=0
+finalize_audit_on_exit() {
+  local shell_rc=$? ended_at audit_root
+  if [ "$AUDIT_FINALIZED" != "1" ]; then
+    ended_at="$(date -u +%FT%TZ)"
+    for audit_root in "${AUDIT_ROOTS[@]:-}"; do
+      audit_command "$audit_root" "$ended_at" "$shell_rc" >/dev/null 2>&1 || true
+    done
+  fi
+  return 0
+}
+exit_on_signal() {
+  local signal_rc="$1"
+  trap - HUP INT TERM
+  exit "$signal_rc"
+}
+trap finalize_audit_on_exit EXIT
+trap 'exit_on_signal 129' HUP
+trap 'exit_on_signal 130' INT
+trap 'exit_on_signal 143' TERM
+
 # Count actionable (non-axiom) admit()s the SAME way the harness gate does:
 # comment/string-aware and excluding `proof fn axiom_*` bodies (via
 # skills/admit_inventory.py → lib.admits). This keeps the MARKER start/end
@@ -271,7 +366,7 @@ count_admits() {
   printf '%s' "$n"
 }
 
-say "[$(date -u +%FT%TZ)] LAUNCH run_id=$RUN_ID pid=$$ ppid=$PPID targets=${#SPEC_LINES[@]} log=$LOG"
+say "[$LAUNCH_STARTED_AT] LAUNCH run_id=$RUN_ID pid=$$ ppid=$PPID targets=${#SPEC_LINES[@]} log=$LOG"
 
 RC_TOTAL=0
 for spec in "${SPEC_LINES[@]}"; do
@@ -309,6 +404,16 @@ sys.exit(0 if sys.argv[2] in names else 1)
       say "[$(date -u +%FT%TZ)] SKIP rel=$rel_for_log (already in ${reg##*/})"
       continue
     fi
+  fi
+
+  # A resumed launcher may reuse the same run/task path while run.py starts
+  # round numbering from one. Move the prior task directory into append-only
+  # usage history before any new stream can overwrite its billing evidence.
+  if ! audit_command "$results_dir" "" "" "$task_id_root" >/dev/null; then
+    say "MARKER target=$rel_for_log usage_archive_error=1"
+    say "error: could not archive prior usage receipts for $rel_for_log"
+    RC_TOTAL=3
+    break
   fi
 
   # Optional: create the admit() skeleton IN PLACE before the run. Opt-in
@@ -357,6 +462,9 @@ sys.exit(0 if sys.argv[2] in names else 1)
   # with --skip-existing) after the window reopens to continue.
   if [ "$rc" -eq 42 ]; then
     say "MARKER target=$rel_for_log rate_limited=1 end_reason=RATE_LIMITED"
+    if ! audit_marker "$results_dir" "" "" "$task_id_root"; then
+      [ "$RC_TOTAL" -ne 0 ] || RC_TOTAL=3
+    fi
     say "[$(date -u +%FT%TZ)] RATE LIMITED on $rel_for_log — aborting run "\
 "(API 429). Re-run the same command after the quota window resets; "\
 "add --skip-existing to resume from where this stopped."
@@ -380,8 +488,18 @@ except Exception as e:
     summary="result_json=MISSING rc=$rc"
   fi
   say "MARKER target=$rel_for_log start_admits=$start_admits end_admits=$end_admits $summary"
+  if ! audit_marker "$results_dir" "" "" "$task_id_root"; then
+    [ "$RC_TOTAL" -ne 0 ] || RC_TOTAL=3
+  fi
 done
 
+AUDIT_ENDED_AT="$(date -u +%FT%TZ)"
+for audit_root in "${AUDIT_ROOTS[@]}"; do
+  if ! audit_marker "$audit_root" "$AUDIT_ENDED_AT" "$RC_TOTAL" ""; then
+    [ "$RC_TOTAL" -ne 0 ] || RC_TOTAL=3
+  fi
+done
+AUDIT_FINALIZED=1
 say "[$(date -u +%FT%TZ)] ALL DONE run_id=$RUN_ID rc=$RC_TOTAL"
 say "MARKER orchestrator=done"
 exit $RC_TOTAL

@@ -92,6 +92,21 @@ class RoundResult:
     # Read-only-offload metric: lets us measure whether the prompt's
     # read-delegation framing actually moves the agent off 0 spawns.
     agent_delegations: int = 0
+    # Content-addressed identity of the candidate and runner-owned verifier
+    # gate. These are deliberately separate from the diversified prompt sample:
+    # a later seed/reset must be able to bind a decision to exact source bytes.
+    tree_receipt: dict = field(default_factory=dict)
+    gate_receipt: dict = field(default_factory=dict)
+    # Full normalized inventory is persisted for audit; `verus_errors` stays a
+    # compact, diversified agent-feedback sample.
+    diagnostic_inventory: list[dict] = field(default_factory=list)
+    # A round-boundary transaction classification. The runner cannot observe
+    # arbitrary interior editor hunks, so this describes only the pre/post
+    # candidate it actually gated.
+    candidate_transaction: dict = field(default_factory=dict)
+    # Stream parser evidence: terminal metadata can follow a valid `result`
+    # event, so callers can distinguish that from a genuinely missing result.
+    parser_provenance: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -104,6 +119,9 @@ class TaskResult:
     end_reason: str
     rounds_used: int
     duration_seconds: float
+    # Execution CLI used for agent turns. `claude` remains the default for
+    # backward-compatible readers of older result.json files.
+    agent_backend: str = "claude"
     round_results: list[RoundResult] = field(default_factory=list)
     error_message: Optional[str] = None
     # Auto-reset bookkeeping: round numbers where a fresh claude session
@@ -123,3 +141,22 @@ class TaskResult:
     # Optional one-line label/provenance for runs whose starting state changes
     # what the result measures (for example operator-scaffolded lane isolation).
     experiment_provenance: Optional[str] = None
+    # Causal fresh-session records. `reset_round_starts` remains for backward
+    # compatibility; this preserves the why and the source/gate receipt passed
+    # across the reset boundary.
+    reset_events: list[dict] = field(default_factory=list)
+    # Disclosed interventions (for example a deliberate signal or trusted
+    # header restore) supplied by the launcher/operator.
+    operator_events: list[dict] = field(default_factory=list)
+    # A terminal integrity rejection must say whether the live worktree was
+    # restored to a clean snapshot before it became reusable.
+    terminal_disposition: dict = field(default_factory=dict)
+    # Immutable acceptance/rejection receipt written alongside result.json.
+    promotion_receipt: dict = field(default_factory=dict)
+    final_tree_receipt: dict = field(default_factory=dict)
+    final_gate_receipt: dict = field(default_factory=dict)
+    # Split the task wall budget into productive agent time and reserved final
+    # gate time so a verifier cannot be starved by the Claude deadline.
+    agent_budget_seconds: float = 0.0
+    agent_elapsed_seconds: float = 0.0
+    final_gate_allowance_seconds: float = 0.0

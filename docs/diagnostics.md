@@ -7,9 +7,11 @@ walk the artifacts in this order to find the actual cause:
 results/<run_id>/<task_id>/
 ├── result.json              ← end_reason, success, rounds_used
 ├── round_N.json             ← per-round verus_okay, verus_errors[], spec_drift, end_reason
+├── claude_raw/round_N.lifecycle.json ← pre-spawn/exit lifecycle receipt
 ├── claude_raw/round_N.jsonl ← agent's full reasoning + tool_use stream
 ├── cli.log                  ← which skills the agent invoked, in order
 └── prompt_rendered.md       ← exact prompt the agent received
+results/<run_id>/usage_audit.json ← recorded cost floor + unresolved streams
 results/failure_memory.json  ← cumulative; fed back into next run's prompt
 ```
 
@@ -122,6 +124,35 @@ terminal. Verify the keychain credential's `expiresAt` is in the future:
 security find-generic-password -s "Claude Code-credentials" -a $USER -w \
  | python3 -c 'import json,sys,datetime; o=json.load(sys.stdin)["claudeAiOauth"]; print(datetime.datetime.fromtimestamp(o["expiresAt"]/1000))'
 ```
+
+### 1a. Cost receipt is incomplete
+
+**Symptom**: the launcher MARKER reports `cost_status=lower_bound` or
+`cost_status=unknown`.
+
+**Detect**:
+```bash
+jq '{cost_status, recorded_cost_usd, counts, reconciliation}' \
+  results/<run>/usage_audit.json
+jq '.streams[] | select(.cost_resolved == false) |
+    {task_id, round_number, recorded_cost_usd, unresolved_reasons}' \
+  results/<run>/usage_audit.json
+```
+
+**Meaning**: `recorded_cost_usd` includes only numeric provider-reported
+receipts, read directly from terminal events or preserved in harness round
+records. A missing terminal event, malformed stream, pending lifecycle receipt,
+raw/round mismatch, or ambiguous multiple-result stream prevents an exact local
+total. For multiple terminal results, the auditor retains the maximum numeric
+event as a lower-bound contribution and marks the stream unresolved; it does
+not sum potentially cumulative events.
+
+**Reconcile**: obtain a provider report already isolated to this launch, then
+rerun `usage_audit.py` with the launch envelope's original timestamps and
+`--reconciled-cost-usd ... --reconciliation-source ...`. The command rejects a
+provider total below the recorded receipt floor and records the reconciliation
+gap. Do not call a shared-workspace provider total exact without first removing
+unrelated traffic.
 
 ### 2. Baseline contamination — agent fills its admit, file still LIMITs
 
