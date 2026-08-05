@@ -91,8 +91,12 @@ Each prints JSON to stdout and logs to `$CLI_LOG_PATH`. **For EVERY skill here
 (verifier and search alike), never pipe merged stderr into a JSON parser**
 (`... 2>&1 | python3 -c 'json.load(...)'`): the skills emit clean JSON on stdout
 only, so a single stray stderr line (a warning, a logging fallback) silently
-becomes a misleading `JSONDecodeError`. Pipe stdout alone
-(`skill.py ... | python3 -c '...'`), or capture stdout to a file and parse that.
+becomes a misleading `JSONDecodeError`. For the verifier (`verus_check.py`),
+read its JSON stdout directly from the Bash tool result — do not pipe its
+stdout to another command and do not redirect it to a file; both are
+policy-blocked at the tool call. For search/inventory skills, piping stdout
+alone (`search_*.py ... | python3 -c '...'`) is fine, but do not redirect
+their stdout to files either.
 Substitute the per-run paths from **## Target** above into the commands. Use these absolute skill
 paths even after `cd` into the Cargo project root; the project root does not
 contain a `skills/` directory. Use absolute target/project arguments too:
@@ -106,7 +110,9 @@ not start background `verus_check` / `cargo verus` jobs, do not write verifier
 results to fixed shared files like `/tmp/vcheck.json`, and do not use broad
 process controls such as `pkill`, `killall`, or `pgrep -f`. Do not wrap
 verifier commands in shell `timeout` (not portable; it fails on macOS). Use
-`verus_check.py --timeout N` when you need a different verifier budget. Never
+`verus_check.py --timeout N` (a numeric literal) when you need a different
+verifier budget; when the runner sets a timeout policy cap, values above the
+cap are blocked and the block message names the cap. Never
 substitute direct `cargo-verus focus`, raw `cargo verus`, or `cargo build`
 greps for verifier truth; direct cargo-verus can forward module filters into
 vstd/dependency crates and report misleading `available modules are:

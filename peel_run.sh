@@ -27,11 +27,12 @@
 #       --depth 2 --run-id peel_001 --detach
 #   ./peel_run.sh --manifest M --depth N --surface          # preview, no worktree
 #   ./peel_run.sh --manifest M --depth N --run-id ID --dry-run   # build+argv, no launch
+#   ./peel_run.sh --manifest M --campaign-spec CAMPAIGN.json \
+#       --run-id ID --dry-run   # additionally bind fixed source/post-peel hashes
 #   ./peel_run.sh --run-id ID --remove                      # tear the worktree down
-#   # RESUME: run on an EXISTING peeled worktree (no rebuild — continue from its
-#   # current, partially-reconstructed state). Editable set/mode come from M.
-#   ./peel_run.sh --manifest M --reuse-worktree /path/to/wt \
-#       --run-id resume_001 --detach
+#   # Direct worktree reuse is disabled. S3 resumes only from a validated
+#   # BANKED_PARTIAL receipt by rebuilding the canonical peel and replaying its
+#   # guarded predecessor patch.
 #
 # Manifest keys consumed here (everything else is peel.py's — see peel.py docstr):
 #   target          required to launch — the run.py anchor, relative to the
@@ -76,7 +77,7 @@ VSTD="${DALEK_VSTD:-$(_glob_dir "$HOME"/.cargo/git/checkouts/verus-*/*/source/vs
 RESULTS_ROOT="${DALEK_RESULTS:-$HARNESS_DIR/results}"
 
 # ── args ─────────────────────────────────────────────────────────────────────
-MANIFEST="" ; DEPTH="" ; RUN_ID="" ; PIN="" ; REF="$SRCREF"
+MANIFEST="" ; CAMPAIGN_SPEC="" ; DEPTH="" ; RUN_ID="" ; PIN="" ; REF="$SRCREF"
 ROUNDS=10 ; BUDGET=180 ; MODEL="opus"
 SURFACE=0 ; DRYRUN=0 ; DETACH=0 ; REMOVE=0 ; REUSE_WT=""
 # claude-tap capture: ON by default for peel runs — route the claude subprocess
@@ -92,6 +93,7 @@ usage() { sed -n '2,55p' "$0"; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --manifest)  MANIFEST="$2"; shift 2 ;;
+    --campaign-spec) CAMPAIGN_SPEC="$2"; shift 2 ;;
     --depth)     DEPTH="$2";    shift 2 ;;
     --run-id)    RUN_ID="$2";   shift 2 ;;
     --pin)       PIN="$2";      shift 2 ;;
@@ -247,83 +249,67 @@ fi
 [ -n "$MANIFEST" ] || die "--manifest required to launch"
 [ -n "$DEPTH" ]    || die "--depth required to launch (none on CLI or in manifest)"
 [ -f "$MANIFEST" ] || die "manifest not found: $MANIFEST"
-command -v cargo-verus >/dev/null || die "cargo-verus not on PATH ($VERUS_DIR missing?)"
-command -v claude      >/dev/null || die "claude not on PATH"
-# Source repo only needed to BUILD a fresh worktree; resume mode reuses one.
-[ -n "$REUSE_WT" ] || [ -d "$SRCREPO" ] || die "source repo missing: $SRCREPO (set DALEK_SRCREPO)"
+[ -z "$CAMPAIGN_SPEC" ] || [ -f "$CAMPAIGN_SPEC" ] || \
+  die "campaign spec not found: $CAMPAIGN_SPEC"
+[ -z "$REUSE_WT" ] || die \
+  "--reuse-worktree is disabled: resume requires S3 BANKED_PARTIAL canonical replay"
+[ -d "$SRCREPO" ] || die "source repo missing: $SRCREPO (set DALEK_SRCREPO)"
 
 TARGET_REL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("target") or "")' "$MANIFEST")"
 [ -n "$TARGET_REL" ] || die "manifest has no \"target\" key (run.py needs an anchor file)"
 
-# Manifest fingerprint: bind a built worktree to the manifest+depth it was peeled
-# with, so --reuse-worktree can't silently run a DIFFERENT editable/pin set
-# against it (a wrong manifest could mark a frozen pin editable). Stored at
-# build, checked on reuse.
-MANIFEST_SHA="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest()[:16])' "$MANIFEST")-d$DEPTH"
-SHA_FILE_REL=".peel_manifest_sha"
-
 # ── obtain the worktree + run.py handoff ─────────────────────────────────────
-# Two paths: REUSE an existing peeled worktree (resume — no rebuild, continue
-# from its current state), or BUILD a fresh one from $REF. Both yield the same
-# four handoff vars: WT_R, PROJECT, EXPMODE, EDITABLE_ABS[].
-if [ -n "$REUSE_WT" ]; then
-  [ -d "$REUSE_WT" ] || die "reuse worktree missing: $REUSE_WT"
-  WT_R="$REUSE_WT"
-  # Guard: the reused worktree must have been peeled with THIS manifest+depth.
-  STORED_SHA="$(cat "$WT_R/$SHA_FILE_REL" 2>/dev/null || true)"
-  if [ -z "$STORED_SHA" ]; then
-    echo "peel_run: WARNING — $WT_R has no $SHA_FILE_REL (legacy worktree); "\
-"cannot verify it matches $MANIFEST. Proceeding on trust." >&2
-  elif [ "$STORED_SHA" != "$MANIFEST_SHA" ]; then
-    die "manifest mismatch: $WT_R was peeled with $STORED_SHA but --manifest+--depth hash to $MANIFEST_SHA. Refusing to reuse (wrong editable/pin set)."
-  fi
-  # Derive straight from the manifest (no peel.py — the worktree already exists).
-  EXPMODE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("experiment_mode") or "")' "$MANIFEST")"
-  PROJECT="$WT_R/${TARGET_REL%%/*}"   # first path component of target = cargo member dir
-  EDITABLE_ABS=()
-  while IFS= read -r line; do EDITABLE_ABS+=("$line"); done < <(python3 - "$MANIFEST" "$WT_R" <<'PY'
-import json, os, sys
-m = json.load(open(sys.argv[1])); wt = sys.argv[2]
-for f in m.get("files", []):
-    print(os.path.join(wt, f["path"]))
-PY
-)
-  echo "peel_run: REUSE existing worktree $WT_R (mode $EXPMODE, no rebuild)" >&2
-else
-  # Build a fresh peeled worktree per run-id. Idempotent: a stale worktree at
-  # $WT is removed first, then rebuilt from $REF. The whole remove/build/seal
-  # sequence is serialized per source repo because git worktree metadata and
-  # orphan-branch refs are shared across all worktrees of that repo.
-  PEEL_ARGS=( --worktree "$WT" --gitroot "$SRCREPO" --ref "$REF"
-              --depth "$DEPTH" --manifest "$MANIFEST" )
-  [ -n "$PIN" ] && PEEL_ARGS+=( --pin "$PIN" )
-  echo "peel_run: building peel worktree at $WT (depth $DEPTH, ref $REF)…" >&2
-  PEEL_LOCK="$(peel_lock_file "$SRCREPO")"
-  PEEL_JSON="$(build_peel_worktree_locked "$PEEL_LOCK" "$WT" "$SRCREPO" "${PEEL_ARGS[@]}")" || {
-    echo "$PEEL_JSON" >&2; die "peel worktree build failed"; }
-  # Use peel's RESOLVED worktree (e.g. /private/tmp on macOS) for every derived
-  # path so run.py never sees a /tmp-vs-/private/tmp split between target/project.
-  read -r WT_R PROJECT EXPMODE PEEL_OK < <(python3 - "$PEEL_JSON" <<'PY'
+# Build a fresh peeled worktree per run-id. Idempotent: a stale worktree at
+# $WT is removed first, then rebuilt from $REF. Direct reuse stays disabled
+# until S3 can prove an accepted predecessor and replay it canonically.
+PEEL_ARGS=( --worktree "$WT" --gitroot "$SRCREPO" --ref "$REF"
+            --depth "$DEPTH" --manifest "$MANIFEST"
+            --require-exact-transform )
+[ -n "$PIN" ] && PEEL_ARGS+=( --pin "$PIN" )
+echo "peel_run: building exact peel worktree at $WT (depth $DEPTH, ref $REF)…" >&2
+PEEL_LOCK="$(peel_lock_file "$SRCREPO")"
+PEEL_JSON="$(build_peel_worktree_locked "$PEEL_LOCK" "$WT" "$SRCREPO" "${PEEL_ARGS[@]}")" || {
+  echo "$PEEL_JSON" >&2; die "exact peel worktree build failed"; }
+# Use peel's RESOLVED worktree (e.g. /private/tmp on macOS) for every derived
+# path so run.py never sees a /tmp-vs-/private/tmp split between target/project.
+read -r WT_R PROJECT EXPMODE PEEL_OK < <(printf '%s' "$PEEL_JSON" | python3 -c '
 import json, sys
-d = json.loads(sys.argv[1])
+d = json.load(sys.stdin)
 print(d.get("worktree", ""), d.get("project", ""),
       d.get("experiment_mode") or "", d.get("okay"))
-PY
-)
-  [ "$PEEL_OK" = "True" ] || { echo "$PEEL_JSON" >&2; die "peel reported not-okay"; }
-  # editable_files are worktree-relative; run.py wants paths under the worktree.
-  # (read loop, not `mapfile` — macOS ships bash 3.2, which lacks mapfile.)
-  EDITABLE_ABS=()
-  while IFS= read -r line; do EDITABLE_ABS+=("$line"); done < <(python3 - "$PEEL_JSON" "$WT_R" <<'PY'
+')
+[ "$PEEL_OK" = "True" ] || { echo "$PEEL_JSON" >&2; die "peel reported not-okay"; }
+# editable_files are worktree-relative; run.py wants paths under the worktree.
+# (read loop, not `mapfile` — macOS ships bash 3.2, which lacks mapfile.)
+EDITABLE_ABS=()
+while IFS= read -r line; do EDITABLE_ABS+=("$line"); done < <(
+  printf '%s' "$PEEL_JSON" | python3 -c '
 import json, os, sys
-d = json.loads(sys.argv[1]); wt = sys.argv[2]
+d = json.load(sys.stdin); wt = sys.argv[1]
 for rel in d.get("editable_files", []):
     print(os.path.join(wt, rel))
-PY
+' "$WT_R"
 )
-  # Fingerprint the worktree so a later --reuse-worktree can verify the manifest.
-  printf '%s\n' "$MANIFEST_SHA" > "$WT_R/$SHA_FILE_REL" 2>/dev/null || true
-fi
+
+# Validate the full receipt against the current post-seal bytes before the
+# model can run. The immutable envelope lives outside the source worktree.
+mkdir -p "$RESULTS_ROOT/$RUN_ID"
+TRANSFORM_RECEIPT_TMP="$(mktemp "${TMPDIR:-/tmp}/peel-transform.XXXXXX")"
+trap 'rm -f "$TRANSFORM_RECEIPT_TMP"' EXIT
+printf '%s' "$PEEL_JSON" | python3 -c '
+import json, sys
+json.dump(json.load(sys.stdin)["transform_receipt"], open(sys.argv[1], "w"))
+' "$TRANSFORM_RECEIPT_TMP"
+START_RECEIPT="$RESULTS_ROOT/$RUN_ID/start_receipt.json"
+VALIDATE_START=( python3 "$HARNESS_DIR/lib/provenance.py" "$PROJECT"
+  --validate-peel-start "$TRANSFORM_RECEIPT_TMP"
+  --manifest "$MANIFEST" --tool-root "$HARNESS_DIR"
+  --receipt-out "$START_RECEIPT" )
+[ -z "$CAMPAIGN_SPEC" ] || VALIDATE_START+=( --campaign-spec "$CAMPAIGN_SPEC" )
+"${VALIDATE_START[@]}" >/dev/null || die "peeled start receipt validation failed"
+START_RECEIPT_ID="$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["receipt_id"])' \
+  "$START_RECEIPT")"
 
 # ── common validation (both paths) ───────────────────────────────────────────
 [ -n "$EXPMODE" ] || die "manifest declared no experiment_mode — set it (proof-only|spec-proof|contract-only|bridge-specs|bridge-full|field-floor)"
@@ -353,12 +339,17 @@ if [ "$DRYRUN" = "1" ]; then
   echo "MODE $EXPMODE"
   echo "TAP $([ "$TAP" = 1 ] && echo "on → http://127.0.0.1:$TAP_PORT" || echo off)"
   echo "WORKTREE $WT_R"
+  echo "START_RECEIPT $START_RECEIPT"
+  echo "START_RECEIPT_ID $START_RECEIPT_ID"
   echo "PROJECT $PROJECT"
   echo "TARGET $TARGET"
   printf 'EDITABLE %s\n' "${EDITABLE_ABS[@]}"
   echo "ARGV ${CMD[*]}"
   exit 0
 fi
+
+command -v cargo-verus >/dev/null || die "cargo-verus not on PATH ($VERUS_DIR missing?)"
+command -v claude      >/dev/null || die "claude not on PATH"
 
 # ── one-time vstd/build warm (cold module-scoped check spuriously fails) ──────
 WARM_SENTINEL="$PROJECT/target/.peel_warmed"
@@ -371,6 +362,13 @@ fi
 # Start/refresh the tap proxy and export ANTHROPIC_BASE_URL just before launch,
 # so BOTH the detached re-exec and the foreground exec inherit it.
 setup_tap
+
+# The warm/proxy setup occurs after the first receipt. Revalidate immediately
+# before spawning the model so any intervening source or harness change fails.
+"${VALIDATE_START[@]}" >/dev/null || \
+  die "peeled start changed after preflight; refusing model invocation"
+rm -f "$TRANSFORM_RECEIPT_TMP"
+trap - EXIT
 
 # ── launch ───────────────────────────────────────────────────────────────────
 if [ "$DETACH" = "1" ]; then

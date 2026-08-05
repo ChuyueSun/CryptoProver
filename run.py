@@ -38,17 +38,19 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lib import discovery_brief, failure_memory, provenance, results  # noqa: E402
+from lib import discovery_brief, failure_memory, frontier, provenance, results, taxonomy  # noqa: E402
 from lib.admits import count_non_axiom as _count_llm_target_admits  # noqa: E402
 from lib.admits import find_matching_brace, find_proof_fn_body_brace  # noqa: E402
 from lib.admits import axiom_fn_names  # noqa: E402
 from lib.admits import count_forbidden_constructs  # noqa: E402
+from lib.admits import rlimit_inventory  # noqa: E402
 from lib.admits import strip_comments_strings  # noqa: E402
 from lib.results import RoundResult, TaskResult, task_dir, write_json  # noqa: E402
 
@@ -56,6 +58,13 @@ from lib.results import RoundResult, TaskResult, task_dir, write_json  # noqa: E
 HERE = Path(__file__).parent.resolve()
 PROMPT_TEMPLATE = HERE / "prompt.md"
 _DEFAULT_VERUS_RLIMIT = 80.0
+_DEFAULT_AGENT_MAX_TURNS = 50
+_DEFAULT_VERUS_TIMEOUT_SEC = 300.0
+_GATE_COMMAND_GRACE_SEC = 30.0
+_MIN_PRODUCTIVE_ROUND_SEC = 300.0
+_AGENT_DEADLINE_DRAIN_SEC = 60.0
+_AGENT_TURN_OBSERVATION_WINDOW = 3
+_AGENT_TURN_SAFETY_FACTOR = 1.25
 
 
 def _count_forbidden_in_files(files) -> dict[str, int]:
@@ -73,15 +82,90 @@ def _count_forbidden_in_files(files) -> dict[str, int]:
     return totals
 
 
-def _forbidden_delta(files, baseline: dict[str, int]) -> list[str]:
-    """Constructs whose count in `files` now exceeds `baseline`, as
-    human-readable `name (+N)` strings. Empty list = nothing introduced;
-    nonempty fails the round as FORBIDDEN_CONSTRUCT in run_task's loop.
-    Baseline-diff semantics: pre-existing constructs are tolerated."""
+def _rlimit_inventory_in_files(files, root: Optional[Path] = None) -> list[dict]:
+    """Return a stable file/function/value inventory for inherited rlimits."""
+    inventory: list[dict] = []
+    resolved_root = Path(root).resolve() if root is not None else None
+    for f in files:
+        path = Path(f)
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        resolved = path.resolve()
+        if resolved_root is not None:
+            try:
+                label = resolved.relative_to(resolved_root).as_posix()
+            except ValueError:
+                label = resolved.as_posix()
+        else:
+            label = resolved.as_posix()
+        for entry in rlimit_inventory(text):
+            inventory.append({"file": label, **entry})
+    return sorted(
+        inventory,
+        key=lambda item: (
+            str(item["file"]), int(item["line"]),
+            str(item["owner"]), str(item["value"]),
+        ),
+    )
+
+
+def _forbidden_baseline(files, root: Optional[Path] = None) -> dict:
+    """Snapshot count-based bypasses plus exact inherited rlimit identity."""
+    return {
+        "counts": _count_forbidden_in_files(files),
+        "rlimits": _rlimit_inventory_in_files(files, root),
+    }
+
+
+def _forbidden_delta(files, baseline: dict,
+                     root: Optional[Path] = None) -> list[str]:
+    """Return forbidden-construct drift from a pre-run baseline.
+
+    `assume` and `external_body` retain increase-only semantics so inherited
+    source is tolerated. Per-function `rlimit` is configuration identity:
+    add/remove/move/value changes all fail, even when the occurrence count is
+    unchanged. Baselines are always the rich ``_forbidden_baseline`` shape —
+    the sole producer — so a shapeless dict is a caller bug, not a legacy
+    input.
+    """
+    if "counts" not in baseline and "rlimits" not in baseline:
+        raise ValueError("forbidden-construct baseline lacks the rich shape")
+    baseline_counts = baseline.get("counts", {})
     cur = _count_forbidden_in_files(files)
-    return [f"{k} (+{cur[k] - baseline.get(k, 0)})"
-            for k in sorted(cur)
-            if cur[k] > baseline.get(k, 0)]
+    delta = [
+        f"{k} (+{cur[k] - baseline_counts.get(k, 0)})"
+        for k in ("assume", "external_body")
+        if cur[k] > baseline_counts.get(k, 0)
+    ]
+    baseline_rlimits = baseline.get("rlimits", [])
+    current_rlimits = _rlimit_inventory_in_files(files, root)
+
+    def _identities(items) -> Counter:
+        return Counter(
+            (
+                str(item["file"]),
+                str(item["owner"]),
+                str(item["value"]),
+            )
+            for item in items
+        )
+
+    baseline_items = _identities(baseline_rlimits)
+    current_items = _identities(current_rlimits)
+    if current_items != baseline_items:
+        delta.append(
+            "rlimit (inventory changed: "
+            f"+{sum((current_items - baseline_items).values())}/"
+            f"-{sum((baseline_items - current_items).values())})"
+        )
+    elif cur["rlimit"] > baseline_counts.get("rlimit", 0):
+        # A syntactically unusual rlimit path that the exact numeric parser
+        # cannot inventory is still forbidden if it appeared after baseline.
+        delta.append(
+            f"rlimit (+{cur['rlimit'] - baseline_counts.get('rlimit', 0)})")
+    return delta
 
 
 def _final_gate_allowance_seconds(experiment_mode: str) -> float:
@@ -93,12 +177,59 @@ def _final_gate_allowance_seconds(experiment_mode: str) -> float:
     exhausted its budget.
     """
     if experiment_mode in _WHOLE_CRATE_MODES:
-        return float(_WHOLE_CRATE_VERUS_TIMEOUT_SEC + 30)
+        return float(_WHOLE_CRATE_VERUS_TIMEOUT_SEC + _GATE_COMMAND_GRACE_SEC)
     return 60.0
 
 
 def _agent_budget_seconds(total_seconds: float, experiment_mode: str) -> float:
     return max(0.0, total_seconds - _final_gate_allowance_seconds(experiment_mode))
+
+
+def _resolve_launch_budget(
+    total_minutes: float,
+    experiment_mode: str,
+    round_gate_allowance_seconds: float,
+    budget_is_auto: bool,
+) -> tuple[float, float, bool, Optional[str]]:
+    """Return (total_minutes, agent_budget_seconds, raised, error).
+
+    The launch minimum is one productive provider slice plus the round's
+    authoritative gate; the terminal reserve sits on top. An AUTO-scaled
+    budget below that minimum is raised to it — the auto formula promises a
+    launchable run, and the whole-crate terminal reserve can exceed the
+    20-minute auto floor (F3: a bare whole-crate run would otherwise exit
+    LIMIT with zero rounds). An EXPLICIT operator budget that cannot fund one
+    round stays a hard error rather than being silently reinterpreted.
+    """
+    final_allowance = _final_gate_allowance_seconds(experiment_mode)
+    minimum_launch = round_gate_allowance_seconds + _MIN_PRODUCTIVE_ROUND_SEC
+    agent_budget = _agent_budget_seconds(total_minutes * 60, experiment_mode)
+    if agent_budget >= minimum_launch:
+        return total_minutes, agent_budget, False, None
+    if budget_is_auto:
+        raised_minutes = (minimum_launch + final_allowance) / 60.0
+        return raised_minutes, minimum_launch, True, None
+    msg = (
+        "task budget cannot fund one provider round plus its authoritative "
+        f"gate: pre-terminal budget={agent_budget:.0f}s, "
+        f"provider floor={_MIN_PRODUCTIVE_ROUND_SEC:.0f}s, "
+        f"round gate allowance={round_gate_allowance_seconds:.0f}s, "
+        f"terminal reserve={final_allowance:.0f}s"
+    )
+    return total_minutes, agent_budget, False, msg
+
+
+def _provider_deadline_seconds(
+    agent_budget_seconds: float,
+    elapsed_seconds: float,
+    round_gate_allowance_seconds: float,
+) -> float:
+    """Provider spend remaining after reserving the current authoritative gate."""
+    return (
+        agent_budget_seconds
+        - elapsed_seconds
+        - round_gate_allowance_seconds
+    )
 
 
 def _bounded_wait_timeout(wall_deadline: Optional[float], now: Optional[float] = None) -> Optional[float]:
@@ -107,6 +238,68 @@ def _bounded_wait_timeout(wall_deadline: Optional[float], now: Optional[float] =
         return None
     remaining = wall_deadline - (time.time() if now is None else now)
     return min(30.0, max(0.01, remaining))
+
+
+def _adaptive_agent_turn_cap(
+    configured_max_turns: Optional[int],
+    provider_deadline_seconds: float,
+    observations: list[dict],
+    *,
+    drain_seconds: float = _AGENT_DEADLINE_DRAIN_SEC,
+) -> tuple[Optional[int], dict]:
+    """Choose a receipt-backed Claude turn cap that fits before drain time.
+
+    The launch registration binds the maximum permitted cap.  Lowering that
+    maximum is a runner-owned transaction boundary, not an execution-config
+    widening.  Only completed max-turn transactions are observations: an
+    interrupted round has no trustworthy turns-to-duration endpoint.
+    """
+    receipt = {
+        "policy": "recent_turn_limit_seconds_per_turn_v1",
+        "configured_max_turns": configured_max_turns,
+        "effective_max_turns": configured_max_turns,
+        "provider_deadline_seconds": provider_deadline_seconds,
+        "drain_reserve_seconds": drain_seconds,
+        "safety_factor": _AGENT_TURN_SAFETY_FACTOR,
+        "observation_window": _AGENT_TURN_OBSERVATION_WINDOW,
+        "observations": [],
+        "adapted": False,
+        "reason": "disabled",
+    }
+    if configured_max_turns is None:
+        return None, receipt
+    recent = [
+        item for item in observations
+        if isinstance(item.get("duration_seconds"), (int, float))
+        and float(item["duration_seconds"]) > 0
+        and isinstance(item.get("effective_max_turns"), int)
+        and item["effective_max_turns"] > 0
+    ][-_AGENT_TURN_OBSERVATION_WINDOW:]
+    receipt["observations"] = recent
+    if not recent:
+        receipt["reason"] = "no_completed_turn_limit_history"
+        return configured_max_turns, receipt
+
+    conservative_seconds_per_turn = max(
+        float(item["duration_seconds"]) / item["effective_max_turns"]
+        for item in recent
+    ) * _AGENT_TURN_SAFETY_FACTOR
+    usable_seconds = max(0.0, provider_deadline_seconds - drain_seconds)
+    deadline_cap = max(1, int(usable_seconds // conservative_seconds_per_turn))
+    effective = min(configured_max_turns, deadline_cap)
+    receipt.update({
+        "effective_max_turns": effective,
+        "usable_provider_seconds": usable_seconds,
+        "conservative_seconds_per_turn": conservative_seconds_per_turn,
+        "deadline_derived_cap": deadline_cap,
+        "adapted": effective < configured_max_turns,
+        "reason": (
+            "reduced_to_finish_before_drain_reserve"
+            if effective < configured_max_turns
+            else "configured_cap_fits_observed_rate"
+        ),
+    })
+    return effective, receipt
 
 def _make_agent_cwd(label: str = "") -> Path:
     """Create a fresh per-task scratch cwd for the claude subprocess and return
@@ -397,6 +590,17 @@ def _flatten_sibling_fail_messages(sibling_fail: list[dict]) -> list[dict]:
     return out
 
 
+# ---- End-reason taxonomy ---------------------------------------------------
+# The single production definition lives in lib/taxonomy.py, imported by BOTH
+# this runner and docker/trusted_core_supervisor.py; the aliases below keep
+# run.py's public names (pinned by tests) stable.
+INFRA_END_REASONS = taxonomy.INFRA_END_REASONS
+AUTORETRY_END_REASONS = taxonomy.AUTORETRY_END_REASONS
+CHEAT_END_REASONS = taxonomy.CHEAT_END_REASONS
+INTEGRITY_REJECTION_END_REASONS = taxonomy.INTEGRITY_REJECTION_END_REASONS
+BANKABLE_END_REASONS = taxonomy.BANKABLE_END_REASONS
+
+
 def _final_end_reason(done_for_real: bool, loop_end_reason: Optional[str]) -> str:
     """Resolve the task's recorded end_reason from the final-state gate.
 
@@ -434,11 +638,9 @@ def _final_end_reason(done_for_real: bool, loop_end_reason: Optional[str]) -> st
     verus pass without a real proof, so a green final state is not evidence of
     done — it's evidence the contamination worked."""
     lr = (loop_end_reason or "").upper()
-    if lr in ("RATE_LIMITED", "RATE_LIMIT_OR_HANG", "RETRY_EXHAUSTED", "TRANSPORT_ERROR",
-              "USER_INTERRUPTED", "INTERRUPTED_SIGNAL", "PROCESS_CROSSTALK"):
+    if lr in INFRA_END_REASONS:
         return lr
-    if lr in ("SPEC_DRIFT", "AXIOM_DRIFT", "TOOLING_DRIFT", "SIBLING_VERUS_FAIL",
-              "GIT_RECOVERY", "FROZEN_EDIT", "FORBIDDEN_CONSTRUCT"):
+    if lr in CHEAT_END_REASONS:
         # Terminal: never promoted to COMPLETE even when the target locally
         # verifies. The cheat-class drifts make verus pass without a real
         # proof; SIBLING_VERUS_FAIL means a sibling/top-level module the agent
@@ -485,9 +687,17 @@ def _count_gate_admits(target: Path, allow_edit: Optional[list[Path]]) -> int:
     """Count non-axiom `admit()` calls across the target plus any
     experiment_allow_edit files. Used by the COMPLETE gate so an agent
     cannot declare done while admit() placeholders remain in dep file
-    bodies (relevant for proof-only mode, whose baseline seeds them)."""
-    total = _count_llm_target_admits(target.read_text())
-    for dep in (allow_edit or []):
+    bodies (relevant for proof-only mode, whose baseline seeds them).
+
+    Sums over the de-duplicated ``_gate_admit_files`` scope: launch paths
+    routinely list the target inside allow-edit too, and double-counting its
+    admits can hold a genuinely complete run at a phantom nonzero count
+    (F8 review blocker, 2026-08-03). The target entry (always first) keeps
+    its fail-closed unreadable-raises semantics; only dep reads are
+    tolerated, matching the pre-consolidation behavior."""
+    gate_files = _gate_admit_files(target, allow_edit)
+    total = _count_llm_target_admits(gate_files[0].read_text())
+    for dep in gate_files[1:]:
         try:
             total += _count_llm_target_admits(dep.read_text())
         except OSError:
@@ -605,6 +815,7 @@ def render_prompt(
     experiment_block: str = "",
     decompose_block: str = "",
     whole_crate_assignment: bool = False,
+    continuation_assignment: bool = False,
     verus_rlimit: Optional[float] = _DEFAULT_VERUS_RLIMIT,
 ) -> str:
     template = PROMPT_TEMPLATE.read_text()
@@ -663,6 +874,13 @@ def render_prompt(
             "them with `admit()`."
         )
         task_scope_intro = (
+            "continue the verifier-banked whole editable proof-reconstruction "
+            "assignment from the runner-owned predecessor frontier described "
+            "in EXPERIMENT MODE. The target path is the harness anchor, but "
+            "your job is every editable file listed there; do not repeat a "
+            "full workspace/admit survey and do not stop when only the target "
+            "file is green."
+            if continuation_assignment else
             "complete the whole editable proof-reconstruction assignment "
             "described in EXPERIMENT MODE. The target path is the harness "
             "anchor, but your job is every editable file listed there; do not "
@@ -1108,8 +1326,85 @@ def _normalized_agent_usage(result: dict) -> dict:
         "total_cost_usd": float(cost) if cost_reported else None,
         "cost_reported": cost_reported,
         "cost_source": "provider_terminal_event" if cost_reported else None,
+        "terminal_subtype": result.get("subtype"),
+        "reported_num_turns": result.get("num_turns"),
         "context_tokens": result.get(
             "_context_tokens", usage.get("cache_creation_input_tokens", 0)),
+    }
+
+
+def _is_agent_turn_limit_boundary(backend: str, result: object) -> bool:
+    """Whether a Claude invocation ended normally at its declared turn cap.
+
+    Claude Code 2.1.220 emits this as a canonical, cost-bearing ``result``
+    event.  It is therefore a planned transaction boundary, not a transport
+    failure.  Codex has no equivalent CLI contract in this runner.
+    """
+    return (
+        backend == "claude"
+        and isinstance(result, dict)
+        and result.get("type") == "result"
+        and result.get("subtype") == "error_max_turns"
+    )
+
+
+def _reset_event(
+    cause, *, planned_round: int, trigger_round: int,
+    predecessor_tree_receipt: dict, last_gate_receipt: dict,
+    candidate_transaction: dict, **extra,
+) -> dict:
+    """Build a fresh-session reset event carrying the consumer-required core.
+
+    ``_retarget_pending_reset_events`` and ``_canonical_reset_handoff``
+    consume the predecessor_* trio and planned/trigger rounds by name;
+    site-specific telemetry rides in ``**extra``. One constructor keeps a
+    newly-required field from silently missing on the rarer plateau or
+    git-recovery paths (previously three hand-maintained dict literals).
+    """
+    return {
+        "cause": cause,
+        "planned_round": planned_round,
+        "trigger_round": trigger_round,
+        **extra,
+        "predecessor_tree_hash": predecessor_tree_receipt.get("tree_hash"),
+        "predecessor_gate_receipt": last_gate_receipt.get("receipt_path"),
+        "predecessor_transaction": candidate_transaction,
+        "actual_start_round": None,
+    }
+
+
+def _turn_limit_reset_event(
+    result: dict,
+    effective_max_turns: int,
+    *,
+    configured_max_turns: Optional[int] = None,
+    planned_round: int,
+    trigger_round: int,
+    current_tree_receipt: dict,
+    last_gate_receipt: dict,
+    candidate_transaction: dict,
+) -> dict:
+    """Build the durable handoff metadata for a mandatory capped-session reset."""
+    usage = _normalized_agent_usage(result)
+    return {
+        **_reset_event(
+            [f"effective_agent_max_turns={effective_max_turns}"],
+            planned_round=planned_round,
+            trigger_round=trigger_round,
+            predecessor_tree_receipt=current_tree_receipt,
+            last_gate_receipt=last_gate_receipt,
+            candidate_transaction=candidate_transaction,
+            kind="agent_turn_limit",
+            configured_max_turns=(
+                configured_max_turns
+                if configured_max_turns is not None else effective_max_turns
+            ),
+            effective_max_turns=effective_max_turns,
+            reported_num_turns=usage.get("reported_num_turns"),
+            terminal_subtype=usage.get("terminal_subtype"),
+            terminal_cost_usd=usage.get("total_cost_usd"),
+            cost_reported=usage.get("cost_reported", False),
+        ),
     }
 
 
@@ -2994,6 +3289,40 @@ def _harness_gate_commands(
     return commands
 
 
+def _verus_command_timeout_seconds(command: list[str]) -> float:
+    """Return the verifier timeout encoded by one canonical gate command."""
+    for index, argument in enumerate(command):
+        if argument == "--timeout":
+            if index + 1 >= len(command):
+                raise ValueError("gate command has --timeout without a value")
+            try:
+                timeout = float(command[index + 1])
+            except ValueError as exc:
+                raise ValueError("gate command has an invalid --timeout value") from exc
+            if timeout <= 0:
+                raise ValueError("gate command timeout must be positive")
+            return timeout
+        if argument.startswith("--timeout="):
+            try:
+                timeout = float(argument.split("=", 1)[1])
+            except ValueError as exc:
+                raise ValueError("gate command has an invalid --timeout value") from exc
+            if timeout <= 0:
+                raise ValueError("gate command timeout must be positive")
+            return timeout
+    return _DEFAULT_VERUS_TIMEOUT_SEC
+
+
+def _round_gate_allowance_seconds(commands: list[list[str]]) -> float:
+    """Reserve every verifier command in the authoritative round gate plan."""
+    if not commands:
+        raise ValueError("authoritative gate plan is empty")
+    return sum(
+        _verus_command_timeout_seconds(command) + _GATE_COMMAND_GRACE_SEC
+        for command in commands
+    )
+
+
 def _normalized_diagnostic_inventory(verus_result: dict) -> list[dict]:
     """Persist the entire normalized gate frontier, not merely prompt samples."""
     inventory: list[dict] = []
@@ -3028,9 +3357,17 @@ def _gate_vector(verus_result: dict) -> dict[str, int | None]:
     }
 
 
+# The registered frontier ordering lives in lib/frontier.py — ONE production
+# body shared with the successor generator (drift between two copies is the
+# class that produced the F2 INITIAL-gap stall). Local underscore alias keeps
+# call sites and pinned tests stable.
+_vector_relation = frontier.vector_relation
+
+
 def _classify_candidate_transaction(
     previous_tree: Optional[dict], previous_gate: Optional[dict],
     current_tree: dict, current_verus: dict,
+    last_decided_gate: Optional[dict] = None,
 ) -> dict:
     """Classify a runner-observed candidate boundary without inventing hunks.
 
@@ -3040,42 +3377,112 @@ def _classify_candidate_transaction(
     """
     current_vector = _gate_vector(current_verus)
     current_hash = str(current_tree.get("tree_hash") or "")
-    previous_hash = str((previous_tree or {}).get("tree_hash") or "")
-    previous_vector = dict((previous_gate or {}).get("vector") or {})
-    if not previous_gate:
-        status = "INITIAL"
-    elif current_hash == previous_hash:
-        status = "NEUTRAL"
-    elif _compile_blocked_or_indeterminate(current_verus) and not previous_gate.get("compile_blocked", False):
-        status = "COMPILE_BLOCKED"
-    elif current_vector["verification_errors"] < previous_vector.get("verification_errors", current_vector["verification_errors"]):
-        status = "IMPROVED"
-    elif (
-        current_vector["verification_errors"] == previous_vector.get("verification_errors")
-        and any(current_vector[key] > previous_vector.get(key, 0)
-                for key in ("resource_limits", "timeouts", "panics", "build_wrappers", "compile_errors"))
-    ):
-        status = "DISPLACED"
-    elif (
-        current_vector["raw_errors"] > previous_vector.get("raw_errors", current_vector["raw_errors"])
-        or (
-            current_vector["verified_count"] is not None
-            and previous_vector.get("verified_count") is not None
-            and current_vector["verified_count"] < previous_vector["verified_count"]
+    immediate_previous_hash = str(
+        (previous_tree or {}).get("tree_hash") or ""
+    )
+    current_indeterminate = _compile_blocked_or_indeterminate(current_verus)
+    previous_indeterminate = bool(
+        (previous_gate or {}).get("compile_blocked", False)
+    )
+    comparison_gate = previous_gate
+    comparison_tree = previous_tree
+    recovered_from_indeterminate = (
+        bool(previous_gate)
+        and previous_indeterminate
+        and not current_indeterminate
+    )
+    if recovered_from_indeterminate:
+        comparison_gate = last_decided_gate
+        comparison_tree = (
+            (last_decided_gate or {}).get("tree_receipt") or None
         )
-    ):
-        status = "REGRESSED"
+    previous_hash = str((comparison_tree or {}).get("tree_hash") or "")
+    previous_vector = dict((comparison_gate or {}).get("vector") or {})
+
+    if not comparison_gate:
+        status = "INITIAL"
+    elif current_indeterminate and previous_indeterminate:
+        status = "INDETERMINATE_CONTINUED"
+    elif current_indeterminate:
+        status = "COMPILE_BLOCKED"
     else:
-        status = "NEUTRAL"
+        # Registered ordering delegated to the single comparator. Note: this
+        # gains the explicit verification-increase REGRESSED branch the
+        # frontier guard always had — a +verification/-secondary edit was
+        # previously NEUTRAL here; recorded as a deliberate telemetry
+        # strengthening in the clean-pass reseal.
+        status = _vector_relation(
+            previous_vector, current_vector,
+            previous_tree_hash=previous_hash,
+            current_tree_hash=current_hash,
+            missing_previous="equal",
+        )
     return {
         "scope": "runner_round_boundary",
         "classification": status,
         "pre_tree_hash": previous_hash or None,
         "post_tree_hash": current_hash or None,
+        "immediate_pre_tree_hash": immediate_previous_hash or None,
+        "changed_paths": _tree_receipt_changed_paths(
+            previous_tree or {}, current_tree,
+        ),
+        "recovered_from_indeterminate": recovered_from_indeterminate,
         "pre_vector": previous_vector,
         "post_vector": current_vector,
         "obligation_identities": _normalized_diagnostic_inventory(current_verus),
     }
+
+
+def _rejected_recovered_transaction(
+    rejected_transaction: dict, reason: str, restored_tree: dict,
+) -> dict:
+    """Replace apparent progress on a rejected tree with zero scored credit."""
+    rejected = dict(rejected_transaction)
+    return {
+        "schema_version": 1,
+        "scope": "runner_round_boundary",
+        "classification": "REJECTED_RECOVERED",
+        "scoreable": False,
+        "reason": reason,
+        "pre_tree_hash": rejected.get("pre_tree_hash"),
+        "rejected_tree_hash": rejected.get("post_tree_hash"),
+        "post_tree_hash": restored_tree.get("tree_hash"),
+        "post_vector": {},
+        "obligation_identities": [],
+        "restored_tree_receipt": restored_tree,
+        "rejected_transaction": rejected,
+    }
+
+
+def _recovered_ungated_receipt(
+    restored_tree: dict, gate_signature: dict, reason: str,
+) -> dict:
+    """Describe a restored source boundary that has not yet been re-verified."""
+    return {
+        "schema_version": 1,
+        "status": "RECOVERED_UNGATED",
+        "reason": reason,
+        "tree_receipt": restored_tree,
+        "gate_signature": gate_signature,
+        "vector": {},
+        "compile_blocked": True,
+        "diagnostic_inventory": [],
+    }
+
+
+def _retarget_pending_reset_events(
+    reset_events: list[dict], round_num: int, transaction: dict,
+    restored_tree: dict,
+) -> None:
+    """Prevent a pending fresh-session handoff from citing a rejected tree."""
+    for event in reset_events:
+        if (
+            event.get("trigger_round") == round_num
+            and event.get("actual_start_round") is None
+        ):
+            event["predecessor_tree_hash"] = restored_tree.get("tree_hash")
+            event["predecessor_gate_receipt"] = None
+            event["predecessor_transaction"] = transaction
 
 
 def _gate_signature_for_commands(commands: list[list[str]]) -> dict:
@@ -3095,22 +3502,509 @@ def _gate_signature_for_commands(commands: list[list[str]]) -> dict:
     )
 
 
+_PRIOR_ATTEMPT_RECEIPTS = (
+    "promotion_receipt.json",
+    "premodel_verifier_warm.json",
+    "lineage_context.json",
+    "predecessor_frontier.json",
+    "gate_receipts",
+)
+
+
+def _supersede_prior_attempt_receipts(tdir: Path) -> Optional[Path]:
+    """Move a prior attempt's immutable receipts out of the live task dir.
+
+    Immutable receipts (``write_immutable_json``) raise on byte-different
+    rewrites, so a same-run-id rerun of a previously failed target would
+    otherwise burn its full round budget and crash at the terminal promotion
+    write — or mid-loop on a reset handoff — before result.json and the
+    failure-memory update are written (F1). launch.sh archives the whole
+    prior task dir; direct run.py and run_layer.py reruns land here instead.
+    Nothing is deleted: the prior attempt's receipts stay inspectable under
+    ``_superseded_receipts/attempt_<n>/``.
+    """
+    candidates = [tdir / name for name in _PRIOR_ATTEMPT_RECEIPTS]
+    candidates.extend(sorted(tdir.glob("reset_handoff_round_*.json")))
+    present = [p for p in candidates if p.exists()]
+    if not present:
+        return None
+    base = tdir / "_superseded_receipts"
+    base.mkdir(exist_ok=True)
+    attempt = 1
+    while (base / f"attempt_{attempt}").exists():
+        attempt += 1
+    dest = base / f"attempt_{attempt}"
+    dest.mkdir()
+    for path in present:
+        os.replace(path, dest / path.name)
+    return dest
+
+
 def _persist_gate_receipt(receipt: dict) -> None:
-    """Persist the completed receipt without its runtime-only path field."""
-    path = Path(receipt["receipt_path"])
-    persisted = dict(receipt)
-    persisted.pop("receipt_path", None)
-    persisted.pop("reused_by_round", None)
-    provenance.write_immutable_json(path, persisted)
+    """Persist the completed receipt without its runtime-only fields.
+
+    Delegates to ``_portable_gate_receipt`` so the persisted bytes and every
+    content-addressed embedding share ONE runtime-field pop-list; a second
+    hand-maintained list is how a runtime path leaks into an immutable
+    receipt when the next runtime-only key is added.
+    """
+    provenance.write_immutable_json(
+        Path(receipt["receipt_path"]), _portable_gate_receipt(receipt),
+    )
+
+
+def _portable_gate_receipt(receipt: dict) -> dict:
+    """Drop runtime-only paths before embedding a gate in a content ID."""
+    portable = dict(receipt)
+    portable.pop("receipt_path", None)
+    portable.pop("reused_by_round", None)
+    return portable
+
+
+def _gate_receipt_decided(receipt: Optional[dict]) -> bool:
+    """Whether a gate completed with an authoritative, non-truncated vector."""
+    if not receipt or receipt.get("compile_blocked") is True:
+        return False
+    verus_result = receipt.get("verus_result") or {}
+    return (
+        verus_result.get("truncated") is not True
+        and verus_result.get("verified_count") is not None
+    )
+
+
+def _gate_frontier_relation(
+    previous: Optional[dict], current: Optional[dict],
+) -> str:
+    """Classify ``current`` against the best authoritative gate so far.
+
+    Same registered ordering as round transaction telemetry (both delegate to
+    lib/frontier.py) — this receipt-level wrapper only adds decidedness
+    handling, letting terminal banking and budget rollback preserve the best
+    decided partial frontier even when no whole-crate round has ever been
+    fully green.
+    """
+    if not _gate_receipt_decided(current):
+        return "INDETERMINATE"
+    if not _gate_receipt_decided(previous):
+        return "INITIAL"
+    return _vector_relation(
+        dict((previous or {}).get("vector") or {}),
+        dict((current or {}).get("vector") or {}),
+        previous_tree_hash=str(
+            ((previous or {}).get("tree_receipt") or {}).get("tree_hash") or ""
+        ),
+        current_tree_hash=str(
+            ((current or {}).get("tree_receipt") or {}).get("tree_hash") or ""
+        ),
+        missing_previous="zero",
+    )
+
+
+def _gate_advances_frontier(
+    previous: Optional[dict], current: Optional[dict],
+) -> bool:
+    return _gate_frontier_relation(previous, current) in {
+        "INITIAL", "IMPROVED", "NEUTRAL",
+    }
+
+
+def _rollback_snapshot_round(
+    experiment_mode: Optional[str], *, best_decided_round: int,
+    last_green_round: int,
+) -> int:
+    """Choose a rollback target without erasing whole-crate partial progress."""
+    return (
+        best_decided_round
+        if experiment_mode in _WHOLE_CRATE_MODES
+        else last_green_round
+    )
+
+
+def _dominated_bank_disposition(
+    final_end_reason: str, banking_gate: Optional[dict],
+    best_decided_gate: Optional[dict],
+) -> Optional[dict]:
+    """Return a fail-closed terminal disposition for an inferior bank."""
+    relation = _gate_frontier_relation(best_decided_gate, banking_gate)
+    # Indeterminate banks retain the established UNBANKABLE_INDETERMINATE
+    # terminal schema; this helper owns only decided inferior frontiers.
+    if relation not in {"DISPLACED", "REGRESSED"}:
+        return None
+    banking = dict(banking_gate or {})
+    best = dict(best_decided_gate or {})
+    bank_tree = dict(banking.get("tree_receipt") or {})
+    best_tree = dict(best.get("tree_receipt") or {})
+    return {
+        "state": "BANK_DOMINATED",
+        "reason": final_end_reason,
+        "bank_dominated": True,
+        "bank_relation": relation,
+        "bank_tree_hash": bank_tree.get("tree_hash"),
+        "bank_gate_receipt_key": banking.get("receipt_key"),
+        "dominating_round": best.get("round_number"),
+        "dominating_tree_hash": best_tree.get("tree_hash"),
+        "dominating_gate_receipt_key": best.get("receipt_key"),
+        "dominating_vector": dict(best.get("vector") or {}),
+        "reusable": False,
+        "scoreable": False,
+    }
+
+
+class PremodelWarmIndeterminate(ValueError):
+    """Round-0 verifier infrastructure failed before provider contact."""
+
+
+def _premodel_verifier_warm(
+    *, tdir: Path, project: Path, gate_commands: list[list[str]],
+    env: dict[str, str], lineage_id: Optional[str],
+    before_tree_receipt: Optional[dict] = None,
+) -> dict:
+    """Run a round-0 whole-crate gate before any provider process.
+
+    A focused/member-local Verus command is not a valid cold warm-up: its
+    ``--verify-module`` filter is forwarded while vstd itself is compiling and
+    reproduces T154.  Reusing the canonical package gate both warms vstd and
+    establishes an authoritative initial frontier on the exact seeded tree.
+    ``before_tree_receipt`` lets the caller pass an already-computed receipt
+    of the untouched seed instead of a third full-tree walk at startup.
+    """
+    if not gate_commands or "--whole-crate" not in gate_commands[0]:
+        raise ValueError("premodel verifier warm requires a whole-crate gate")
+    before = before_tree_receipt or provenance.source_tree_receipt(project)
+    rc, stdout, stderr = run_subskill(gate_commands[0], env=env)
+    after = provenance.source_tree_receipt(project)
+
+    def fail(reason: str, message: str) -> None:
+        receipt = {
+            "schema_version": 1,
+            "kind": "exact_seeded_premodel_whole_crate_gate",
+            "tree_hash_before": before["tree_hash"],
+            "tree_hash_after": after["tree_hash"],
+            "gate_signature": _gate_signature_for_commands(gate_commands),
+            "returncode": rc,
+            "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
+            "completed": False,
+            "retryable_infrastructure": True,
+            "failure_reason": reason,
+        }
+        receipt["receipt_id"] = provenance.receipt_id(receipt)
+        provenance.write_immutable_json(
+            tdir / "premodel_verifier_warm.json", receipt,
+        )
+        raise PremodelWarmIndeterminate(message)
+
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError:
+        fail(
+            "MALFORMED_RESULT",
+            "premodel verifier warm returned malformed JSON",
+        )
+    if before["tree_hash"] != after["tree_hash"]:
+        fail(
+            "SOURCE_TREE_CHANGED",
+            "premodel verifier warm changed the source tree",
+        )
+    if _compile_blocked_or_indeterminate(result):
+        fail(
+            "INDETERMINATE_GATE",
+            "premodel verifier warm did not complete authoritatively",
+        )
+    gate_receipt = _gate_receipt(
+        tdir, 0, after, gate_commands, result, rc,
+        forced_recheck=True, lineage_id=lineage_id,
+    )
+    gate_receipt["premodel_warm"] = True
+    _persist_gate_receipt(gate_receipt)
+    receipt = {
+        "schema_version": 1,
+        "kind": "exact_seeded_premodel_whole_crate_gate",
+        "tree_hash_before": before["tree_hash"],
+        "tree_hash_after": after["tree_hash"],
+        "gate_receipt_key": gate_receipt["receipt_key"],
+        "gate_receipt_path": gate_receipt["receipt_path"],
+        "gate_receipt_sha256": provenance.sha256_file(
+            Path(gate_receipt["receipt_path"]),
+        ),
+        "vector": dict(gate_receipt["vector"]),
+        "completed": True,
+    }
+    receipt["receipt_id"] = provenance.receipt_id(receipt)
+    provenance.write_immutable_json(tdir / "premodel_verifier_warm.json", receipt)
+    return gate_receipt
+
+
+def _terminal_disposition(
+    *,
+    final_end_reason: str,
+    success: bool,
+    requires_acceptance_gate: bool,
+    lineage_scoreable: bool,
+    banking_attempted: bool,
+    acceptance_gate_receipt: Optional[dict] = None,
+    banking_gate_receipt: Optional[dict] = None,
+) -> dict:
+    """Pure terminal state transition; receipt truthiness never banks a tree."""
+    acceptance = dict(acceptance_gate_receipt or {})
+    banking = dict(banking_gate_receipt or {})
+
+    if success and requires_acceptance_gate:
+        acceptance_green = (
+            _gate_receipt_decided(acceptance)
+            and acceptance.get("fresh") is True
+            and acceptance.get("exact_tree_match") is True
+            and (acceptance.get("verus_result") or {}).get("okay") is True
+            and (acceptance.get("vector") or {}).get("hard_admits") == 0
+        )
+        if not acceptance_green:
+            indeterminate = not _gate_receipt_decided(acceptance)
+            reason = (
+                "TERMINAL_GATE_INDETERMINATE"
+                if indeterminate else "TERMINAL_GATE_REJECTED"
+            )
+            return {
+                "success": False,
+                "end_reason": reason,
+                "promotion_decision": "REJECTED",
+                "scoreable": False,
+                "terminal_disposition": {
+                    "state": (
+                        "REJECTED_INDETERMINATE"
+                        if indeterminate else "REJECTED_TERMINAL_GATE"
+                    ),
+                    "reason": reason,
+                    "reusable": False,
+                    "scoreable": False,
+                    "gate_receipt_key": acceptance.get("receipt_key"),
+                },
+            }
+
+    if success:
+        return {
+            "success": True,
+            "end_reason": final_end_reason,
+            "promotion_decision": "ACCEPTED",
+            "scoreable": lineage_scoreable,
+            "terminal_disposition": {
+                "state": "ACCEPTED",
+                "reusable": True,
+                "scoreable": lineage_scoreable,
+            },
+        }
+
+    if banking_attempted:
+        if not banking:
+            state = "UNBANKABLE_NO_RECEIPT"
+            reason = "terminal banking gate produced no receipt"
+        elif banking.get("exact_tree_match") is not True:
+            state = "UNBANKABLE_TREE_MISMATCH"
+            reason = "terminal banking gate tree does not match the candidate"
+        elif not _gate_receipt_decided(banking):
+            state = "UNBANKABLE_INDETERMINATE"
+            reason = "terminal banking gate is compile-blocked or indeterminate"
+        else:
+            return {
+                "success": False,
+                "end_reason": final_end_reason,
+                "promotion_decision": "BANKED_PARTIAL",
+                "scoreable": lineage_scoreable,
+                "terminal_disposition": {
+                    "state": "BANKED_PARTIAL",
+                    "reason": final_end_reason,
+                    "reusable": True,
+                    "scoreable": lineage_scoreable,
+                    "gate_receipt_key": banking.get("receipt_key"),
+                },
+            }
+        return {
+            "success": False,
+            "end_reason": final_end_reason,
+            "promotion_decision": "REJECTED",
+            "scoreable": False,
+            "terminal_disposition": {
+                "state": state,
+                "reason": reason,
+                "reusable": False,
+                "scoreable": False,
+                "gate_receipt_key": banking.get("receipt_key"),
+            },
+        }
+
+    return {
+        "success": False,
+        "end_reason": final_end_reason,
+        "promotion_decision": "REJECTED",
+        "scoreable": False,
+        "terminal_disposition": {
+            "state": "UNCOMMITTED_CANDIDATE",
+            "reason": final_end_reason,
+            "reusable": False,
+            "scoreable": False,
+        },
+    }
+
+
+def _tree_receipt_changed_paths(
+    decided_tree: Optional[dict], current_tree: Optional[dict],
+) -> list[str]:
+    """Return the deterministic path delta since the last decided gate."""
+    if not decided_tree or not current_tree:
+        return []
+
+    def _entries(receipt: dict) -> dict[str, tuple]:
+        return {
+            str(entry.get("path") or ""): (
+                entry.get("kind"),
+                entry.get("sha256"),
+                entry.get("size"),
+            )
+            for entry in receipt.get("files", []) or []
+            if entry.get("path")
+        }
+
+    before = _entries(decided_tree)
+    after = _entries(current_tree)
+    return sorted(
+        path for path in before.keys() | after.keys()
+        if before.get(path) != after.get(path)
+    )
+
+
+def _validate_scored_lineage_context(
+    context_path: Path,
+    *,
+    project: Path,
+    operator_events: list[dict],
+) -> dict:
+    """Validate the launcher's content-addressed scored-lineage boundary."""
+    try:
+        context = json.loads(context_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid scored lineage context: {context_path}") from exc
+    if (
+        context.get("schema_version") != 1
+        or context.get("kind") != "scored_lineage_context"
+        or context.get("scoreable") is not True
+    ):
+        raise ValueError("lineage context is not scoreable schema_version 1")
+    stored_id = context.get("receipt_id")
+    if not isinstance(stored_id, str) or stored_id != provenance.receipt_id(context):
+        raise ValueError("lineage context content ID mismatch")
+    required = (
+        "lineage_id", "campaign_spec_sha256", "start_receipt_id",
+        "launch_registration_id", "sterility_receipt_id",
+        "expected_tree_hash",
+    )
+    for field in required:
+        if not isinstance(context.get(field), str) or not context[field]:
+            raise ValueError(f"lineage context lacks {field}")
+    if context.get("hint_level") != "H0":
+        raise ValueError("only H0 scored lineage contexts are currently supported")
+    if not isinstance(context.get("execution"), dict):
+        raise ValueError("lineage context lacks its registered execution envelope")
+    expected_lineage = provenance.derive_lineage_id(
+        context["campaign_spec_sha256"], context["start_receipt_id"],
+    )
+    if context["lineage_id"] != expected_lineage:
+        raise ValueError("lineage_id is not derived from campaign + start receipt")
+    if context.get("taints") not in ([], None):
+        raise ValueError("scoreable lineage context carries launch taints")
+    if operator_events:
+        raise ValueError("operator events permanently taint a scored lineage")
+    current_tree = provenance.source_tree_receipt(project)
+    if current_tree.get("tree_hash") != context["expected_tree_hash"]:
+        raise ValueError(
+            "lineage context tree mismatch: expected "
+            f"{context['expected_tree_hash']} actual {current_tree.get('tree_hash')}"
+        )
+    predecessor = context.get("predecessor") or None
+    if predecessor is not None:
+        if not isinstance(predecessor, dict):
+            raise ValueError("lineage predecessor authority is malformed")
+        if predecessor.get("lineage_id") != context["lineage_id"]:
+            raise ValueError("predecessor belongs to a different lineage")
+        if predecessor.get("campaign_spec_sha256") != context["campaign_spec_sha256"]:
+            raise ValueError("predecessor belongs to a different campaign")
+        if predecessor.get("tree_hash") != context["expected_tree_hash"]:
+            raise ValueError("predecessor tree does not match the replayed source")
+        if not isinstance(predecessor.get("receipt_id"), str):
+            raise ValueError("predecessor lacks a receipt ID")
+        frontier = predecessor.get("frontier")
+        if not isinstance(frontier, dict):
+            raise ValueError("predecessor lacks its runner-owned frontier")
+        if frontier.get("tree_hash") != context["expected_tree_hash"]:
+            raise ValueError("predecessor frontier tree mismatch")
+        vector = frontier.get("vector")
+        owner_queue = frontier.get("owner_queue")
+        required_vector = {
+            "hard_admits", "verification_errors", "resource_limits",
+            "raw_errors", "verified_count",
+        }
+        if not isinstance(vector, dict) or not required_vector <= set(vector):
+            raise ValueError("predecessor frontier vector is malformed")
+        if not isinstance(owner_queue, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("file"), str)
+            or not isinstance(item.get("kind"), str)
+            or not isinstance(item.get("count"), int)
+            or item["count"] <= 0
+            for item in owner_queue
+        ):
+            raise ValueError("predecessor frontier owner queue is malformed")
+        if not provenance.is_canonical_owner_queue(owner_queue):
+            raise ValueError("predecessor frontier owner queue is not canonical")
+        sidecar_name = frontier.get("sidecar_name")
+        if (
+            not isinstance(sidecar_name, str)
+            or not sidecar_name
+            or Path(sidecar_name).name != sidecar_name
+        ):
+            raise ValueError("predecessor frontier sidecar name is unsafe")
+        sidecar_path = context_path.parent / sidecar_name
+        if not sidecar_path.is_file():
+            raise ValueError("predecessor frontier sidecar is missing")
+        if provenance.sha256_file(sidecar_path) != frontier.get("sidecar_sha256"):
+            raise ValueError("predecessor frontier sidecar hash mismatch")
+        try:
+            sidecar = json.loads(sidecar_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("predecessor frontier sidecar is invalid") from exc
+        if (
+            sidecar.get("kind") != "scored_predecessor_frontier"
+            or sidecar.get("receipt_id") != provenance.receipt_id(sidecar)
+            or sidecar.get("receipt_id") != frontier.get("sidecar_receipt_id")
+            or sidecar.get("source_promotion_receipt_id")
+            != predecessor.get("receipt_id")
+            or sidecar.get("tree_hash") != frontier.get("tree_hash")
+            or sidecar.get("vector") != vector
+            or not isinstance(sidecar.get("diagnostic_inventory"), list)
+        ):
+            raise ValueError("predecessor frontier sidecar binding mismatch")
+    return context
+
+
+def _promotion_lineage_binding(context: dict | None) -> dict:
+    context = context or {}
+    return {
+        "lineage_context_receipt_id": context.get("receipt_id"),
+        "sterility_receipt_id": context.get("sterility_receipt_id"),
+    }
 
 
 def _gate_receipt(
     tdir: Path, round_num: int, tree_receipt: dict, commands: list[list[str]],
     verus_result: dict, returncode: int, *, cache_hit: bool = False,
-    forced_recheck: bool = False,
+    forced_recheck: bool = False, lineage_id: Optional[str] = None,
+    signature: Optional[dict] = None,
 ) -> dict:
-    """Create an unpersisted runner-owned receipt for one exact package gate."""
-    signature = _gate_signature_for_commands(commands)
+    """Create an unpersisted runner-owned receipt for one exact package gate.
+
+    ``signature`` lets callers that already computed the tool signature (the
+    round loop derives its cache key from it one statement earlier) skip a
+    redundant re-hash of ~400KB of harness tool bytes per gate.
+    """
+    signature = signature or _gate_signature_for_commands(commands)
     key = provenance.receipt_key(str(tree_receipt.get("tree_hash") or ""), signature["signature"])
     receipt = {
         "schema_version": 1,
@@ -3125,6 +4019,7 @@ def _gate_receipt(
         "compile_blocked": _compile_blocked_or_indeterminate(verus_result),
         "diagnostic_inventory": _normalized_diagnostic_inventory(verus_result),
         "cache_hit": cache_hit,
+        "lineage_id": lineage_id,
     }
     suffix = f".round_{round_num}" if forced_recheck else ""
     receipt_path = tdir / "gate_receipts" / f"{key}{suffix}.json"
@@ -3132,35 +4027,176 @@ def _gate_receipt(
     return receipt
 
 
-def _canonical_reset_handoff(tdir: Path, next_round: int, reset_event: dict,
-                             prior_gate: Optional[dict]) -> str:
+def _fresh_terminal_gate(
+    *,
+    tdir: Path,
+    round_number: int,
+    target: Path,
+    project: Path,
+    experiment_mode: str,
+    verus_rlimit: Optional[float],
+    experiment_allow_edit: list[Path],
+    env: dict[str, str],
+    lineage_id: str,
+    expected_tree_hash: str,
+) -> dict:
+    """Run and persist a mandatory fresh exact-tree promotion/banking gate."""
+    if experiment_mode not in _WHOLE_CRATE_MODES:
+        raise ValueError("BANKED_PARTIAL requires a whole-crate experiment mode")
+    tree = provenance.source_tree_receipt(project)
+    commands = _harness_gate_commands(
+        target, project, experiment_mode, verus_rlimit, experiment_allow_edit,
+    )
+    rc, stdout, _ = run_subskill(commands[0], env=env)
+    try:
+        verus_result = json.loads(stdout)
+    except json.JSONDecodeError:
+        verus_result = {"okay": False, "messages": [], "truncated": True}
+    receipt = _gate_receipt(
+        tdir, round_number, tree, commands, verus_result, rc,
+        forced_recheck=True, lineage_id=lineage_id,
+    )
+    receipt["fresh"] = True
+    receipt["exact_tree_match"] = (
+        receipt.get("tree_receipt", {}).get("tree_hash") == expected_tree_hash
+    )
+    receipt["vector"]["hard_admits"] = _count_gate_admits(
+        target, experiment_allow_edit,
+    )
+    _persist_gate_receipt(receipt)
+    return receipt
+
+
+def _canonical_reset_handoff(
+    tdir: Path,
+    next_round: int,
+    reset_event: dict,
+    prior_gate: Optional[dict],
+    last_decided_gate: Optional[dict],
+) -> str:
     """Write and render runner-owned reset context before a fresh session."""
     gate = dict(prior_gate or {})
-    handoff = {
-        "schema_version": 1,
-        "kind": "runner_reset_handoff",
-        "next_round": next_round,
-        "reset_event": reset_event,
-        "tree_receipt": gate.get("tree_receipt", {}),
+    decided = dict(last_decided_gate or {})
+    current_tree = gate.get("tree_receipt", {})
+    decided_tree = decided.get("tree_receipt", {})
+    post_decision_changes = _tree_receipt_changed_paths(
+        decided_tree, current_tree,
+    )
+    current_gate = {
+        "round_number": gate.get("round_number"),
+        "receipt_key": gate.get("receipt_key"),
         "gate_signature": gate.get("gate_signature", {}),
         "vector": gate.get("vector", {}),
+        "compile_blocked": gate.get("compile_blocked", True),
         "diagnostic_inventory": gate.get("diagnostic_inventory", []),
-        "transaction": reset_event.get("predecessor_transaction", {}),
+    }
+    if post_decision_changes:
+        owner_queue = [
+            {"file": path, "kind": "changed-path", "count": 1}
+            for path in post_decision_changes if path.endswith(".rs")
+        ]
+        queue_source = "changed_paths"
+    else:
+        owner_queue = provenance.diagnostic_owner_queue(
+            current_gate["diagnostic_inventory"],
+        )
+        queue_source = "current_gate"
+    transaction = reset_event.get("predecessor_transaction", {})
+    last_transaction_changed_owners = [
+        path for path in transaction.get("changed_paths", [])
+        if isinstance(path, str) and path.endswith(".rs")
+    ][:32]
+
+    def gate_ref(receipt: dict) -> dict:
+        receipt_path = Path(str(receipt.get("receipt_path") or ""))
+        if not receipt_path.is_file():
+            return {
+                "persisted": False,
+                "reason": (
+                    "NO_GATE_RECEIPT"
+                    if not receipt else "SYNTHETIC_OR_UNPERSISTED_GATE"
+                ),
+                "receipt_key": receipt.get("receipt_key"),
+                "tree_hash": (
+                    receipt.get("tree_receipt") or {}
+                ).get("tree_hash"),
+                "vector": dict(receipt.get("vector") or {}),
+                "compile_blocked": receipt.get("compile_blocked", True),
+            }
+        return {
+            "persisted": True,
+            "receipt_key": receipt.get("receipt_key"),
+            "path": str(receipt_path),
+            "sha256": provenance.sha256_file(receipt_path),
+            "tree_hash": (receipt.get("tree_receipt") or {}).get("tree_hash"),
+            "vector": dict(receipt.get("vector") or {}),
+            "compile_blocked": receipt.get("compile_blocked", True),
+        }
+    reset_event_summary = {
+        key: value for key, value in reset_event.items()
+        if key not in {"predecessor_transaction", "handoff_path"}
+    }
+    reset_event_summary["predecessor_transaction"] = {
+        key: value for key, value in transaction.items()
+        if key != "obligation_identities"
+    }
+    handoff = {
+        "schema_version": 3,
+        "kind": "runner_reset_handoff",
+        "next_round": next_round,
+        "reset_event": reset_event_summary,
+        "current_tree_hash": current_tree.get("tree_hash"),
+        "current_gate": current_gate,
+        "current_gate_ref": gate_ref(gate),
+        "last_decided_gate_ref": gate_ref(decided),
+        "last_decided_vector": dict(decided.get("vector") or {}),
+        "last_decided_tree_hash": decided_tree.get("tree_hash"),
+        "post_decision_changes": post_decision_changes,
+        "owner_queue": owner_queue,
+        "queue_source": queue_source,
+        "last_transaction_changed_owners": last_transaction_changed_owners,
+        "lineage_id": gate.get("lineage_id"),
     }
     path = tdir / f"reset_handoff_round_{next_round}.json"
     provenance.write_immutable_json(path, handoff)
     reset_event["handoff_path"] = str(path)
-    vector = handoff["vector"]
+    current_vector = current_gate["vector"]
+    decided_vector = decided.get("vector", {})
+    if current_gate["compile_blocked"]:
+        owners = ", ".join(
+            item["file"] for item in handoff["owner_queue"][:12]
+        ) or "unknown"
+        decided_summary = (
+            f"last decided tree `{decided_tree.get('tree_hash', 'none')}` "
+            f"(raw={decided_vector.get('raw_errors')}, "
+            f"verification={decided_vector.get('verification_errors')}, "
+            f"resource_limits={decided_vector.get('resource_limits')})"
+        )
+        return (
+            "# Canonical runner reset handoff — recovery required\n\n"
+            f"Read `{path}` before editing. The current source tree "
+            f"`{current_tree.get('tree_hash', 'unknown')}` has an "
+            "**indeterminate** runner gate; its timeout/compile vector is not "
+            f"an exhaustive frontier. The {decided_summary}. Changes since "
+            f"that decision are listed in `post_decision_changes`; Rust owner "
+            f"queue ({queue_source}): {owners}. Immediately preceding changed "
+            f"owners: {', '.join(last_transaction_changed_owners) or 'none'}. "
+            "First localize and obtain focused verifier "
+            "receipts for those owners. Do not claim progress from the "
+            "indeterminate whole-crate vector."
+        )
     return (
         "# Canonical runner reset handoff\n\n"
-        f"Read `{path}` before editing. It is the runner-owned receipt for the "
-        f"current source tree `{handoff['tree_receipt'].get('tree_hash', 'unknown')}` "
-        f"and exact gate argv/signature. The exhaustive normalized unresolved "
-        f"frontier is in that receipt (raw={vector.get('raw_errors')}, "
-        f"verification={vector.get('verification_errors')}, "
-        f"resource_limits={vector.get('resource_limits')}). Do not spend this "
-        "fresh session rerunning a whole-crate baseline; make the next proof "
-        "transaction against this candidate and use focused checks while editing."
+        f"Read `{path}` before editing. It binds the decided current source "
+        f"tree `{current_tree.get('tree_hash', 'unknown')}` to the exact gate "
+        f"signature and exhaustive frontier (raw={current_vector.get('raw_errors')}, "
+        f"verification={current_vector.get('verification_errors')}, "
+        f"resource_limits={current_vector.get('resource_limits')}). Scheduler "
+        f"queue source `{queue_source}`; owners: "
+        f"{', '.join(item['file'] for item in owner_queue[:12]) or 'none'}. "
+        f"Immediately preceding changed owners: "
+        f"{', '.join(last_transaction_changed_owners) or 'none'}. Use focused "
+        "checks while making the next proof transaction."
     )
 
 
@@ -4341,6 +5377,40 @@ reusable lemma and reuse.
 """
 
 
+def _render_continuation_frontier(
+    experiment_block: str,
+    frontier: dict,
+    sidecar_path: Path,
+) -> str:
+    """Render mechanically derived predecessor state without operator hints."""
+    owner_lines = "\n".join(
+        f"  - `{item['file']}` / `{item['kind']}`: {item['count']}"
+        for item in frontier["owner_queue"]
+    )
+    frontier_block = (
+        "## Runner-owned continuation frontier\n\n"
+        "This is a continuation from a fresh verifier-banked tree, not a "
+        "new full peel. Start from this mechanical remaining-owner queue; "
+        "do not repeat broad workspace, proof-function, or admit surveys.\n\n"
+        f"- Exact bank tree: `{frontier['tree_hash']}`\n"
+        f"- Canonical vector: `{json.dumps(frontier['vector'], sort_keys=True)}`\n"
+        f"- Exhaustive diagnostic inventory: `{sidecar_path}`\n"
+        "- Remaining-owner queue (count descending, then path/kind):\n"
+        f"{owner_lines}\n\n"
+    )
+    continuation = experiment_block.replace(
+        "The entire in-repo proof layer has been peeled. You reconstruct",
+        "The in-repo proof layer was initially peeled, but prior scored "
+        "legs have reconstructed substantial proofs. Continue from the "
+        "current banked tree and reconstruct",
+    ).replace(
+        "**Entire in-repo proof layer peeled** -- this is the trusted-core variant.",
+        "**Verifier-banked trusted-core continuation** -- this proof layer "
+        "was initially peeled and is now partially reconstructed.",
+    )
+    return frontier_block + continuation
+
+
 def run_subskill(cmd: list[str], env: dict, cwd: Optional[Path] = None) -> tuple[int, str, str]:
     """Run a skill CLI; capture stdout/stderr as strings."""
     proc = subprocess.run(
@@ -4455,6 +5525,7 @@ def _build_agent_command(
     model: Optional[str],
     continue_message: Optional[str],
     settings_path: Optional[Path] = None,
+    agent_max_turns: Optional[int] = _DEFAULT_AGENT_MAX_TURNS,
 ) -> list[str]:
     """Build one noninteractive agent invocation without running it."""
     message = (continue_message or "continue") if resume else prompt
@@ -4473,6 +5544,10 @@ def _build_agent_command(
                    *AGENT_TOOL_FLAGS, *settings_flags]
         if model:
             cmd += ["--model", model]
+        if agent_max_turns is not None:
+            if agent_max_turns <= 0:
+                raise ValueError("agent_max_turns must be positive or None")
+            cmd += ["--max-turns", str(agent_max_turns)]
         return [*cmd, message]
     if backend == "codex":
         # This matches Claude's bypassPermissions semantics. The proof harness
@@ -4497,6 +5572,92 @@ def _build_agent_command(
     raise ValueError(f"unknown agent backend: {backend!r}")
 
 
+def _wait_for_agent_process(
+    proc: subprocess.Popen,
+    backend: str,
+    deadline_seconds: Optional[float],
+    *,
+    drain_seconds: float = _AGENT_DEADLINE_DRAIN_SEC,
+) -> dict:
+    """Wait for an agent, requesting a graceful stop before hard SIGKILL.
+
+    The returned receipt is persisted in the round lifecycle.  A graceful
+    signal does not manufacture a provider result: if the stream still lacks
+    a terminal cost event, usage_audit continues to classify it unresolved.
+    """
+    import signal as _signal
+
+    started = time.time()
+    hard_deadline = (
+        started + deadline_seconds if deadline_seconds is not None else None
+    )
+    effective_drain = (
+        min(max(0.0, drain_seconds), max(0.0, deadline_seconds))
+        if deadline_seconds is not None else 0.0
+    )
+    soft_deadline = (
+        hard_deadline - effective_drain if hard_deadline is not None else None
+    )
+    receipt = {
+        "deadline_seconds": deadline_seconds,
+        "drain_seconds": effective_drain,
+        "graceful_signal": "SIGINT",
+        "graceful_signal_sent": False,
+        "graceful_signal_elapsed_seconds": None,
+        "hard_kill_sent": False,
+        "hard_kill_elapsed_seconds": None,
+    }
+    while True:
+        now = time.time()
+        next_deadline = (
+            soft_deadline
+            if soft_deadline is not None
+            and not receipt["graceful_signal_sent"]
+            else hard_deadline
+        )
+        try:
+            proc.wait(timeout=_bounded_wait_timeout(next_deadline, now=now))
+            break
+        except subprocess.TimeoutExpired:
+            now = time.time()
+            if (
+                soft_deadline is not None
+                and not receipt["graceful_signal_sent"]
+                and now >= soft_deadline
+            ):
+                print(
+                    f"[run] deadline drain window entered — requesting "
+                    f"graceful {backend} stop for process group {proc.pid}",
+                    flush=True,
+                )
+                try:
+                    os.killpg(proc.pid, _signal.SIGINT)
+                    receipt["graceful_signal_sent"] = True
+                    receipt["graceful_signal_elapsed_seconds"] = now - started
+                except ProcessLookupError:
+                    break
+                continue
+            if hard_deadline is not None and now >= hard_deadline:
+                print(
+                    f"[run] deadline ({deadline_seconds:.0f}s) exceeded — "
+                    f"killing {backend} process group {proc.pid}",
+                    flush=True,
+                )
+                try:
+                    os.killpg(proc.pid, _signal.SIGKILL)
+                    receipt["hard_kill_sent"] = True
+                    receipt["hard_kill_elapsed_seconds"] = now - started
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                break
+    receipt["elapsed_seconds"] = time.time() - started
+    return receipt
+
+
 def run_claude_round(
     prompt: str,
     cwd: Path,
@@ -4508,7 +5669,9 @@ def run_claude_round(
     deadline_seconds: Optional[float] = None,
     continue_message: Optional[str] = None,
     backend: str = "claude",
-) -> tuple[Optional[str], int, dict]:
+    agent_max_turns: Optional[int] = _DEFAULT_AGENT_MAX_TURNS,
+    deadline_drain_seconds: float = _AGENT_DEADLINE_DRAIN_SEC,
+) -> tuple[Optional[str], int, dict, dict]:
     """Invoke a Claude or Codex noninteractive round and normalize its result.
 
     Claude starts with the caller-provided UUID. Codex chooses a thread UUID
@@ -4523,10 +5686,10 @@ def run_claude_round(
     See: investigation of curve_eq_20260518 — 6 of 10 rounds were
     re-routed to the user's interactive session because of that.
 
-    `deadline_seconds`: if set, SIGKILL the entire process group when the
-    deadline expires. Catches the case where the agent spawns background
-    subprocesses (Monitor + sleep loops, async cargo verus + pkill chains)
-    that hold the claude -p process alive forever.
+    `deadline_seconds`: if set, request a graceful process-group stop during
+    the final drain window, then SIGKILL the entire group at the hard deadline.
+    This catches background subprocesses while giving Claude a bounded chance
+    to emit its terminal provider-cost event.
 
     `start_new_session=True`: puts claude (+ all its descendants) in a
     fresh process group so we can kill the whole tree at once.
@@ -4537,6 +5700,7 @@ def run_claude_round(
     cmd = _build_agent_command(
         backend, prompt, session_id, resume, model, continue_message,
         settings_path=settings_path,
+        agent_max_turns=agent_max_turns,
     )
 
     raw_out.parent.mkdir(parents=True, exist_ok=True)
@@ -4550,28 +5714,14 @@ def run_claude_round(
             start_new_session=True,
         )
         _LIVE_PROC = proc
-        # Enforce the deadline against the WALL clock (time.time), polling in
-        # short slices. proc.wait(timeout=...) alone counts down against
-        # time.monotonic(), which freezes during macOS sleep — once let a
-        # round run 7.8h past a 90-min budget on a sleeping laptop.
-        wall_deadline = (time.time() + deadline_seconds) if deadline_seconds else None
-        while True:
-            try:
-                proc.wait(timeout=_bounded_wait_timeout(wall_deadline))
-                break
-            except subprocess.TimeoutExpired:
-                if wall_deadline and time.time() >= wall_deadline:
-                    print(f"[run] deadline ({deadline_seconds:.0f}s) exceeded — "
-                          f"killing {backend} process group {proc.pid}", flush=True)
-                    try:
-                        os.killpg(proc.pid, _signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    break
+        # Enforce against the WALL clock. time.monotonic() freezes during
+        # macOS sleep and once let a nominal 90-minute round run for 7.8h.
+        process_receipt = _wait_for_agent_process(
+            proc,
+            backend,
+            deadline_seconds,
+            drain_seconds=deadline_drain_seconds,
+        )
         # Post-completion cleanup: claude may have left background bash
         # children (Monitor poll loops, etc.). If anything is still alive
         # after the main process returned, kill the whole group.
@@ -4588,7 +5738,12 @@ def run_claude_round(
     result_dict, parser_provenance = _last_agent_result_event(raw_out, backend)
     if result_dict:
         result_dict["_parser_provenance"] = parser_provenance
-    return end_reason_from_result(result_dict), proc.returncode, result_dict
+    return (
+        end_reason_from_result(result_dict),
+        proc.returncode,
+        result_dict,
+        process_receipt,
+    )
 
 
 def end_reason_from_result(result_dict: dict) -> Optional[str]:
@@ -4707,7 +5862,14 @@ def _last_codex_result_event(raw_out: Path) -> tuple[dict, dict]:
                                  error_text, re.I)
         if status_match:
             result["api_error_status"] = int(status_match.group(1))
-        elif "429" in error_text or "rate limit" in error_text.lower():
+        elif re.search(
+            r"(?<!\d)429(?!\d)[^\n]{0,60}?too many requests", error_text, re.I,
+        ) or "rate limit" in error_text.lower():
+            # A 429 classification halts the whole sweep (exit 42), so the
+            # fallback must not fire on an incidental "429" inside request
+            # ids or byte counts (F7): the standalone number counts only in
+            # its canonical "429 Too Many Requests" phrasing, while an
+            # explicit rate-limit phrase still counts on its own.
             result["api_error_status"] = 429
     return result, {
         "backend": "codex",
@@ -5165,9 +6327,10 @@ def _restore_snapshot_targets(snapshot_targets: list[Path], snapshots_root: Path
                               round_number: int) -> dict:
     """Restore one complete source snapshot and report every missing file.
 
-    This is used only at a terminal integrity boundary. The rejected post-agent
-    snapshot remains on disk for forensics, while the reusable live worktree is
-    put back to the last integrity-clean candidate.
+    The single restore implementation for all rollback boundaries: terminal
+    integrity rejection, budget-exhaustion bail, and RATE_LIMIT_OR_HANG. The
+    rejected post-agent snapshot remains on disk for forensics, while the
+    reusable live worktree is put back to the chosen restoration frontier.
     """
     source = snapshots_root / f"round_{round_number}"
     restored: list[str] = []
@@ -5274,6 +6437,8 @@ def run_task(
     admitted_ref: Optional[str] = None,
     truth_ref: str = "main",
     max_task_minutes: float = 45.0,
+    budget_is_auto: bool = False,
+    agent_max_turns: Optional[int] = _DEFAULT_AGENT_MAX_TURNS,
     skip_failure_memory: bool = False,
     verus_rlimit: Optional[float] = _DEFAULT_VERUS_RLIMIT,
     auto_reset: bool = True,
@@ -5291,24 +6456,98 @@ def run_task(
     sibling_verify: bool = True,
     force_gate_recheck: bool = False,
     operator_events: Optional[list[dict]] = None,
+    lineage_context: Optional[dict] = None,
+    lineage_frontier_sidecar: Optional[Path] = None,
+    bank_partial: bool = False,
 ) -> TaskResult:
     if backend not in ("claude", "codex"):
         raise ValueError(f"unknown agent backend: {backend!r}")
+    if agent_max_turns is not None and agent_max_turns <= 0:
+        raise ValueError("agent_max_turns must be positive or None")
     target = target.resolve()
     project = project.resolve()
     experiment_allow_edit = [p.resolve() for p in (experiment_allow_edit or [])]
     experiment_active_edit = [p.resolve() for p in (experiment_active_edit or [])]
     experiment_edit_scope = experiment_active_edit or experiment_allow_edit
     operator_events = list(operator_events or [])
+    lineage_context = dict(lineage_context or {})
+    lineage_id = lineage_context.get("lineage_id") or None
+    if lineage_context and not skip_failure_memory:
+        raise ValueError(
+            "scoreable lineage runs require --no-failure-memory until retry "
+            "memory is explicitly lineage-bound"
+        )
+    if lineage_context and experiment_mode not in _WHOLE_CRATE_MODES:
+        raise ValueError(
+            "scoreable lineage runs require a whole-crate experiment mode; "
+            "module-mode COMPLETE has no whole-package terminal seal"
+        )
+    if bank_partial and not lineage_context:
+        raise ValueError("BANKED_PARTIAL requires a scored lineage context")
     module = module_path_of(target, project)
     target_id = results.target_id_from_path(target)
     tdir = task_dir(results_root, run_id, target_id)
+    superseded = _supersede_prior_attempt_receipts(tdir)
+    if superseded:
+        print(f"[run] prior-attempt immutable receipts superseded into "
+              f"{superseded}", flush=True)
+    if lineage_context:
+        provenance.write_immutable_json(
+            tdir / "lineage_context.json", lineage_context,
+        )
+        predecessor = lineage_context.get("predecessor") or {}
+        frontier = predecessor.get("frontier") or None
+        if frontier:
+            if lineage_frontier_sidecar is None:
+                raise ValueError("continuation lineage lacks its frontier sidecar")
+            sidecar = json.loads(lineage_frontier_sidecar.read_text())
+            frontier_copy = tdir / "predecessor_frontier.json"
+            provenance.write_immutable_json(frontier_copy, sidecar)
+            if provenance.sha256_file(frontier_copy) != frontier["sidecar_sha256"]:
+                raise ValueError("persisted predecessor frontier hash mismatch")
     catalog_cache = results_root / "catalog_cache.json"
     experiment_provenance = (
         os.environ.get("DALEK_EXPERIMENT_PROVENANCE", "").strip() or None
     )
     final_gate_allowance_seconds = _final_gate_allowance_seconds(experiment_mode)
-    agent_budget_seconds = _agent_budget_seconds(max_task_minutes * 60, experiment_mode)
+    canonical_gate_commands = _harness_gate_commands(
+        target, project, experiment_mode, verus_rlimit, experiment_allow_edit,
+    )
+    round_gate_allowance_seconds = _round_gate_allowance_seconds(
+        canonical_gate_commands,
+    )
+    max_task_minutes, agent_budget_seconds, budget_raised, budget_error = (
+        _resolve_launch_budget(
+            max_task_minutes, experiment_mode,
+            round_gate_allowance_seconds, budget_is_auto,
+        )
+    )
+    if budget_raised:
+        print(
+            f"[run] auto budget could not fund one provider round plus its "
+            f"authoritative gate; raised to {max_task_minutes:.1f} min "
+            f"(round gate allowance={round_gate_allowance_seconds:.0f}s, "
+            f"terminal reserve={final_gate_allowance_seconds:.0f}s)",
+            flush=True,
+        )
+    if budget_error:
+        msg = budget_error
+        print(f"[error] {msg}", file=sys.stderr)
+        task_result = TaskResult(
+            task_id=target_id,
+            run_id=run_id,
+            target_path=str(target),
+            module_path=module,
+            success=False,
+            end_reason="ERROR",
+            rounds_used=0,
+            duration_seconds=0.0,
+            agent_backend=backend,
+            error_message=msg,
+            experiment_provenance=experiment_provenance,
+        )
+        write_json(tdir / "result.json", task_result)
+        return task_result
 
     omitted_active_admits = _active_edit_omitted_admit_files(
         target, experiment_allow_edit, experiment_active_edit)
@@ -5429,9 +6668,50 @@ def run_task(
     # canonical runner argv. Older records remain useful as archival hints, but
     # must not masquerade as evidence for this candidate/configuration.
     baseline_tree_receipt = provenance.source_tree_receipt(project)
-    canonical_gate_commands = _harness_gate_commands(
-        target, project, experiment_mode, verus_rlimit, experiment_allow_edit)
     canonical_gate_signature = _gate_signature_for_commands(canonical_gate_commands)
+
+    # Continuation legs previously spent their first provider transaction
+    # compiling Verus/vstd despite an exact banked seed. Run the canonical
+    # unfiltered package gate in-container before provider contact. It both
+    # warms the cold dependency cache and establishes the decided round-0
+    # frontier; a focused module filter here would reproduce T154.
+    premodel_gate_receipt: Optional[dict] = None
+    if lineage_context and lineage_context.get("predecessor") \
+            and experiment_mode in _WHOLE_CRATE_MODES:
+        try:
+            premodel_gate_receipt = _premodel_verifier_warm(
+                tdir=tdir, project=project,
+                gate_commands=canonical_gate_commands, env=env,
+                lineage_id=lineage_id,
+                before_tree_receipt=baseline_tree_receipt,
+            )
+        except PremodelWarmIndeterminate as exc:
+            # This boundary is before any provider process. Persist a result so
+            # the durable supervisor can apply its registered infrastructure
+            # backoff instead of converting a bare exception into a permanent
+            # no-result stop. The failed warm remains non-authoritative and
+            # contributes no gate/frontier authority.
+            task_result = TaskResult(
+                task_id=target_id,
+                run_id=run_id,
+                target_path=str(target),
+                module_path=module,
+                success=False,
+                end_reason="PREMODEL_GATE_INDETERMINATE",
+                rounds_used=0,
+                duration_seconds=0.0,
+                agent_backend=backend,
+                error_message=str(exc),
+                experiment_provenance=experiment_provenance,
+                final_tree_receipt=provenance.source_tree_receipt(project),
+                lineage_context=lineage_context,
+            )
+            write_json(tdir / "result.json", task_result)
+            return task_result
+        print(
+            f"[run] exact-seeded premodel whole-crate gate: "
+            f"{premodel_gate_receipt['receipt_key'][:12]}", flush=True,
+        )
 
     # Pull prior failures → prompt block. Skippable for runs where prior
     # records predate prompt/harness improvements and would prime the
@@ -5447,10 +6727,13 @@ def run_task(
         current_gate_signature=canonical_gate_signature["signature"],
     )
 
-    # Feature 3: prepend the cross-round discovery brief (files/searches a
-    # prior attempt on this target already explored) so the retry doesn't
-    # re-walk the tree. Injected regardless of failure-memory skip.
-    brief_block = discovery_brief.load_block(results_root, target_id)
+    # Generic retries may reuse a target-local discovery brief. A scored
+    # lineage refuses that unbound channel; S5 may later supply an explicitly
+    # lineage+predecessor-bound brief through the launch context.
+    brief_block = (
+        "" if lineage_context
+        else discovery_brief.load_block(results_root, target_id)
+    )
     if brief_block:
         print("[run] Feature3: injecting prior discovery brief", flush=True)
         failure_block = (
@@ -5494,6 +6777,26 @@ def run_task(
     experiment_block = build_experiment_block(
         target, experiment_edit_scope, mode=experiment_mode,
     )
+    continuation_frontier = None
+    if lineage_context:
+        continuation_frontier = (
+            (lineage_context.get("predecessor") or {}).get("frontier")
+        )
+    if continuation_frontier:
+        experiment_block = _render_continuation_frontier(
+            experiment_block,
+            continuation_frontier,
+            tdir / "predecessor_frontier.json",
+        )
+    if lineage_context:
+        experiment_block = (
+            "## Scored Trust Core launch identity\n\n"
+            f"- Hint level: `{lineage_context['hint_level']}` (no operator hints)\n"
+            f"- Lineage context receipt: `{lineage_context['receipt_id']}`\n"
+            f"- Launch registration: "
+            f"`{lineage_context['launch_registration_id']}`\n\n"
+            + experiment_block
+        )
     operator_brief = os.environ.get("DALEK_EXPERIMENT_BRIEF", "").strip()
     if operator_brief:
         experiment_block = (
@@ -5526,6 +6829,7 @@ def run_task(
         vstd_root=vstd_root, experiment_block=experiment_block,
         decompose_block=decompose_block,
         whole_crate_assignment=experiment_mode in _WHOLE_CRATE_MODES,
+        continuation_assignment=bool(continuation_frontier),
         verus_rlimit=verus_rlimit,
     )
 
@@ -5578,10 +6882,27 @@ def run_task(
     # than leave the rejected post-agent bytes as a tempting next seed.
     last_integrity_clean_snapshot_round = 0
     agent_elapsed_seconds = 0.0
-    gate_cache: dict[str, dict] = {}
+    agent_turn_observations: list[dict] = []
+    gate_cache: dict[str, dict] = (
+        {premodel_gate_receipt["receipt_key"]: dict(premodel_gate_receipt)}
+        if premodel_gate_receipt else {}
+    )
     previous_tree_receipt: dict = baseline_tree_receipt
-    previous_gate_receipt: Optional[dict] = None
-    last_gate_receipt: dict = {}
+    previous_gate_receipt: Optional[dict] = (
+        dict(premodel_gate_receipt) if premodel_gate_receipt else None
+    )
+    last_gate_receipt: dict = dict(premodel_gate_receipt or {})
+    last_decided_gate_receipt: Optional[dict] = (
+        dict(premodel_gate_receipt) if premodel_gate_receipt else None
+    )
+    # Best authoritative partial frontier, distinct from "last green".  A
+    # whole-crate proof campaign can make substantial scored progress without
+    # ever reaching verus_okay=True; rolling such a leg back to the last green
+    # snapshot (normally round 0) destroys valid work at budget exhaustion.
+    best_decided_gate_receipt: Optional[dict] = (
+        dict(premodel_gate_receipt) if premodel_gate_receipt else None
+    )
+    best_decided_snapshot_round = 0
     # GIT_RECOVERY softening: a peek into git history is no longer instantly
     # terminal. We discard the contaminated round + reset the session, up to
     # this many times; only a repeat offender past the cap fails the task.
@@ -5696,23 +7017,24 @@ def run_task(
     # catch. A new `lemma_*` whose body is `assume(false)`, or a new
     # external_body helper, is therefore a fake-green vector in exactly the
     # class SPEC_DRIFT / AXIOM_DRIFT / TOOLING_DRIFT guard against. Snapshot a
-    # comment/string-aware count across the editable scope (target + siblings +
-    # allow-edit deps) before the loop; any INCREASE fails the round. This is
-    # the only gate covering external_body in experiment mode, where the spec
-    # gate (which catches external_body on the spec-snapshot path) is off.
-    # Baseline-diff (not absolute) so a pre-existing `external_body` in seeded
-    # dalek source doesn't trip it — only agent-introduced constructs do.
+    # comment/string-aware baseline across the editable scope (target +
+    # siblings + allow-edit deps) before the loop. `assume`/`external_body`
+    # retain increase-only semantics. `rlimit` freezes the exact normalized
+    # (relative file, owner/location, value) inventory because raising or
+    # moving an inherited attribute changes gate configuration without
+    # changing its count. This is the only gate covering external_body in
+    # experiment mode, where the spec gate (which catches external_body on the
+    # spec-snapshot path) is off. Baseline-diff (not absolute) so inherited
+    # constructs in seeded dalek source do not trip it.
     forbidden_scope_files = [target, *siblings, *(experiment_allow_edit or [])]
 
-    def _forbidden_counts() -> dict[str, int]:
-        return _count_forbidden_in_files(forbidden_scope_files)
-
-    baseline_forbidden = _forbidden_counts()
+    baseline_forbidden = _forbidden_baseline(
+        forbidden_scope_files, root=project)
 
     def _forbidden_introduced() -> list[str]:
-        """Forbidden constructs introduced this round vs the pre-run baseline,
-        as human-readable `name (+N)` strings. Empty = none added."""
-        return _forbidden_delta(forbidden_scope_files, baseline_forbidden)
+        """Forbidden construct/config drift from the pre-run baseline."""
+        return _forbidden_delta(
+            forbidden_scope_files, baseline_forbidden, root=project)
 
     # Tooling-integrity gate: the harness's own verification skills are
     # re-read from disk every round — verus_check.py / spec_check.py run as
@@ -5732,7 +7054,22 @@ def run_task(
     # write primitive and `--allowedTools` is a no-op under bypassPermissions.
     def _tooling_digest() -> dict[str, str]:
         digest: dict[str, str] = {}
-        for f in [*HERE.glob("skills/**/*.py"), *HERE.glob("lib/**/*.py")]:
+        top_level = [
+            HERE / name for name in (
+                "run.py", "prompt.md", "prompt_decompose.md", "admit.py",
+                "peel.py", "strip_specs.py", "usage_audit.py",
+                "trusted_core_profile.py", "skills/SKILL.md",
+            )
+        ]
+        files = [
+            *top_level,
+            *HERE.glob("skills/**/*.py"),
+            *HERE.glob("lib/**/*.py"),
+            *HERE.glob("docker/*.py"),
+            *HERE.glob("docker/*.sh"),
+            *HERE.glob("docker/*.json"),
+        ]
+        for f in files:
             if "__pycache__" in f.parts:
                 continue
             rel = str(f.relative_to(HERE))
@@ -5876,18 +7213,22 @@ def run_task(
         # verifier call to the same cap so repeated gates cannot make a
         # nominally bounded run unbounded.
         remaining_s = agent_budget_seconds - elapsed
-        if remaining_s < 60.0:
+        provider_deadline_s = _provider_deadline_seconds(
+            agent_budget_seconds, elapsed, round_gate_allowance_seconds,
+        )
+        if provider_deadline_s < 60.0:
             print(f"[run] budget exhausted "
                   f"(elapsed={elapsed:.0f}s / "
                   f"agent_budget={agent_budget_seconds:.0f}s, "
                   f"final_gate_reserve={final_gate_allowance_seconds:.0f}s, "
-                  f"remaining={remaining_s:.0f}s < 60s) — stopping loop",
+                  f"round_gate_reserve={round_gate_allowance_seconds:.0f}s, "
+                  f"provider_remaining={provider_deadline_s:.0f}s < 60s) "
+                  "— stopping loop",
                   flush=True)
             break
 
-        # Bail-out guard: if remaining budget is <5 min, no productive
-        # agent work is possible (claude will be SIGKILL'd at ~60s by
-        # the deadline, the floor). Two sub-cases:
+        # Bail-out guard: after reserving this round's complete gate plan,
+        # require a five-minute productive provider slice. Two sub-cases:
         #
         #   (a) Current file state is broken (verus_okay=False on last
         #       round). Roll back to the latest verus_okay snapshot so
@@ -5895,31 +7236,40 @@ def run_task(
         #   (b) Current file state is clean. No rollback needed; just
         #       break out of the loop. Avoids burning N×60s rounds at
         #       end-of-budget with zero productive work.
-        budget_exhausted = remaining_s < 5 * 60
+        budget_exhausted = provider_deadline_s < _MIN_PRODUCTIVE_ROUND_SEC
         last_verus_failed = bool(round_results) and not round_results[-1].verus_okay
         if budget_exhausted:
             if last_verus_failed:
-                snap_dir = snapshots_root / f"round_{last_good_snapshot_round}"
-                rollback_files = snapshot_targets
+                rollback_round = _rollback_snapshot_round(
+                    experiment_mode,
+                    best_decided_round=best_decided_snapshot_round,
+                    last_green_round=last_good_snapshot_round,
+                )
+                snap_dir = snapshots_root / f"round_{rollback_round}"
                 if snap_dir.exists():
                     print(f"[run] budget exhausted with broken file state — "
-                          f"rolling back to snapshots/round_{last_good_snapshot_round}/",
+                          f"rolling back to snapshots/round_{rollback_round}/",
                           flush=True)
-                    for f in rollback_files:
-                        snap_f = snap_dir / _snapshot_name(f, rollback_files)
-                        if snap_f.exists():
-                            shutil.copy2(snap_f, f)
+                    restore = _restore_snapshot_targets(
+                        snapshot_targets, snapshots_root, rollback_round)
+                    if restore["missing_files"]:
+                        print(f"[run] rollback missing files: "
+                              f"{restore['missing_files']}", flush=True)
                     pending_sibling_fail.clear()
                 else:
                     print(f"[run] budget exhausted with broken file state, but no "
                           f"snapshot to roll back to — file remains broken.",
                           flush=True)
-                print(f"[run] bailing out of round loop early (budget < 5 min, "
+                print(f"[run] bailing out of round loop early "
+                      f"(provider budget < {_MIN_PRODUCTIVE_ROUND_SEC:.0f}s, "
                       f"file not verus_okay). end_reason=LIMIT", flush=True)
             else:
-                print(f"[run] budget exhausted (remaining < 5 min); file is in "
+                print(f"[run] budget exhausted "
+                      f"(provider budget < {_MIN_PRODUCTIVE_ROUND_SEC:.0f}s); "
+                      f"file is in "
                       f"verus_okay state with {_admit_count()} admits remaining. "
-                      f"Bailing out of round loop to avoid wasted 60s rounds. "
+                      f"Bailing out of round loop to preserve the "
+                      f"{round_gate_allowance_seconds:.0f}s gate allowance. "
                       f"end_reason=LIMIT", flush=True)
             break
 
@@ -5969,22 +7319,29 @@ def run_task(
         if fresh_next_round:
             task_session_id = str(uuid.uuid4())
             agent_cwd = _make_agent_cwd(target_id)
-            print(f"[run] starting FRESH {backend} session "
-                  f"(auto-reset #{auto_resets_used}, session_id={task_session_id})",
-                  flush=True)
             reset_event = next(
                 (event for event in reversed(reset_events)
                  if event.get("planned_round") == round_num
                  and event.get("actual_start_round") is None),
                 None,
             )
+            reset_cause = "; ".join(
+                str(cause) for cause in (
+                    (reset_event or {}).get("cause") or ["session reset"]
+                )
+            )
+            print(f"[run] starting FRESH {backend} session "
+                  f"(reason={reset_cause}, session_id={task_session_id})",
+                  flush=True)
             reset_handoff = ""
             if reset_event is not None:
                 active_reset_event = reset_event
                 reset_event["actual_start_round"] = round_num
                 reset_event["fresh_session_id"] = task_session_id
                 reset_handoff = _canonical_reset_handoff(
-                    tdir, round_num, reset_event, last_gate_receipt)
+                    tdir, round_num, reset_event, last_gate_receipt,
+                    last_decided_gate_receipt,
+                )
             carryover = "\n\n".join(
                 part for part in (reset_handoff, continue_message)
                 if part and part != "continue"
@@ -5996,6 +7353,11 @@ def run_task(
             )
         lifecycle_path = (
             tdir / "claude_raw" / f"round_{round_num}.lifecycle.json"
+        )
+        effective_agent_max_turns, turn_cap_receipt = _adaptive_agent_turn_cap(
+            agent_max_turns if backend == "claude" else None,
+            provider_deadline_s,
+            agent_turn_observations,
         )
         round_lifecycle = {
             "schema_version": 1,
@@ -6011,32 +7373,71 @@ def run_task(
             "ended_at": None,
             "returncode": None,
             "status": "agent_started",
+            "configured_agent_max_turns": (
+                agent_max_turns if backend == "claude" else None
+            ),
+            "effective_agent_max_turns": effective_agent_max_turns,
+            "turn_cap": turn_cap_receipt,
+            "provider_deadline_seconds": provider_deadline_s,
         }
         # Persist before spawning the agent. If the runner or launcher is
         # interrupted, the cost auditor can still distinguish a started stream
         # from a round that was never invoked.
         write_json(lifecycle_path, round_lifecycle)
-        reason, rc, claude_result = run_claude_round(
+        reason, rc, claude_result, process_receipt = run_claude_round(
             prompt=round_prompt,
             cwd=agent_cwd, env=env, raw_out=raw_out,
             session_id=task_session_id,
             resume=use_resume,
             model=model,
-            deadline_seconds=remaining_s,
+            deadline_seconds=provider_deadline_s,
             continue_message=continue_message if use_resume else None,
             backend=backend,
+            agent_max_turns=effective_agent_max_turns,
         )
         duration = time.time() - round_start
         agent_elapsed_seconds += duration
+        turn_limit_boundary = _is_agent_turn_limit_boundary(
+            backend, claude_result)
+        terminal_usage = (
+            _normalized_agent_usage(claude_result) if claude_result else {}
+        )
         round_lifecycle.update({
             "ended_at": time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "returncode": rc,
-            "status": "agent_exited",
+            "status": (
+                "agent_turn_limit" if turn_limit_boundary else "agent_exited"
+            ),
+            "agent_max_turns": (
+                effective_agent_max_turns if backend == "claude" else None
+            ),
+            "deadline": process_receipt,
+            "duration_seconds": process_receipt.get("elapsed_seconds"),
+            "terminal_subtype": terminal_usage.get("terminal_subtype"),
+            "reported_num_turns": terminal_usage.get("reported_num_turns"),
+            "terminal_cost_usd": terminal_usage.get("total_cost_usd"),
+            "cost_reported": terminal_usage.get("cost_reported", False),
         })
         write_json(lifecycle_path, round_lifecycle)
+        if (
+            turn_limit_boundary
+            and isinstance(effective_agent_max_turns, int)
+            and effective_agent_max_turns > 0
+            and isinstance(process_receipt.get("elapsed_seconds"), (int, float))
+        ):
+            agent_turn_observations.append({
+                "round_number": round_num,
+                "effective_max_turns": effective_agent_max_turns,
+                "reported_num_turns": terminal_usage.get("reported_num_turns"),
+                "duration_seconds": process_receipt["elapsed_seconds"],
+            })
         fresh_next_round = False
-        _, parser_provenance = _last_agent_result_event(raw_out, backend)
+        parser_provenance = claude_result.get("_parser_provenance")
+        if parser_provenance is None:
+            # Only no-result rounds skip the in-run attach; one re-parse on
+            # that rare path beats re-reading a multi-MB stream every round.
+            _, parser_provenance = _last_agent_result_event(raw_out, backend)
         captured_session_id = str(claude_result.get("_session_id") or "")
         if captured_session_id:
             task_session_id = captured_session_id
@@ -6125,10 +7526,12 @@ def run_task(
                 "vector": _gate_vector(no_result_verus),
                 "compile_blocked": True,
                 "diagnostic_inventory": _normalized_diagnostic_inventory(no_result_verus),
+                "lineage_id": lineage_id,
             }
             no_result_transaction = _classify_candidate_transaction(
                 previous_tree_receipt, previous_gate_receipt,
                 current_tree_receipt, no_result_verus,
+                last_decided_gate_receipt,
             )
             no_result_spec_diag = None
             if not no_spec_gate:
@@ -6175,6 +7578,7 @@ def run_task(
                 diagnostic_inventory=_normalized_diagnostic_inventory(no_result_verus),
                 candidate_transaction=no_result_transaction,
                 parser_provenance=parser_provenance,
+                lineage_id=lineage_id,
             )
             round_results.append(rr)
             write_json(tdir / f"round_{round_num}.json", rr)
@@ -6233,6 +7637,7 @@ def run_task(
                 "vector": _gate_vector(verus_result),
                 "compile_blocked": True,
                 "diagnostic_inventory": _normalized_diagnostic_inventory(verus_result),
+                "lineage_id": lineage_id,
             }
         else:
             # Verus check on the target (anchor) module plus every configured
@@ -6297,6 +7702,7 @@ def run_task(
                 gate_receipt = _gate_receipt(
                     tdir, round_num, current_tree_receipt, gate_commands,
                     verus_result, rc_verus, forced_recheck=force_gate_recheck,
+                    lineage_id=lineage_id, signature=current_signature,
                 )
                 _persist_gate_receipt(gate_receipt)
                 gate_cache[gate_key] = dict(gate_receipt)
@@ -6309,6 +7715,7 @@ def run_task(
         candidate_transaction = _classify_candidate_transaction(
             previous_tree_receipt, previous_gate_receipt,
             current_tree_receipt, verus_result,
+            last_decided_gate_receipt,
         )
         last_gate_receipt = gate_receipt
 
@@ -6355,6 +7762,7 @@ def run_task(
             diagnostic_inventory=_normalized_diagnostic_inventory(verus_result),
             candidate_transaction=candidate_transaction,
             parser_provenance=parser_provenance,
+            lineage_id=lineage_id,
         )
         last_verus_err = _format_diagnostics_for_memory(
             rr.verus_errors, verus_result.get("stderr_tail", "") or "")
@@ -6488,23 +7896,62 @@ def run_task(
                   f"end_reason=RATE_LIMIT_OR_HANG", flush=True)
             # Roll back if the file is now broken (otherwise leave as-is).
             if not rr.verus_okay:
-                snap_dir = snapshots_root / f"round_{last_good_snapshot_round}"
+                rollback_round = _rollback_snapshot_round(
+                    experiment_mode,
+                    best_decided_round=best_decided_snapshot_round,
+                    last_green_round=last_good_snapshot_round,
+                )
+                snap_dir = snapshots_root / f"round_{rollback_round}"
                 if snap_dir.exists():
-                    import shutil as _shutil
-                    for f in snapshot_targets:
-                        snap_f = snap_dir / _snapshot_name(f, snapshot_targets)
-                        if snap_f.exists():
-                            _shutil.copy2(snap_f, f)
+                    restore = _restore_snapshot_targets(
+                        snapshot_targets, snapshots_root, rollback_round)
+                    if restore["missing_files"]:
+                        print(f"[run] rollback missing files: "
+                              f"{restore['missing_files']}", flush=True)
                     pending_sibling_fail.clear()
-                    print(f"[run] rolled back to snapshots/round_{last_good_snapshot_round}/",
+                    print(f"[run] rolled back to snapshots/round_{rollback_round}/",
                           flush=True)
             end_reason = "RATE_LIMIT_OR_HANG"
             break
 
+        # A Claude max-turns result is a planned, provider-costed transaction
+        # boundary.  Always continue in a new session from the runner-owned
+        # post-gate receipt.  This safety reset is independent of --auto-reset
+        # and does not consume its heuristic reset allowance.
+        if turn_limit_boundary and round_num < max_rounds:
+            assert agent_max_turns is not None
+            assert effective_agent_max_turns is not None
+            print(
+                f"[run] agent turn cap reached "
+                f"({terminal_usage.get('reported_num_turns')}/"
+                f"{effective_agent_max_turns} effective turns; "
+                f"configured ceiling={agent_max_turns}, "
+                f"cost={terminal_usage.get('total_cost_usd')!r}) → "
+                f"round {round_num + 1} fresh receipt-derived session",
+                flush=True,
+            )
+            fresh_next_round = True
+            session_start_round = round_num + 1
+            session_cc_tokens = 0
+            if round_num + 1 not in reset_round_starts:
+                reset_round_starts.append(round_num + 1)
+            reset_events.append(_turn_limit_reset_event(
+                claude_result,
+                effective_agent_max_turns,
+                configured_max_turns=agent_max_turns,
+                planned_round=round_num + 1,
+                trigger_round=round_num,
+                current_tree_receipt=current_tree_receipt,
+                last_gate_receipt=last_gate_receipt,
+                candidate_transaction=candidate_transaction,
+            ))
+
         # Lever 2: auto-reset decision. Evaluate AFTER the round but BEFORE
         # the early-exit decision below (COMPLETE/SPEC_DRIFT should still
         # short-circuit). We only reset if we'd otherwise continue.
-        if auto_reset and auto_resets_used < max_auto_resets and round_num < max_rounds:
+        if (not fresh_next_round and auto_reset
+                and auto_resets_used < max_auto_resets
+                and round_num < max_rounds):
             # Stall signal: last 2 rounds in current session, zero fills + short.
             stall = False
             session_rounds = [rr_ for rr_ in round_results
@@ -6563,17 +8010,16 @@ def run_task(
                 session_cc_tokens = 0
                 auto_resets_used += 1
                 reset_round_starts.append(round_num + 1)
-                reset_events.append({
-                    "cause": reason_str,
-                    "planned_round": round_num + 1,
-                    "trigger_round": round_num,
-                    "session_cache_creation_tokens": session_cc_before_reset,
-                    "stall_rounds": [round_num - 1, round_num] if stall else [],
-                    "predecessor_tree_hash": current_tree_receipt.get("tree_hash"),
-                    "predecessor_gate_receipt": last_gate_receipt.get("receipt_path"),
-                    "predecessor_transaction": candidate_transaction,
-                    "actual_start_round": None,
-                })
+                reset_events.append(_reset_event(
+                    reason_str,
+                    planned_round=round_num + 1,
+                    trigger_round=round_num,
+                    predecessor_tree_receipt=current_tree_receipt,
+                    last_gate_receipt=last_gate_receipt,
+                    candidate_transaction=candidate_transaction,
+                    session_cache_creation_tokens=session_cc_before_reset,
+                    stall_rounds=[round_num - 1, round_num] if stall else [],
+                ))
 
         # Plateau guard (duration-INDEPENDENT — the stall detector above only
         # fires on SHORT no-progress rounds, so it missed corefloor_006's long
@@ -6603,18 +8049,17 @@ def run_task(
             session_start_round = round_num + 1
             session_cc_tokens = 0
             reset_round_starts.append(round_num + 1)
-            reset_events.append({
-                "cause": ["plateau"],
-                "planned_round": round_num + 1,
-                "trigger_round": round_num,
-                "rounds_since_new_low": rounds_since_new_low,
-                "metric": plateau_metric_name,
-                "metric_best": plateau_best_value,
-                "predecessor_tree_hash": current_tree_receipt.get("tree_hash"),
-                "predecessor_gate_receipt": last_gate_receipt.get("receipt_path"),
-                "predecessor_transaction": candidate_transaction,
-                "actual_start_round": None,
-            })
+            reset_events.append(_reset_event(
+                ["plateau"],
+                planned_round=round_num + 1,
+                trigger_round=round_num,
+                predecessor_tree_receipt=current_tree_receipt,
+                last_gate_receipt=last_gate_receipt,
+                candidate_transaction=candidate_transaction,
+                rounds_since_new_low=rounds_since_new_low,
+                metric=plateau_metric_name,
+                metric_best=plateau_best_value,
+            ))
             directive_best_admits = (
                 0 if plateau_metric_name == "whole-crate source-span Verus errors"
                 else plateau_best_value
@@ -6623,6 +8068,7 @@ def run_task(
                 rounds_since_new_low, directive_best_admits, experiment_mode)
 
         # Decision
+        recovery_continue_messages: list[str] = []
         process_crosstalk = detect_process_crosstalk(raw_out)
         if process_crosstalk:
             print(f"[run] PROCESS_CROSSTALK: agent used unsafe process/tmp "
@@ -6688,19 +8134,74 @@ def run_task(
                       f"back to snapshots/round_{round_num - 1}/", flush=True)
             else:
                 print(f"[run] GIT_RECOVERY: no round_{round_num - 1} snapshot to "
-                      f"roll back to (round 1?); leaving working tree as-is.",
+                      f"roll back to; refusing to continue a contaminated tree.",
                       flush=True)
+                rr.verus_okay = False
+                rr.end_reason = "GIT_RECOVERY"
+                write_json(tdir / f"round_{round_num}.json", rr)
+                end_reason = "GIT_RECOVERY"
+                break
+
+            restored_tree_receipt = provenance.source_tree_receipt(project)
+            if (
+                restored_tree_receipt.get("tree_hash")
+                != previous_tree_receipt.get("tree_hash")
+            ):
+                print(
+                    "[run] GIT_RECOVERY: rollback did not restore the exact "
+                    f"pre-round tree (expected="
+                    f"{previous_tree_receipt.get('tree_hash')}, observed="
+                    f"{restored_tree_receipt.get('tree_hash')}); refusing to "
+                    "continue a contaminated tree.",
+                    flush=True,
+                )
+                rr.verus_okay = False
+                rr.end_reason = "GIT_RECOVERY"
+                write_json(tdir / f"round_{round_num}.json", rr)
+                end_reason = "GIT_RECOVERY"
+                break
+
+            candidate_transaction = _rejected_recovered_transaction(
+                candidate_transaction,
+                "GIT_RECOVERY_RECOVERED",
+                restored_tree_receipt,
+            )
+            rr.candidate_transaction = candidate_transaction
+            last_gate_receipt = (
+                dict(previous_gate_receipt)
+                if previous_gate_receipt is not None
+                else _recovered_ungated_receipt(
+                    restored_tree_receipt,
+                    canonical_gate_signature,
+                    "GIT_RECOVERY_RECOVERED",
+                )
+            )
             # Fresh session next round (sheds the leaked context); mirror the
             # auto-reset bookkeeping so stall detection re-baselines too.
             fresh_next_round = True
             session_start_round = round_num + 1
             session_cc_tokens = 0
-            reset_round_starts.append(round_num + 1)
+            if round_num + 1 not in reset_round_starts:
+                reset_round_starts.append(round_num + 1)
+            reset_events.append(_reset_event(
+                ["git_recovery"],
+                planned_round=round_num + 1,
+                trigger_round=round_num,
+                predecessor_tree_receipt=restored_tree_receipt,
+                last_gate_receipt=last_gate_receipt,
+                candidate_transaction=candidate_transaction,
+            ))
+            _retarget_pending_reset_events(
+                reset_events, round_num, candidate_transaction,
+                restored_tree_receipt)
             # Taint this round: `verus_okay` was computed before the rollback
             # and before resetting away leaked context. If this is the final
             # iteration, it must not satisfy the final COMPLETE gate.
             rr.verus_okay = False
             rr.end_reason = "GIT_RECOVERY_RECOVERED"
+            snapshot_files(
+                snapshot_targets,
+                snapshots_root / f"round_{round_num}")
             write_json(tdir / f"round_{round_num}.json", rr)
             next_continue_msg = (
                 "STOP reading version control. Your previous round ran a git "
@@ -6765,6 +8266,21 @@ def run_task(
             # Taint this round: Verus was skipped on the drifted state, and the
             # restored state has not yet been verified. COMPLETE requires a later
             # clean round after the restore.
+            restored_tree_receipt = provenance.source_tree_receipt(project)
+            candidate_transaction = _rejected_recovered_transaction(
+                candidate_transaction,
+                "SPEC_DRIFT_RECOVERED",
+                restored_tree_receipt,
+            )
+            rr.candidate_transaction = candidate_transaction
+            last_gate_receipt = _recovered_ungated_receipt(
+                restored_tree_receipt,
+                canonical_gate_signature,
+                "SPEC_DRIFT_RECOVERED",
+            )
+            _retarget_pending_reset_events(
+                reset_events, round_num, candidate_transaction,
+                restored_tree_receipt)
             rr.verus_okay = False
             rr.end_reason = "SPEC_DRIFT_RECOVERED"
             restored_files = recovery.get("restored_files", []) or []
@@ -6780,13 +8296,10 @@ def run_task(
                     ),
                 },
             ])
-            snapshot_files(snapshot_targets,
-                           snapshots_root / f"round_{round_num}")
-            write_json(tdir / f"round_{round_num}.json", rr)
-            next_continue_msg = _spec_drift_continue_msg(
-                spec_drift, restored_files)
-            continue
-        spec_drift_recovery_counts.clear()
+            recovery_continue_messages.append(
+                _spec_drift_continue_msg(spec_drift, restored_files))
+        else:
+            spec_drift_recovery_counts.clear()
         if experiment_mode in _WHOLE_CRATE_MODES:
             frozen_changed = _frozen_files_changed()
             if frozen_check_error:
@@ -6849,11 +8362,25 @@ def run_task(
                 # True would promote to a COMPLETE the post-revert state never
                 # earned. Mark it not-okay so COMPLETE requires a clean,
                 # re-verified post-revert round (P1).
+                restored_tree_receipt = provenance.source_tree_receipt(project)
+                candidate_transaction = _rejected_recovered_transaction(
+                    candidate_transaction,
+                    "FROZEN_EDIT_RECOVERED",
+                    restored_tree_receipt,
+                )
+                rr.candidate_transaction = candidate_transaction
+                last_gate_receipt = _recovered_ungated_receipt(
+                    restored_tree_receipt,
+                    canonical_gate_signature,
+                    "FROZEN_EDIT_RECOVERED",
+                )
+                _retarget_pending_reset_events(
+                    reset_events, round_num, candidate_transaction,
+                    restored_tree_receipt)
                 rr.verus_okay = False
                 rr.end_reason = "FROZEN_EDIT_RECOVERED"
-                write_json(tdir / f"round_{round_num}.json", rr)
-                next_continue_msg = _frozen_edit_continue_msg(frozen_changed)
-                continue
+                recovery_continue_messages.append(
+                    _frozen_edit_continue_msg(frozen_changed))
         new_axioms = _axiom_names() - baseline_axioms
         if new_axioms:
             # Hard fail: agent introduced a new `proof fn axiom_*`. Admits
@@ -6880,6 +8407,17 @@ def run_task(
                   flush=True)
             end_reason = "FORBIDDEN_CONSTRUCT"
             break
+        if recovery_continue_messages:
+            # Only continue after every remaining integrity gate has inspected
+            # the restored tree. Otherwise a mixed SPEC/FROZEN recovery could
+            # postpone an editable AXIOM/rlimit/assume drift until after
+            # another model invocation.
+            snapshot_files(
+                snapshot_targets,
+                snapshots_root / f"round_{round_num}")
+            write_json(tdir / f"round_{round_num}.json", rr)
+            next_continue_msg = "\n\n".join(recovery_continue_messages)
+            continue
         # If this round ended with the full checked state verifying *and* every
         # integrity gate above accepted it, mark it as the rollback target in
         # case a future round runs out of budget while leaving files broken.
@@ -6895,6 +8433,13 @@ def run_task(
         last_integrity_clean_snapshot_round = round_num
         previous_tree_receipt = current_tree_receipt
         previous_gate_receipt = gate_receipt
+        if _gate_receipt_decided(gate_receipt):
+            last_decided_gate_receipt = dict(gate_receipt)
+            if _gate_advances_frontier(
+                best_decided_gate_receipt, gate_receipt,
+            ):
+                best_decided_gate_receipt = dict(gate_receipt)
+                best_decided_snapshot_round = round_num
         if sibling_fail:
             # The agent broke a sibling helper (or a top-level module that
             # consumes it). The per-round verus check covers only the TARGET
@@ -7071,12 +8616,54 @@ def run_task(
     final_end_reason = _final_end_reason(done_for_real, end_reason)
 
     success = final_end_reason == "COMPLETE"
-    integrity_rejections = {
-        "SPEC_DRIFT", "AXIOM_DRIFT", "FORBIDDEN_CONSTRUCT", "FROZEN_EDIT",
-        "GIT_RECOVERY", "PROCESS_CROSSTALK", "TOOLING_DRIFT",
-    }
-    terminal_disposition: dict
+    integrity_rejections = set(INTEGRITY_REJECTION_END_REASONS)
     pre_disposition_tree = provenance.source_tree_receipt(project)
+    banking_gate_receipt: dict = {}
+    acceptance_gate_receipt: dict = {}
+    if success and lineage_context:
+        acceptance_gate_receipt = _fresh_terminal_gate(
+            tdir=tdir,
+            round_number=len(round_results) + 1,
+            target=target,
+            project=project,
+            experiment_mode=experiment_mode,
+            verus_rlimit=verus_rlimit,
+            experiment_allow_edit=experiment_allow_edit,
+            env=env,
+            lineage_id=lineage_id,
+            expected_tree_hash=pre_disposition_tree["tree_hash"],
+        )
+    bankable_end_reasons = set(BANKABLE_END_REASONS)
+    banking_attempted = bool(
+        bank_partial
+        and final_end_reason in bankable_end_reasons
+        and not final_new_axioms
+        and not final_changed_tooling
+        and not final_frozen_changed
+        and not final_frozen_check_error
+        and not final_forbidden
+    )
+    if banking_attempted:
+        banking_gate_receipt = _fresh_terminal_gate(
+            tdir=tdir,
+            round_number=len(round_results) + 1,
+            target=target,
+            project=project,
+            experiment_mode=experiment_mode,
+            verus_rlimit=verus_rlimit,
+            experiment_allow_edit=experiment_allow_edit,
+            env=env,
+            lineage_id=lineage_id,
+            expected_tree_hash=pre_disposition_tree["tree_hash"],
+        )
+    dominated_bank = (
+        _dominated_bank_disposition(
+            final_end_reason,
+            banking_gate_receipt,
+            best_decided_gate_receipt,
+        )
+        if banking_attempted else None
+    )
     if final_end_reason in integrity_rejections:
         restore = _restore_snapshot_targets(
             snapshot_targets, snapshots_root, last_integrity_clean_snapshot_round)
@@ -7088,33 +8675,70 @@ def run_task(
             "restored_tree_hash": post_disposition_tree.get("tree_hash"),
             "restore": restore,
             "reusable": False,
+            "scoreable": False,
         }
+        promotion_decision = "REJECTED"
+        promotion_scoreable = False
+        success = False
         print(f"[run] terminal integrity disposition={terminal_disposition['state']} "
               f"restore_round={last_integrity_clean_snapshot_round} "
               f"okay={restore['okay']}", flush=True)
-    elif success:
+    elif dominated_bank is not None:
         post_disposition_tree = pre_disposition_tree
-        terminal_disposition = {"state": "ACCEPTED", "reusable": True}
+        terminal_disposition = dominated_bank
+        promotion_decision = "REJECTED"
+        promotion_scoreable = False
+        success = False
+        print(
+            "[run] terminal bank dominated by decided frontier: "
+            f"relation={dominated_bank['bank_relation']} "
+            f"bank={pre_disposition_tree.get('tree_hash')} "
+            f"best={dominated_bank['dominating_tree_hash']} — "
+            "refusing reusable bank",
+            flush=True,
+        )
     else:
         post_disposition_tree = pre_disposition_tree
-        terminal_disposition = {
-            "state": "UNCOMMITTED_CANDIDATE",
-            "reason": final_end_reason,
-            "reusable": False,
-        }
+        outcome = _terminal_disposition(
+            final_end_reason=final_end_reason,
+            success=success,
+            requires_acceptance_gate=bool(lineage_context),
+            lineage_scoreable=bool(lineage_context),
+            banking_attempted=banking_attempted,
+            acceptance_gate_receipt=acceptance_gate_receipt,
+            banking_gate_receipt=banking_gate_receipt,
+        )
+        success = outcome["success"]
+        final_end_reason = outcome["end_reason"]
+        promotion_decision = outcome["promotion_decision"]
+        promotion_scoreable = outcome["scoreable"]
+        terminal_disposition = outcome["terminal_disposition"]
 
-    # A LIMIT can leave partial source progress on disk for analysis, but only
-    # a COMPLETE receipt is eligible to seed another run. This prevents a
-    # launcher from treating whichever bytes happen to remain as promoted work.
     promotion_receipt = {
-        "schema_version": 1,
+        "schema_version": 2 if lineage_context else 1,
         "agent_backend": backend,
-        "decision": "ACCEPTED" if success else "REJECTED",
+        "decision": promotion_decision,
+        "scoreable": promotion_scoreable,
+        "lineage_id": lineage_id,
+        "campaign_spec_sha256": lineage_context.get("campaign_spec_sha256"),
+        "start_receipt_id": lineage_context.get("start_receipt_id"),
+        "launch_registration_id": lineage_context.get("launch_registration_id"),
+        **_promotion_lineage_binding(lineage_context),
+        "predecessor_receipt_id": (
+            (lineage_context.get("predecessor") or {}).get("receipt_id")
+        ),
         "run_id": run_id,
         "task_id": target_id,
         "end_reason": final_end_reason,
         "final_tree_receipt": post_disposition_tree,
-        "last_gate_receipt": last_gate_receipt,
+        "last_gate_receipt": _portable_gate_receipt(last_gate_receipt),
+        "best_decided_gate_receipt": _portable_gate_receipt(
+            best_decided_gate_receipt or {},
+        ),
+        "banking_gate_receipt": _portable_gate_receipt(banking_gate_receipt),
+        "acceptance_gate_receipt": _portable_gate_receipt(
+            acceptance_gate_receipt,
+        ),
         "terminal_disposition": terminal_disposition,
         "integrity": {
             "spec_drift_count": len(round_results[-1].spec_drift) if round_results else 0,
@@ -7125,6 +8749,8 @@ def run_task(
         },
         "operator_events": operator_events,
     }
+    if lineage_context:
+        promotion_receipt["receipt_id"] = provenance.receipt_id(promotion_receipt)
     promotion_path = tdir / "promotion_receipt.json"
     provenance.write_immutable_json(promotion_path, promotion_receipt)
     promotion_receipt["receipt_path"] = str(promotion_path)
@@ -7158,10 +8784,13 @@ def run_task(
         terminal_disposition=terminal_disposition,
         promotion_receipt=promotion_receipt,
         final_tree_receipt=post_disposition_tree,
-        final_gate_receipt=last_gate_receipt,
+        final_gate_receipt=(
+            acceptance_gate_receipt or banking_gate_receipt or last_gate_receipt
+        ),
         agent_budget_seconds=agent_budget_seconds,
         agent_elapsed_seconds=agent_elapsed_seconds,
         final_gate_allowance_seconds=final_gate_allowance_seconds,
+        lineage_context=lineage_context,
     )
     write_json(tdir / "result.json", task_result)
 
@@ -7174,7 +8803,10 @@ def run_task(
                     "unconfirmed_false": unconfirmed_false})
         print(f"[info] false contracts: {len(false_contracts)} verified-false, "
               f"{len(unconfirmed_false)} unconfirmed → {tdir}/false_contracts.json")
-    persist_retry_memory = _should_persist_retry_memory(final_end_reason)
+    persist_retry_memory = (
+        not lineage_context
+        and _should_persist_retry_memory(final_end_reason)
+    )
 
     # Feature 3: mine this run's trace into a discovery brief for the next
     # attempt on this target (persisted whether or not it succeeded).
@@ -7340,6 +8972,16 @@ def main() -> int:
                          "throughout).")
     ap.add_argument("--max-auto-resets", type=int, default=3,
                     help="Cap on auto-resets per task. Default: 3.")
+    ap.add_argument(
+        "--agent-max-turns",
+        type=int,
+        default=_DEFAULT_AGENT_MAX_TURNS,
+        help="Maximum turns per Claude invocation. Reaching the cap emits a "
+             "provider-costed terminal receipt, runs the normal gates, and "
+             "continues in a fresh receipt-derived session. This mandatory "
+             "boundary is independent of --auto-reset. Default: 50. "
+             "Ignored by the Codex backend.",
+    )
     ap.add_argument("--max-git-recovery-resets", type=int, default=3,
                     help="A git-history peek discards the round + resets the "
                          "session instead of failing the task; this caps how "
@@ -7443,7 +9085,18 @@ def main() -> int:
                     metavar="JSON",
                     help="Disclosed operator intervention JSON to persist in "
                          "result/promotion receipts. Repeatable.")
+    ap.add_argument("--lineage-context", type=Path, default=None,
+                    help="Immutable scored_lineage_context JSON produced by "
+                         "the trusted-core launcher. Validated against current "
+                         "source bytes before any model invocation.")
+    ap.add_argument("--bank-partial", action="store_true",
+                    help="For a scored lineage only, run a fresh exact-tree "
+                         "whole-crate gate at a clean non-success terminal and "
+                         "emit a reusable BANKED_PARTIAL receipt.")
     args = ap.parse_args()
+    if args.agent_max_turns <= 0:
+        print("[error] --agent-max-turns must be positive", file=sys.stderr)
+        return 2
     operator_events: list[dict] = []
     for raw_event in args.operator_event:
         try:
@@ -7485,6 +9138,32 @@ def main() -> int:
         print(f"[error] target not found: {target}", file=sys.stderr)
         return 1
     project = (args.project or find_cargo_root(target)).resolve()
+    lineage_context: dict = {}
+    lineage_frontier_sidecar: Optional[Path] = None
+    if args.lineage_context is not None:
+        try:
+            context_path = args.lineage_context.resolve()
+            lineage_context = _validate_scored_lineage_context(
+                context_path,
+                project=project,
+                operator_events=operator_events,
+            )
+            frontier = (
+                (lineage_context.get("predecessor") or {}).get("frontier")
+            )
+            if frontier:
+                lineage_frontier_sidecar = (
+                    context_path.parent / frontier["sidecar_name"]
+                )
+        except ValueError as exc:
+            print(f"[error] scored lineage validation failed: {exc}", file=sys.stderr)
+            return 2
+        if not args.no_failure_memory:
+            print("[error] scored lineage requires --no-failure-memory", file=sys.stderr)
+            return 2
+    elif args.bank_partial:
+        print("[error] --bank-partial requires --lineage-context", file=sys.stderr)
+        return 2
     run_id = args.run_id or results.run_id_new()
     results_root = args.results.resolve()
     results_root.mkdir(parents=True, exist_ok=True)
@@ -7494,20 +9173,29 @@ def main() -> int:
         max_minutes = args.max_task_minutes
         budget_source = "explicit"
     else:
+        # Count NON-AXIOM admits only — the same axiom-aware counter the
+        # COMPLETE gate uses (_count_gate_admits / _admit_count). A raw
+        # .count("admit()") over-counts: it includes admit()s inside
+        # `proof fn axiom_*` bodies (allowed to stay) and any in
+        # comments/strings, inflating the auto budget. The count spans the
+        # whole de-duplicated editable set, not just the target: in
+        # experiment modes the target is often frozen (0 admits), and a
+        # target-only count collapses the auto budget to the floor while the
+        # per-round gate reserve scales with the dep count — making dep-heavy
+        # module runs unlaunchable by default (F8).
         try:
-            # Count NON-AXIOM admits only — the same axiom-aware counter the
-            # COMPLETE gate uses (_count_gate_admits / _admit_count). A raw
-            # .count("admit()") over-counts: it includes admit()s inside
-            # `proof fn axiom_*` bodies (allowed to stay) and any in
-            # comments/strings, inflating the auto budget.
-            num_admits = _count_llm_target_admits(target.read_text())
+            num_admits = _count_gate_admits(
+                target,
+                [p.resolve() for p in (args.experiment_allow_edit or [])],
+            )
         except OSError:
             num_admits = 0
         auto = max(args.budget_min_floor, args.budget_min_per_admit * num_admits)
         max_minutes = auto
         budget_source = (
             f"auto (max({args.budget_min_floor}, "
-            f"{args.budget_min_per_admit} * {num_admits} admits) = {auto:.0f})"
+            f"{args.budget_min_per_admit} * {num_admits} admits across the "
+            f"editable set) = {auto:.0f})"
         )
 
     print(f"[run] target   = {target}")
@@ -7515,6 +9203,8 @@ def main() -> int:
     print(f"[run] run_id   = {run_id}")
     print(f"[run] results  = {results_root}")
     print(f"[run] backend  = {args.backend}")
+    if args.backend == "claude":
+        print(f"[run] turns    = {args.agent_max_turns} max per session")
     print(f"[run] rounds   = {args.rounds}")
     print(f"[run] budget   = {max_minutes:.1f} min  ({budget_source})")
     print(f"[run] pid      = {os.getpid()}  (Ctrl-C or kill -TERM {os.getpid()} to stop)")
@@ -7525,10 +9215,12 @@ def main() -> int:
         max_rounds=args.rounds,
         model=args.model,
         backend=args.backend,
+        agent_max_turns=args.agent_max_turns,
         vstd_root=args.vstd_root.resolve() if args.vstd_root else None,
         admitted_ref=args.admitted_ref,
         truth_ref=args.truth_ref,
         max_task_minutes=max_minutes,
+        budget_is_auto=(args.max_task_minutes is None),
         skip_failure_memory=args.no_failure_memory,
         verus_rlimit=args.verus_rlimit,
         auto_reset=args.auto_reset,
@@ -7546,6 +9238,9 @@ def main() -> int:
         sibling_verify=args.sibling_verify,
         force_gate_recheck=args.force_gate_recheck,
         operator_events=operator_events,
+        lineage_context=lineage_context,
+        lineage_frontier_sidecar=lineage_frontier_sidecar,
+        bank_partial=args.bank_partial,
     )
     # Distinct exit code 42 on a 429 halt so a batch launcher (launch.sh) can
     # tell "this target failed" (rc 1) from "the quota window is exhausted,

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import signal
 import sys
 import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -23,6 +25,62 @@ class LifecycleReceiptTests(unittest.TestCase):
         self.assertIsNone(run._bounded_wait_timeout(None, now=now))
         self.assertAlmostEqual(run._bounded_wait_timeout(now + 0.25, now=now), 0.25)
         self.assertAlmostEqual(run._bounded_wait_timeout(now - 1, now=now), 0.01)
+
+    def test_adaptive_turn_cap_uses_recent_completed_boundaries(self):
+        cap, receipt = run._adaptive_agent_turn_cap(50, 469.0, [])
+        self.assertEqual(cap, 50)
+        self.assertFalse(receipt["adapted"])
+        self.assertEqual(receipt["reason"], "no_completed_turn_limit_history")
+
+        observations = [
+            {"round_number": 6, "effective_max_turns": 50,
+             "duration_seconds": 529.142},
+            {"round_number": 7, "effective_max_turns": 50,
+             "duration_seconds": 508.713},
+            {"round_number": 8, "effective_max_turns": 50,
+             "duration_seconds": 487.124},
+        ]
+        cap, receipt = run._adaptive_agent_turn_cap(
+            50, 469.0, observations)
+        self.assertEqual(cap, 30)
+        self.assertTrue(receipt["adapted"])
+        self.assertEqual(
+            receipt["reason"], "reduced_to_finish_before_drain_reserve")
+        self.assertEqual(receipt["configured_max_turns"], 50)
+        self.assertEqual(receipt["effective_max_turns"], 30)
+        self.assertEqual(len(receipt["observations"]), 3)
+
+    def test_deadline_wait_gracefully_signals_then_hard_kills(self):
+        class FakeProcess:
+            pid = 12345
+            returncode = -9
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls <= 2:
+                    raise run.subprocess.TimeoutExpired("agent", timeout)
+                return self.returncode
+
+        clock = iter([0.0, 0.0, 40.0, 40.0, 50.0, 50.0])
+        proc = FakeProcess()
+        with (
+            mock.patch.object(run.time, "time", side_effect=lambda: next(clock)),
+            mock.patch.object(run.os, "killpg") as killpg,
+        ):
+            receipt = run._wait_for_agent_process(
+                proc, "claude", 50.0, drain_seconds=10.0)
+        self.assertTrue(receipt["graceful_signal_sent"])
+        self.assertEqual(receipt["graceful_signal_elapsed_seconds"], 40.0)
+        self.assertTrue(receipt["hard_kill_sent"])
+        self.assertEqual(receipt["hard_kill_elapsed_seconds"], 50.0)
+        self.assertEqual(receipt["elapsed_seconds"], 50.0)
+        self.assertEqual(
+            [call.args[1] for call in killpg.call_args_list],
+            [signal.SIGINT, signal.SIGKILL],
+        )
 
     def test_terminal_result_survives_later_metadata(self):
         with tempfile.TemporaryDirectory() as td:
@@ -78,6 +136,76 @@ class LifecycleReceiptTests(unittest.TestCase):
         self.assertEqual(usage["total_cost_usd"], 0.0)
         self.assertTrue(usage["cost_reported"])
         self.assertEqual(usage["cost_source"], "provider_terminal_event")
+
+    def test_claude_turn_cap_result_preserves_cost_and_requests_fresh_handoff(self):
+        result = {
+            "type": "result",
+            "subtype": "error_max_turns",
+            "is_error": True,
+            "num_turns": 50,
+            "total_cost_usd": 12.345,
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 11,
+                "cache_creation_input_tokens": 13,
+            },
+        }
+        self.assertTrue(run._is_agent_turn_limit_boundary("claude", result))
+        self.assertFalse(run._is_agent_turn_limit_boundary("codex", result))
+        usage = run._normalized_agent_usage(result)
+        self.assertEqual(usage["total_cost_usd"], 12.345)
+        self.assertTrue(usage["cost_reported"])
+        self.assertEqual(usage["terminal_subtype"], "error_max_turns")
+        self.assertEqual(usage["reported_num_turns"], 50)
+
+        reset = run._turn_limit_reset_event(
+            result,
+            50,
+            planned_round=4,
+            trigger_round=3,
+            current_tree_receipt={"tree_hash": "tree-after-gate"},
+            last_gate_receipt={"receipt_path": "/results/gate.json"},
+            candidate_transaction={"classification": "improved"},
+        )
+        self.assertEqual(reset["kind"], "agent_turn_limit")
+        self.assertEqual(reset["terminal_cost_usd"], 12.345)
+        self.assertTrue(reset["cost_reported"])
+        self.assertEqual(reset["predecessor_tree_hash"], "tree-after-gate")
+        self.assertEqual(reset["planned_round"], 4)
+
+        # F9: the GIT_RECOVERY reset must produce the same consumer-matchable
+        # core as the stall/plateau paths — planned_round set and
+        # actual_start_round None (the pre-launch consumer matches on both),
+        # plus the predecessor trio — so the fresh session gets its handoff
+        # receipt and result.json's reset_events stays causally complete.
+        recovery = run._reset_event(
+            ["git_recovery"],
+            planned_round=6,
+            trigger_round=5,
+            predecessor_tree_receipt={"tree_hash": "restored-tree"},
+            last_gate_receipt={"receipt_path": "/results/gate.json"},
+            candidate_transaction={"classification": "REJECTED_RECOVERED"},
+        )
+        self.assertEqual(recovery["cause"], ["git_recovery"])
+        self.assertEqual(recovery["planned_round"], 6)
+        self.assertIsNone(recovery["actual_start_round"])
+        self.assertEqual(recovery["predecessor_tree_hash"], "restored-tree")
+        self.assertEqual(
+            recovery["predecessor_gate_receipt"], "/results/gate.json")
+        self.assertEqual(
+            recovery["predecessor_transaction"],
+            {"classification": "REJECTED_RECOVERED"},
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            raw = Path(td) / "round.jsonl"
+            raw.write_text(json.dumps(result) + "\n")
+            parsed, _ = run._last_claude_result_event(raw)
+            self.assertEqual(parsed["subtype"], "error_max_turns")
+            raw_usage = run.summarize_raw_usage(raw)
+            self.assertTrue(raw_usage["result_cost_complete"])
+            self.assertEqual(raw_usage["result_total_cost_usd_max"], 12.345)
 
     def test_layer_usage_preserves_unknown_cost_and_reported_lower_bound(self):
         rounds = [
@@ -139,6 +267,26 @@ class LifecycleReceiptTests(unittest.TestCase):
             "codex", "unused", "thread-123", True, None, "continue safely")
         self.assertEqual(resumed[:3], ["codex", "exec", "resume"])
         self.assertEqual(resumed[-2:], ["thread-123", "continue safely"])
+        self.assertNotIn("--max-turns", fresh)
+        self.assertNotIn("--max-turns", resumed)
+
+    def test_claude_command_caps_fresh_and_resumed_sessions(self):
+        fresh = run._build_agent_command(
+            "claude", "prove it", "session-1", False, None, None,
+            agent_max_turns=17,
+        )
+        resumed = run._build_agent_command(
+            "claude", "unused", "session-1", True, None, "continue",
+            agent_max_turns=17,
+        )
+        for command in (fresh, resumed):
+            cap_index = command.index("--max-turns")
+            self.assertEqual(command[cap_index + 1], "17")
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            run._build_agent_command(
+                "claude", "prove it", "session-1", False, None, None,
+                agent_max_turns=0,
+            )
 
     def test_codex_error_event_preserves_rate_limit_status(self):
         with tempfile.TemporaryDirectory() as td:
@@ -150,6 +298,32 @@ class LifecycleReceiptTests(unittest.TestCase):
             result, _ = run._last_agent_result_event(raw, "codex")
             self.assertTrue(result["is_error"])
             self.assertEqual(result["api_error_status"], 429)
+
+    def test_codex_429_fallback_requires_rate_limit_context(self):
+        # F7: a 429 classification aborts the whole sweep (exit 42), so
+        # incidental "429" text must never classify as rate-limited.
+        cases = [
+            # (message, expected api_error_status or None)
+            ("stream error: request id req_84295 connection reset", None),
+            ("read 14290 bytes then EOF", None),
+            ("account quota check failed after 429 ms retry window", None),
+            ("429 Too Many Requests", 429),
+            ("upstream said 429: Too Many Requests, backing off", 429),
+            ("provider rate limit reached, cooling down", 429),
+            ("status=429 exceeded", 429),
+        ]
+        for message, expected in cases:
+            with tempfile.TemporaryDirectory() as td:
+                raw = Path(td) / "codex-error.jsonl"
+                raw.write_text("\n".join([
+                    json.dumps({"type": "thread.started", "thread_id": "t"}),
+                    json.dumps({"type": "error", "message": message}),
+                ]) + "\n")
+                result, _ = run._last_agent_result_event(raw, "codex")
+                self.assertTrue(result["is_error"], message)
+                self.assertEqual(
+                    result.get("api_error_status"), expected, message,
+                )
 
     def test_codex_command_events_feed_existing_integrity_audits(self):
         with tempfile.TemporaryDirectory() as td:
@@ -232,6 +406,48 @@ class LifecycleReceiptTests(unittest.TestCase):
             self.assertEqual(audit["cost_status"], "complete")
             self.assertEqual(audit["recorded_cost_usd"], 2.5)
             self.assertEqual(audit["counts"]["unresolved_streams"], 0)
+
+    def test_usage_audit_turn_limit_with_provider_receipt_is_complete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "results"
+            self._usage_fixture(
+                root,
+                [{"type": "result", "total_cost_usd": 2.5}],
+                round_cost=2.5,
+                lifecycle_status="agent_turn_limit",
+            )
+            audit = usage_audit.audit_run(
+                root, "run-1", started_at="2026-07-29T00:00:00Z",
+                ended_at="2026-07-29T00:10:00Z", launcher_rc=1,
+            )
+            self.assertEqual(audit["cost_status"], "complete")
+            self.assertEqual(audit["recorded_cost_usd"], 2.5)
+            self.assertEqual(audit["counts"]["unresolved_streams"], 0)
+            self.assertEqual(audit["streams"][0]["unresolved_reasons"], [])
+
+    def test_usage_audit_unreceipted_turn_limit_remains_unresolved(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "results"
+            self._usage_fixture(
+                root,
+                [{"type": "assistant", "message": "cap before result"}],
+                round_cost=1.25,
+                lifecycle_status="agent_turn_limit",
+            )
+            audit = usage_audit.audit_run(
+                root, "run-1", started_at="2026-07-29T00:00:00Z",
+                ended_at="2026-07-29T00:10:00Z", launcher_rc=1,
+            )
+            self.assertEqual(audit["cost_status"], "lower_bound")
+            self.assertEqual(audit["recorded_cost_usd"], 1.25)
+            self.assertIn(
+                "raw_stream_without_terminal_event",
+                audit["streams"][0]["unresolved_reasons"],
+            )
+            self.assertIn(
+                "lifecycle_not_exited=agent_turn_limit",
+                audit["streams"][0]["unresolved_reasons"],
+            )
 
     def test_usage_audit_multiple_results_uses_max_but_stays_unresolved(self):
         with tempfile.TemporaryDirectory() as td:
@@ -345,6 +561,66 @@ class LifecycleReceiptTests(unittest.TestCase):
             self.assertEqual(audit["reconciliation"]["status"], "conflict")
             self.assertLess(audit["reconciliation"]["gap_usd"], 0)
 
+    def test_usage_audit_oauth_conservative_receipt_is_distinct_and_persistent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "results"
+            self._usage_fixture(
+                root,
+                [{"type": "assistant", "message": "interrupted before result"}],
+                round_cost=1.25,
+            )
+            kwargs = {
+                "started_at": "2026-07-29T00:00:00Z",
+                "ended_at": "2026-07-29T00:10:00Z",
+                "launcher_rc": 1,
+                "launch_instance_id": "oauth-leg",
+            }
+            audit = usage_audit.audit_run(
+                root, "run-1", **kwargs,
+                equivalent_conservative_cost_usd=Decimal("2.50"),
+                equivalent_conservative_source="oauth-usage-receipt-1",
+                equivalent_conservative_method="visible tariff x2 + allowance",
+                equivalent_conservative_evidence_sha256="a" * 64,
+            )
+            self.assertEqual(
+                audit["cost_status"], "equivalent_conservative")
+            self.assertEqual(
+                audit["equivalent_conservative"]["status"], "accepted")
+            self.assertEqual(
+                audit["equivalent_conservative"]["accounted_cost_usd"], 2.5)
+            self.assertEqual(audit["reconciliation"]["status"], "not_provided")
+            Path(audit["audit_path"]).write_text(json.dumps(audit))
+
+            persisted = usage_audit.audit_run(root, "run-1", **kwargs)
+            self.assertEqual(
+                persisted["cost_status"], "equivalent_conservative")
+            self.assertEqual(
+                persisted["equivalent_conservative"],
+                audit["equivalent_conservative"],
+            )
+
+            conflict = usage_audit.audit_run(
+                root, "run-1", **kwargs,
+                equivalent_conservative_cost_usd=Decimal("1.24"),
+                equivalent_conservative_source="oauth-usage-receipt-2",
+                equivalent_conservative_method="deliberate undercut",
+                equivalent_conservative_evidence_sha256="b" * 64,
+            )
+            self.assertEqual(conflict["cost_status"], "conflict")
+            self.assertEqual(
+                conflict["equivalent_conservative"]["status"], "conflict")
+
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                usage_audit.audit_run(
+                    root, "run-1", **kwargs,
+                    reconciled_cost_usd=Decimal("2.50"),
+                    reconciliation_source="provider-exact",
+                    equivalent_conservative_cost_usd=Decimal("2.50"),
+                    equivalent_conservative_source="oauth-usage-receipt-3",
+                    equivalent_conservative_method="not permitted together",
+                    equivalent_conservative_evidence_sha256="c" * 64,
+                )
+
     def test_usage_audit_resume_archives_prior_attempt_without_losing_cost(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "results"
@@ -380,6 +656,43 @@ class LifecycleReceiptTests(unittest.TestCase):
                 stream["source"].startswith("archive:")
                 for stream in resumed["streams"]
             ))
+
+
+class SupersedePriorAttemptReceipts(unittest.TestCase):
+    def test_rerun_supersedes_immutable_receipts_instead_of_colliding(self):
+        # F1: a same-run-id rerun reuses the task dir; prior immutable
+        # receipts must move aside (inspectable, never deleted) so
+        # write_immutable_json cannot crash the retry at the terminal write.
+        with tempfile.TemporaryDirectory() as td:
+            tdir = Path(td)
+            self.assertIsNone(run._supersede_prior_attempt_receipts(tdir))
+
+            (tdir / "promotion_receipt.json").write_text('{"decision": "REJECTED"}')
+            (tdir / "gate_receipts").mkdir()
+            (tdir / "gate_receipts" / "abc.json").write_text("{}")
+            (tdir / "reset_handoff_round_3.json").write_text("{}")
+            (tdir / "result.json").write_text("{}")  # mutable — must stay
+
+            dest = run._supersede_prior_attempt_receipts(tdir)
+            self.assertEqual(dest, tdir / "_superseded_receipts" / "attempt_1")
+            self.assertFalse((tdir / "promotion_receipt.json").exists())
+            self.assertFalse((tdir / "gate_receipts").exists())
+            self.assertFalse((tdir / "reset_handoff_round_3.json").exists())
+            self.assertTrue((tdir / "result.json").exists())
+            self.assertTrue((dest / "promotion_receipt.json").exists())
+            self.assertTrue((dest / "gate_receipts" / "abc.json").exists())
+            self.assertTrue((dest / "reset_handoff_round_3.json").exists())
+
+            # A rewritten receipt no longer collides after superseding.
+            from lib import provenance
+            provenance.write_immutable_json(
+                tdir / "promotion_receipt.json", {"decision": "ACCEPTED"})
+
+            # A third attempt gets its own slot; attempt_1 is untouched.
+            dest2 = run._supersede_prior_attempt_receipts(tdir)
+            self.assertEqual(dest2, tdir / "_superseded_receipts" / "attempt_2")
+            self.assertTrue((dest / "promotion_receipt.json").exists())
+            self.assertTrue((dest2 / "promotion_receipt.json").exists())
 
 
 if __name__ == "__main__":

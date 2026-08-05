@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Build an honest cost receipt for one launcher run.
 
-Provider terminal events are the only authoritative local dollar receipts.
-Interrupted streams can still contain useful token telemetry, but their dollar
-cost remains unresolved until a provider-side reconciliation is supplied.
+Provider terminal events are the only authoritative local equivalent-cost
+receipts. Interrupted streams can still contain useful token telemetry. They
+remain unresolved until either an exact provider reconciliation is supplied or
+an explicitly conservative OAuth-equivalent debit is authorized and receipted.
 """
 
 from __future__ import annotations
@@ -23,6 +24,25 @@ RAW_RE = re.compile(r"^round_(\d+)\.jsonl$")
 ROUND_RE = re.compile(r"^round_(\d+)\.json$")
 LIFECYCLE_RE = re.compile(r"^round_(\d+)\.lifecycle\.json$")
 TERMINAL_TYPES = {"result", "turn.completed", "turn.failed"}
+
+
+def _lifecycle_cost_closed(
+    lifecycle: dict[str, Any],
+    raw: dict[str, Any],
+) -> bool:
+    """Return whether the lifecycle is terminal for local cost accounting.
+
+    A Claude max-turn boundary is an intentional runner terminal state, not a
+    pending process, but it is cost-complete only when the raw stream contains
+    exactly one provider-priced terminal event. Other raw-stream defects remain
+    independently fail-closed in `_stream_record`.
+    """
+    status = lifecycle.get("status")
+    return status == "agent_exited" or (
+        status == "agent_turn_limit"
+        and raw["terminal_events"] == 1
+        and raw["provider_cost_events"] == 1
+    )
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -193,7 +213,7 @@ def _stream_record(
         harness_gap = None
     if require_lifecycle and lifecycle_path is None:
         reasons.append("missing_required_lifecycle_receipt")
-    if lifecycle is not None and lifecycle.get("status") != "agent_exited":
+    if lifecycle is not None and not _lifecycle_cost_closed(lifecycle, raw):
         reasons.append(
             f"lifecycle_not_exited={lifecycle.get('status', 'unknown')}"
         )
@@ -230,6 +250,10 @@ def audit_run(
     launch_instance_id: str | None = None,
     reconciled_cost_usd: Decimal | None = None,
     reconciliation_source: str | None = None,
+    equivalent_conservative_cost_usd: Decimal | None = None,
+    equivalent_conservative_source: str | None = None,
+    equivalent_conservative_method: str | None = None,
+    equivalent_conservative_evidence_sha256: str | None = None,
 ) -> dict[str, Any]:
     run_dir = results_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -402,6 +426,23 @@ def audit_run(
         "gap_usd": None,
         "basis": None,
     }
+    equivalent_conservative: dict[str, Any] = {
+        "status": "not_provided",
+        "source": None,
+        "accounted_cost_usd": None,
+        "method": None,
+        "evidence_sha256": None,
+        "gap_usd": None,
+        "basis": None,
+    }
+    if (
+        reconciled_cost_usd is not None
+        and equivalent_conservative_cost_usd is not None
+    ):
+        raise ValueError(
+            "exact reconciliation and conservative equivalent cost are "
+            "mutually exclusive"
+        )
     if reconciled_cost_usd is not None:
         if not reconciliation_source:
             raise ValueError("reconciliation_source is required with reconciled cost")
@@ -416,6 +457,41 @@ def audit_run(
             "basis": reconciliation_basis,
         }
         cost_status = "conflict" if gap < 0 else "reconciled"
+    elif equivalent_conservative_cost_usd is not None:
+        required_evidence = {
+            "source": equivalent_conservative_source,
+            "method": equivalent_conservative_method,
+            "evidence_sha256": equivalent_conservative_evidence_sha256,
+        }
+        missing = [key for key, value in required_evidence.items() if not value]
+        if missing:
+            raise ValueError(
+                "equivalent conservative cost lacks: " + ", ".join(missing)
+            )
+        evidence_sha256 = str(
+            equivalent_conservative_evidence_sha256
+        ).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", evidence_sha256):
+            raise ValueError(
+                "equivalent conservative evidence SHA256 must be 64 hex chars"
+            )
+        gap = equivalent_conservative_cost_usd - recorded_total
+        equivalent_conservative = {
+            "status": "conflict" if gap < 0 else "accepted",
+            "source": equivalent_conservative_source,
+            "accounted_cost_usd": float(equivalent_conservative_cost_usd),
+            "accounted_cost_usd_decimal": str(
+                equivalent_conservative_cost_usd
+            ),
+            "method": equivalent_conservative_method,
+            "evidence_sha256": evidence_sha256,
+            "gap_usd": float(gap),
+            "gap_usd_decimal": str(gap),
+            "basis": reconciliation_basis,
+        }
+        cost_status = (
+            "conflict" if gap < 0 else "equivalent_conservative"
+        )
     else:
         prior_reconciliation = (
             prior_audit.get("reconciliation")
@@ -443,6 +519,36 @@ def audit_run(
                     "gap_usd": None,
                     "basis": reconciliation_basis,
                     "previous": prior_reconciliation,
+                }
+        prior_equivalent = (
+            prior_audit.get("equivalent_conservative")
+            if isinstance(prior_audit, dict) else None
+        )
+        if (
+            reconciliation.get("status") == "not_provided"
+            and isinstance(prior_equivalent, dict)
+            and prior_equivalent.get("status") in {"accepted", "conflict"}
+        ):
+            if (
+                prior_equivalent.get("basis") == reconciliation_basis
+                and not launch_running
+            ):
+                equivalent_conservative = prior_equivalent
+                cost_status = (
+                    "conflict"
+                    if prior_equivalent.get("status") == "conflict"
+                    else "equivalent_conservative"
+                )
+            else:
+                equivalent_conservative = {
+                    "status": "stale_after_new_evidence",
+                    "source": None,
+                    "accounted_cost_usd": None,
+                    "method": None,
+                    "evidence_sha256": None,
+                    "gap_usd": None,
+                    "basis": reconciliation_basis,
+                    "previous": prior_equivalent,
                 }
 
     counts = {
@@ -478,15 +584,17 @@ def audit_run(
         "recorded_cost_usd": float(recorded_total),
         "recorded_cost_usd_decimal": str(recorded_total),
         "cost_semantics": (
-            "Numeric provider-reported cost receipts only, read directly from "
-            "raw terminal events or preserved in harness round records. This "
-            "is a lower bound whenever cost_status is lower_bound or unknown; "
-            "no local token repricing is included."
+            "Provider-reported equivalent-cost receipts are read from raw "
+            "terminal events or preserved harness round records. They are a "
+            "lower bound when cost_status is lower_bound or unknown. Exact "
+            "provider reconciliation and explicitly receipted conservative "
+            "OAuth-equivalent debits have distinct statuses."
         ),
         "counts": counts,
         "tasks": task_summaries,
         "streams": streams,
         "reconciliation": reconciliation,
+        "equivalent_conservative": equivalent_conservative,
     }
 
 
@@ -502,6 +610,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--archive-task-id")
     parser.add_argument("--reconciled-cost-usd")
     parser.add_argument("--reconciliation-source")
+    parser.add_argument("--equivalent-conservative-cost-usd")
+    parser.add_argument("--equivalent-conservative-source")
+    parser.add_argument("--equivalent-conservative-method")
+    parser.add_argument("--equivalent-conservative-evidence-sha256")
     return parser
 
 
@@ -513,6 +625,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.reconciled_cost_usd is not None and reconciled is None:
         raise SystemExit("--reconciled-cost-usd must be a non-negative number")
+    equivalent_conservative = (
+        _decimal(args.equivalent_conservative_cost_usd)
+        if args.equivalent_conservative_cost_usd is not None else None
+    )
+    if (
+        args.equivalent_conservative_cost_usd is not None
+        and equivalent_conservative is None
+    ):
+        raise SystemExit(
+            "--equivalent-conservative-cost-usd must be a non-negative number"
+        )
     archived_task = None
     try:
         if args.archive_task_id:
@@ -535,6 +658,16 @@ def main(argv: list[str] | None = None) -> int:
             launch_instance_id=args.launch_instance_id,
             reconciled_cost_usd=reconciled,
             reconciliation_source=args.reconciliation_source,
+            equivalent_conservative_cost_usd=equivalent_conservative,
+            equivalent_conservative_source=(
+                args.equivalent_conservative_source
+            ),
+            equivalent_conservative_method=(
+                args.equivalent_conservative_method
+            ),
+            equivalent_conservative_evidence_sha256=(
+                args.equivalent_conservative_evidence_sha256
+            ),
         )
     except ValueError as exc:
         print(f"usage audit error: {exc}", file=sys.stderr)

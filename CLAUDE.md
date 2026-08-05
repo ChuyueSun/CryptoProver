@@ -176,6 +176,14 @@ python replay.py <jsonl> --full                                          # no tr
 tail -f results/<run_id>/<target_id>/cli.log                             # live skill-call log
 ```
 
+**Prior attempts move on relaunch.** When `launch.sh` re-launches the same
+run-id + target, the entire previous task directory is archived to
+`results/<run_id>/_usage_history/<launch_instance_id>/<target_id>/` before
+the new attempt starts — so if `results/<run_id>/<target_id>/` looks empty
+or is missing the round you expect, look there. (A direct `run.py` rerun
+instead moves only the immutable receipts, into the task dir's
+`_superseded_receipts/attempt_<n>/`.)
+
 When a run produces unexpected results (fake-greens, premature COMPLETE,
 rlimit / verus-timeout failures, etc.), see
 [docs/diagnostics.md](docs/diagnostics.md) — playbook of recurring
@@ -253,7 +261,7 @@ The prompt also explicitly forbids `#[verifier::external_body]` (silently bypass
 
 Three sibling integrity gates in `run.py` guard the same "agent's incentive is to fake a green" threat and are checked the same way (snapshot a baseline before the loop, diff after each round, break + a non-promotable `end_reason` on drift — folded into `_final_end_reason` so even a budget-bail exit can't be promoted to COMPLETE):
 - **Axiom integrity** (`end_reason: AXIOM_DRIFT`): the COMPLETE counter excludes `admit()` inside `proof fn axiom_*` bodies, so a *new* `axiom_*` is a fake-green vector. `lib/admits.py::axiom_fn_names` snapshots the axiom-name set across target + siblings + allow-edit deps; any name not in the baseline fails the round.
-- **Tooling integrity** (`end_reason: TOOLING_DRIFT`): the harness's own verification skills are re-read from disk every round (`verus_check.py` / `spec_check.py` run as subprocesses; the agent runs the rest via Bash), and the proof agent shares this repo as its cwd with `Edit/Write/Bash` under `bypassPermissions` — so it *can* rewrite a skill to always return `okay=true`. `run.py` snapshots a SHA-256 of every `*.py` under `skills/` + `lib/` before the loop and diffs after each round; any add/edit/delete fails the round (checked **first** in the decision block, since a doctored tool makes the other gates' results untrustworthy). This is detection, not prevention — the same model as the spec/axiom gates — because tool-scoping can't close it: `Bash` is a write primitive and `--allowedTools` is a no-op under `bypassPermissions`. Don't relax these gates.
+- **Tooling integrity** (`end_reason: TOOLING_DRIFT`): the harness's verification skills and post-run authority tools are re-read from disk, and the proof agent has `Edit/Write/Bash` under `bypassPermissions` — so it can otherwise rewrite a checker, prompt, usage auditor, or terminal validator. `run.py` snapshots the executable top-level harness/prompt files plus `skills/`, `lib/`, and executable/policy files under `docker/`; any add/edit/delete fails the round (checked **first** in the decision block, since doctored tooling makes the other gates' results untrustworthy). This is detection, not prevention — the same model as the spec/axiom gates — because tool-scoping can't close it: `Bash` is a write primitive and `--allowedTools` is a no-op under `bypassPermissions`. Don't relax these gates.
 - **Forbidden-construct integrity** (`end_reason: FORBIDDEN_CONSTRUCT`): `assume(...)` and `#[verifier::external_body]` each discharge a proof obligation *without* an SMT proof (`assume(false)` closes any goal; `external_body` skips the body), and neither leaves an `admit()` or a new `axiom_*` for the other counters to catch — so a new `lemma_*` with `assume(false)`, or a new `external_body` helper, is a fake-green vector. `lib/admits.py::count_forbidden_constructs` (comment/string-aware) snapshots a baseline count across target + siblings + allow-edit deps; any *increase* fails the round. This is the only one of the three that runs even when the spec gate is off (experiment mode), so it's also what catches a new `external_body` helper there — the spec gate's own new-fn `external_body` check (`spec_check.py`) covers the normal path.
 
 ### State on disk, not in Python

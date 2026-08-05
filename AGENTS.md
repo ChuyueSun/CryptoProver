@@ -110,6 +110,12 @@ python replay.py <jsonl> --full                                          # no tr
 tail -f results/<run_id>/<target_id>/cli.log                             # live skill-call log
 ```
 
+When the same run-id and target are relaunched through `launch.sh`, the prior
+task directory moves under
+`results/<run_id>/_usage_history/<launch_instance_id>/<target_id>/`. A direct
+`run.py` rerun instead moves immutable receipts to the live task directory's
+`_superseded_receipts/attempt_<n>/`.
+
 When a run produces unexpected results (fake-greens, premature COMPLETE,
 rlimit / verus-timeout failures, etc.), see
 [docs/diagnostics.md](docs/diagnostics.md) — playbook of recurring
@@ -185,7 +191,7 @@ The four search skills (`search_semantic`, `search_module`, `search_macro`, `sea
 
 The prompt also explicitly forbids `#[verifier::external_body]` (silently bypasses SMT), `assume(...)`, and introducing new `admit()` calls.
 
-**Sibling integrity gates.** Four more gates guard the same "the agent's incentive is to fake a green" threat, each snapshotted before the loop and diffed after every round (drift → break + a non-promotable `end_reason`): **axiom** (`AXIOM_DRIFT` — new `axiom_*`), **tooling** (`TOOLING_DRIFT` — any edit to `skills/`+`lib/` `*.py`; checked first, since a doctored tool makes the others untrustworthy), **forbidden-construct** (`FORBIDDEN_CONSTRUCT` — any *increase* in `assume(...)`/`external_body`, runs even when the spec gate is off), and the **spec-definition freeze** (`--check-spec-defs`, on whenever the spec gate is on — freezes `spec fn` *bodies*, not just headers, so a definition can't be redefined to hollow a frozen contract). See CLAUDE.md → **Spec integrity gate** for the full text. Don't relax these.
+**Sibling integrity gates.** Four more gates guard the same "the agent's incentive is to fake a green" threat, each snapshotted before the loop and diffed after every round (drift → break + a non-promotable `end_reason`): **axiom** (`AXIOM_DRIFT` — new `axiom_*`), **tooling** (`TOOLING_DRIFT` — any edit to the executable top-level harness/prompt files or to `skills/`, `lib/`, and executable/policy files under `docker/`; checked first, since doctored tooling makes the others untrustworthy), **forbidden-construct** (`FORBIDDEN_CONSTRUCT` — any *increase* in `assume(...)`/`external_body`, runs even when the spec gate is off), and the **spec-definition freeze** (`--check-spec-defs`, on whenever the spec gate is on — freezes `spec fn` *bodies*, not just headers, so a definition can't be redefined to hollow a frozen contract). See CLAUDE.md → **Spec integrity gate** for the full text. Don't relax these.
 
 ### State on disk, not in Python
 

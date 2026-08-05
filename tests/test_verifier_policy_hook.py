@@ -111,6 +111,29 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
          {"command": "python3 verus_check.py x --project /p > /dev/null"}, False),
         ("verifier stderr-only -> /work file", "Bash",
          {"command": "python3 verus_check.py x --project /p 2> /work/err.log"}, False),
+        ("verifier stderr append -> /work file", "Bash",
+         {"command": "python3 verus_check.py x --project /p 2>>/work/err.log"}, False),
+        ("verifier noclobber stdout redirect", "Bash",
+         {"command": "python3 verus_check.py x --project /p >| /work/out.json"}, True),
+        ("verifier explicit-fd noclobber redirect", "Bash",
+         {"command": "python3 verus_check.py x --project /p 1>| /work/out.json"}, True),
+        ("verifier merged redirect shorthand", "Bash",
+         {"command": "python3 verus_check.py x --project /p >& /work/out.json"}, True),
+        ("hash inside token cannot hide pipeline", "Bash",
+         {"command": "python3 verus_check.py foo#bar --project /p | head -1"}, True),
+        ("real shell comment hides non-executed pipeline", "Bash",
+         {"command": "python3 verus_check.py x --project /p # | head -1"}, False),
+        ("quoted hash is query data", "Bash",
+         {"command": "python3 verus_check.py 'foo # bar' --project /p"}, False),
+        ("semantic search quoted Rust arrow", "Bash",
+         {"command": "python3 /opt/harness/skills/search_semantic.py "
+                     "\"u64 -> nat\" --project /p"}, False),
+        ("semantic search quoted alternation", "Bash",
+         {"command": "python3 /opt/harness/skills/search_semantic.py "
+                     "\"pow2 | bitvector\" --project /p"}, False),
+        ("quoted command substitution cannot hide verifier pipeline", "Bash",
+         {"command": "printf '%s\\n' \"$(python3 /opt/harness/skills/"
+                     "verus_check.py x --project /p | head -1)\""}, True),
         ("non-verifier redirect untouched", "Bash",
          {"command": "echo hi > /work/x.json"}, False),
         ("fg verus_check with --timeout", "Bash",
@@ -146,6 +169,17 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
         ("non-Bash tool ignored", "Read", {"file_path": "/p/src/x.rs"}, False),
         ("plain timeout, no verifier", "Bash", {"command": "timeout 5 sleep 3"}, False),
         ("empty command", "Bash", {"command": ""}, False),
+        # --- output-shape rules are segment-scoped (F4): a pipe/redirect in
+        # an unrelated control segment of a compound command is plain shell ---
+        ("pipe in unrelated segment before verifier", "Bash",
+         {"command": "grep -n lemma src/x.rs | head -5; "
+                     "python3 /opt/harness/skills/verus_check.py f --project /p"}, False),
+        ("redirect in unrelated segment before verifier", "Bash",
+         {"command": "echo note > /work/notes.txt && "
+                     "python3 /opt/harness/skills/verus_check.py f --project /p"}, False),
+        ("verifier segment piped stays blocked in compound", "Bash",
+         {"command": "echo start; python3 /opt/harness/skills/verus_check.py f "
+                     "--project /p | head -3"}, True),
     ]
 
     def test_table(self):
@@ -209,11 +243,47 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
                 src.write_text("proof fn lemma_x() { assert(true); }\n")
                 self.assertEqual(evaluate("Bash", verus_cmd), [])
 
+                subprocess.run(
+                    ["git", "add", "src.rs"], cwd=root, check=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                self.assertEqual(
+                    evaluate("Bash", verus_cmd), [],
+                    "a staged-only active edit must satisfy the guard",
+                )
+
+            subprocess.run(
+                ["git", "reset", "--hard", "HEAD"], cwd=root, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            new_src = root / "new_lemma.rs"
+            new_src.write_text("proof fn lemma_new() {}\n")
+            new_env = {
+                **env,
+                "DALEK_AGENT_TARGET_PATH": str(new_src),
+                "DALEK_AGENT_ACTIVE_EDIT_PATHS": str(new_src),
+            }
+            new_cmd = {
+                "command": f"python3 /opt/harness/skills/verus_check.py "
+                           f"{new_src} --project {root}",
+            }
+            with mock.patch.dict(os.environ, new_env, clear=False):
+                self.assertEqual(
+                    evaluate("Bash", new_cmd), [],
+                    "an untracked active source edit must satisfy the guard",
+                )
+
     def test_runner_owned_whole_crate_and_timeout_cap_are_enforced(self):
         env = {
             "DALEK_RUNNER_OWNS_WHOLE_CRATE": "1",
             "DALEK_AGENT_MAX_VERIFIER_TIMEOUT": "300",
         }
+        def cap_tripped(reasons):
+            return any(
+                r.startswith("agent verifier timeout exceeds runner policy cap")
+                for r in reasons
+            )
+
         with mock.patch.dict(os.environ, env, clear=False):
             whole = evaluate("Bash", {
                 "command": "python3 /opt/harness/skills/verus_check.py x --project /p --whole-crate"
@@ -224,9 +294,24 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
             focused = evaluate("Bash", {
                 "command": "python3 /opt/harness/skills/verus_check.py x --project /p --timeout 300"
             })
+            # Both argparse spellings must respect the cap: `--timeout=N` is
+            # equivalent to `--timeout N` to verus_check.py's parser (F6).
+            equals_slow = evaluate("Bash", {
+                "command": "python3 /opt/harness/skills/verus_check.py x --project /p --timeout=1800"
+            })
+            equals_ok = evaluate("Bash", {
+                "command": "python3 /opt/harness/skills/verus_check.py x --project /p --timeout=300"
+            })
+            # A non-literal value cannot be checked statically — fail closed.
+            variable = evaluate("Bash", {
+                "command": "python3 /opt/harness/skills/verus_check.py x --project /p --timeout $N"
+            })
         self.assertIn("whole-crate verifier is runner-owned for this experiment", whole)
-        self.assertIn("agent verifier timeout exceeds runner policy cap", slow)
+        self.assertTrue(cap_tripped(slow), slow)
         self.assertEqual(focused, [])
+        self.assertTrue(cap_tripped(equals_slow), equals_slow)
+        self.assertEqual(equals_ok, [])
+        self.assertTrue(cap_tripped(variable), variable)
 
 
 if __name__ == "__main__":

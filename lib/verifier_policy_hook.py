@@ -24,6 +24,7 @@ Patterns mirror `run.py`'s gate regexes (kept in sync intentionally) plus the
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -88,6 +89,143 @@ def _is_raw_admit_count(cmd):
         return False
     return bool(_RAW_ADMIT_COUNT_PIPE.search(cmd) or _RAW_ADMIT_COUNT_FLAG.search(cmd))
 
+
+def _shell_tokens(cmd):
+    """Tokenize shell operators without treating quoted query text as syntax."""
+    try:
+        lexer = shlex.shlex(
+            _strip_shell_comments(cmd),
+            posix=True,
+            punctuation_chars="|&;<>",
+        )
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        # An incomplete quote is malformed shell anyway. Retain the regex
+        # backstop instead of allowing it through because tokenization failed.
+        return []
+    expanded = list(tokens)
+    for token in tokens:
+        cursor = 0
+        while True:
+            start = token.find("$(", cursor)
+            if start < 0:
+                break
+            depth = 1
+            index = start + 2
+            while index < len(token) and depth:
+                if token.startswith("$(", index):
+                    depth += 1
+                    index += 2
+                    continue
+                if token[index] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                index += 1
+            if depth:
+                # Malformed shell. Force the regex fallback used by evaluate.
+                return []
+            expanded.extend(_shell_tokens(token[start + 2:index]))
+            cursor = index + 1
+    return expanded
+
+
+def _strip_shell_comments(cmd):
+    """Remove real Bash comments while retaining `#` inside a shell word."""
+    out = []
+    quote = None
+    escaped = False
+    index = 0
+    while index < len(cmd):
+        char = cmd[index]
+        if escaped:
+            out.append(char)
+            escaped = False
+        elif char == "\\" and quote != "'":
+            out.append(char)
+            escaped = True
+        elif quote:
+            out.append(char)
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            out.append(char)
+            quote = char
+        elif char == "#" and (
+            index == 0 or cmd[index - 1].isspace()
+            or cmd[index - 1] in ";|&()"
+        ):
+            newline = cmd.find("\n", index)
+            if newline < 0:
+                break
+            out.append("\n")
+            index = newline
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _stdout_file_redirect(tokens):
+    for index, token in enumerate(tokens):
+        if token not in {">", ">>", ">|", ">&", "&>", "&>>"}:
+            continue
+        if token in {">", ">>", ">|", ">&"} and index and tokens[index - 1] == "2":
+            continue
+        destination = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if destination == "/dev/null":
+            continue
+        return True
+    return False
+
+
+def _verifier_pipe(tokens):
+    return any(token in {"|", "|&"} for token in tokens)
+
+
+def _verifier_output_slice(tokens):
+    for index, token in enumerate(tokens[:-1]):
+        if token in {"|", "|&"} and os.path.basename(tokens[index + 1]) in {
+            "head", "tail", "grep",
+        }:
+            return True
+    return False
+
+
+_CONTROL_TOKENS = {";", "&&", "||", "&"}
+
+
+def _token_segments(tokens):
+    """Group a token stream into control segments (split at `;`/`&&`/`||`/`&`).
+
+    Pipes bind WITHIN a segment: output-shape rules (pipe/slice/redirect)
+    apply only to segments that actually invoke a verifier or harness skill,
+    so a pipe or redirect in an unrelated segment of a compound command is
+    ordinary shell, not verifier-output handling (F4). Tokens expanded out of
+    a command substitution are appended to the trailing segment, which can
+    over-attribute a substitution's pipe to a later verifier segment — a
+    conservative false positive the corrective message resolves.
+    """
+    segments, current = [], []
+    for token in tokens:
+        if token in _CONTROL_TOKENS:
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _segment_matches_verifier(segment_text):
+    return bool(
+        (_VERIFIER.search(segment_text) or _DIRECT_VERUS_RAW.search(segment_text))
+        and not _is_verus_check_help_only(segment_text)
+    )
+
 # Absolute path to this harness's verus_check skill, derived from __file__ so the
 # corrective message hands the model a real absolute path (prompt.md:66-70 requires
 # absolute skill paths even after `cd` into the Cargo project root).
@@ -108,19 +246,33 @@ def _path_has_git_diff(project_root, path):
     if not project_root or not path:
         return True
     try:
-        proc = subprocess.run(
+        for command in (
             ["git", "-C", project_root, "diff", "--quiet", "--", path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            ["git", "-C", project_root, "diff", "--cached", "--quiet",
+             "--", path],
+        ):
+            proc = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            if proc.returncode == 1:
+                return True
+            if proc.returncode != 0:
+                return True
+        untracked = subprocess.run(
+            ["git", "-C", project_root, "ls-files", "--others",
+             "--exclude-standard", "--", path],
+            capture_output=True,
+            text=True,
             timeout=5,
         )
     except Exception:
         return True
-    if proc.returncode == 1:
+    if untracked.returncode != 0:
         return True
-    if proc.returncode == 0:
-        return False
-    return True
+    return bool(untracked.stdout.strip())
 
 
 def _pre_edit_guard_active():
@@ -147,8 +299,15 @@ def _agent_timeout_exceeds_cap(cmd):
         cap = float(raw_cap)
     except ValueError:
         return False
-    for value in re.findall(r"(?:^|\s)--timeout\s+([0-9]+(?:\.[0-9]+)?)", cmd):
-        if float(value) > cap:
+    # Both argparse spellings count (`--timeout N` and `--timeout=N`). A value
+    # that is not a numeric literal ($VAR, command substitution, quoted)
+    # cannot be checked against the cap statically, so it fails closed — the
+    # corrective reason tells the agent to pass a literal within the cap (F6).
+    for value in re.findall(r"(?:^|\s)--timeout(?:=|\s+)([^\s;|&]+)", cmd):
+        try:
+            if float(value) > cap:
+                return True
+        except ValueError:
             return True
     return False
 
@@ -186,6 +345,7 @@ def evaluate(tool_name, tool_input):
     if not isinstance(cmd, str) or not cmd:
         return []
     bg = bool((tool_input or {}).get("run_in_background"))
+    shell_tokens = _shell_tokens(cmd)
     reasons = []
     direct_verus = bool(_DIRECT_VERUS_RAW.search(cmd))
     is_verifier = bool(_VERIFIER.search(cmd) or direct_verus) and not _is_verus_check_help_only(cmd)
@@ -200,15 +360,40 @@ def evaluate(tool_name, tool_input):
         reasons.append("verifier output to shared /tmp/*.{json,out,log,err}")
     if (is_verifier or is_harness_skill) and _MERGED_STDERR_JSON.search(cmd):
         reasons.append("merged stderr into harness-skill JSON parser")
-    if (is_verifier or is_harness_skill) and _STDOUT_FILE_REDIRECT.search(cmd):
+    if shell_tokens:
+        # Scope output-shape rules to the control segments that actually
+        # invoke a verifier or harness skill (F4): a pipe or redirect in an
+        # unrelated segment of a compound command is plain shell.
+        segments = _token_segments(shell_tokens)
+        verifier_segments = [
+            seg for seg in segments if _segment_matches_verifier(" ".join(seg))
+        ]
+        guarded_segments = verifier_segments + [
+            seg for seg in segments
+            if _HARNESS_SKILL.search(" ".join(seg)) and seg not in verifier_segments
+        ]
+        redirect_hit = any(_stdout_file_redirect(seg) for seg in guarded_segments)
+        slice_hit = any(_verifier_output_slice(seg) for seg in verifier_segments)
+        pipe_hit = any(_verifier_pipe(seg) for seg in verifier_segments)
+    else:
+        # Tokenization failed (malformed shell) — regex backstop over the
+        # whole command, fail-closed.
+        redirect_hit = bool((is_verifier or is_harness_skill)
+                            and _STDOUT_FILE_REDIRECT.search(cmd))
+        slice_hit = bool(is_verifier and _VERIFIER_OUTPUT_SLICE.search(cmd))
+        pipe_hit = bool(is_verifier and _VERIFIER_PIPE.search(cmd))
+    if redirect_hit:
         reasons.append(
             "verifier/skill stdout redirected to a file (read JSON stdout directly)")
-    if is_verifier and _VERIFIER_OUTPUT_SLICE.search(cmd):
+    if slice_hit:
         reasons.append("verifier output piped through head/tail/grep")
-    if is_verifier and _VERIFIER_PIPE.search(cmd):
+    if pipe_hit:
         reasons.append("verifier output piped to another command (read JSON stdout directly)")
     if is_verifier and _agent_timeout_exceeds_cap(cmd):
-        reasons.append("agent verifier timeout exceeds runner policy cap")
+        raw_cap = os.environ.get("DALEK_AGENT_MAX_VERIFIER_TIMEOUT", "").strip()
+        reasons.append(
+            "agent verifier timeout exceeds runner policy cap "
+            f"(pass a literal --timeout <= {raw_cap})")
     if (is_verifier and os.environ.get("DALEK_RUNNER_OWNS_WHOLE_CRATE") == "1"
             and "--whole-crate" in cmd):
         reasons.append("whole-crate verifier is runner-owned for this experiment")

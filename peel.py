@@ -100,6 +100,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import admit  # noqa: E402  (create_admit_worktree, remove_admit_worktree, resolve_mode, admit_text)
 import strip_specs  # noqa: E402  (delete_text, strip_text)
+from lib import provenance  # noqa: E402
 from lib.admits import count_non_axiom  # noqa: E402
 
 # Shell names indexed by depth (depth 1 → SHELLS[0], etc.).
@@ -250,6 +251,41 @@ def _require_pin(depth: int, pin: str | None, *, deletes_spec: bool = False) -> 
             f"(consumer:NAME | oracle:REF | proof) and keep that consumer frozen.")
 
 
+def _validate_worktree_manifest(manifest: dict, *, exact: bool) -> None:
+    """Reject ambiguous manifests before creating or modifying a worktree."""
+    files = manifest.get("files")
+    if not isinstance(files, list) or (exact and not files):
+        raise ValueError("manifest must contain a non-empty files array")
+    seen_paths: set[str] = set()
+    for index, spec in enumerate(files):
+        if not isinstance(spec, dict):
+            raise ValueError(f"manifest files[{index}] must be an object")
+        rel = spec.get("path")
+        if not isinstance(rel, str) or not rel:
+            raise ValueError(f"manifest files[{index}] lacks a path")
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise ValueError(f"manifest path must stay relative: {rel}")
+        if rel in seen_paths:
+            raise ValueError(f"duplicate manifest path: {rel}")
+        seen_paths.add(rel)
+        for key in (
+            "lemmas", "spec_fns", "contract_fns", "strip_proof_fns",
+        ):
+            names = spec.get(key, [])
+            if not isinstance(names, list) or any(
+                not isinstance(name, str) or not name for name in names
+            ):
+                raise ValueError(f"{rel}: {key} must be a list of names")
+            if len(set(names)) != len(names):
+                raise ValueError(f"{rel}: duplicate names in {key}")
+        delete_names = list(spec.get("lemmas", ())) + list(
+            spec.get("spec_fns", ())
+        )
+        if len(set(delete_names)) != len(delete_names):
+            raise ValueError(f"{rel}: duplicate names across deletion strata")
+
+
 def _seal_peeled_history(wt: Path) -> str:
     """Re-root the peeled worktree on a parent-less orphan commit so the proven
     original no longer leaks through the worktree's *reachable* git history.
@@ -300,6 +336,8 @@ def peel_worktree(
     manifest: dict,
     pin: str | None = None,
     seal: bool = True,
+    require_exact_transform: bool = False,
+    manifest_sha256: str | None = None,
 ) -> dict:
     """Build a full peel init-state in an isolated git worktree.
 
@@ -314,6 +352,9 @@ def peel_worktree(
     (see `_seal_peeled_history`). Pass False only for transform debugging.
     """
     pin = pin or manifest.get("pin")
+    _validate_worktree_manifest(manifest, exact=require_exact_transform)
+    if require_exact_transform and not manifest_sha256:
+        raise ValueError("exact peel requires the full manifest SHA-256")
     deletes_spec = depth >= 3 and any(
         f.get("spec_fns") for f in manifest.get("files", []))
     _require_pin(depth, pin, deletes_spec=deletes_spec)
@@ -322,9 +363,15 @@ def peel_worktree(
     # single deterministic path produces every depth.
     summary = admit.create_admit_worktree(gitroot, ref, dest, admit_targets=None)
     wt = Path(summary["worktree"])
+    project = Path(summary["project"])
+    resolved_source_commit = admit._git("rev-parse", "HEAD^{commit}", cwd=wt)
+    resolved_source_tree = admit._git("rev-parse", "HEAD^{tree}", cwd=wt)
+    pre_tree = provenance.source_tree_receipt(project)
+    pre_tree.pop("workspace_root", None)
 
     peeled: list[dict] = []
     editable: list[str] = []
+    transform_errors: list[str] = []
     for fspec in manifest.get("files", []):
         rel = fspec["path"]
         f = wt / rel
@@ -341,10 +388,117 @@ def peel_worktree(
             proof_admit=fspec.get("proof_admit"),  # back-compat; None if absent
         )
         f.write_text(new)
-        peeled.append({"file": rel, **report})
+        changed = new != text
+        file_report = {"file": rel, "changed": changed, **report}
+        peeled.append(file_report)
         editable.append(rel)
 
+        expected_deleted: set[str] = set()
+        if depth >= 2:
+            expected_deleted.update(fspec.get("lemmas", ()))
+        if depth >= 3:
+            expected_deleted.update(fspec.get("spec_fns", ()))
+        actual_deleted = set(report["deleted"])
+        if actual_deleted != expected_deleted:
+            transform_errors.append(
+                f"{rel}: deleted names expected={sorted(expected_deleted)} "
+                f"actual={sorted(actual_deleted)}"
+            )
+        expected_contracts = (
+            set(fspec.get("contract_fns", ())) if depth >= 4 else set()
+        )
+        actual_contracts = set(report["stripped"])
+        if actual_contracts != expected_contracts:
+            transform_errors.append(
+                f"{rel}: stripped contracts expected={sorted(expected_contracts)} "
+                f"actual={sorted(actual_contracts)}"
+            )
+        proof_op = report["proof_op"]
+        actual_proof_strips = set(report["proof_stripped"])
+        if depth >= 1 and proof_op == "strip":
+            expected_proof_strips = set(fspec.get("strip_proof_fns", ()))
+            if actual_proof_strips != expected_proof_strips:
+                transform_errors.append(
+                    f"{rel}: stripped proof functions "
+                    f"expected={sorted(expected_proof_strips)} "
+                    f"actual={sorted(actual_proof_strips)}"
+                )
+        if depth >= 1 and proof_op == "strip-all" and not actual_proof_strips:
+            transform_errors.append(
+                f"{rel}: strip-all observed no removable proof content"
+            )
+        if require_exact_transform and not changed:
+            transform_errors.append(f"{rel}: declared editable file did not change")
+
+    post_tree = provenance.source_tree_receipt(project)
+    post_tree.pop("workspace_root", None)
+    pre_files = {entry["path"]: entry for entry in pre_tree["files"]}
+    post_files = {entry["path"]: entry for entry in post_tree["files"]}
+    changed_paths = sorted(
+        path for path in set(pre_files) | set(post_files)
+        if pre_files.get(path) != post_files.get(path)
+    )
+    frozen_changes = sorted(set(changed_paths) - set(editable))
+    missing_editable_changes = sorted(set(editable) - set(changed_paths))
+    if frozen_changes:
+        transform_errors.append(
+            f"frozen files changed during peel: {frozen_changes}"
+        )
+    if require_exact_transform and missing_editable_changes:
+        transform_errors.append(
+            f"declared editable files unchanged: {missing_editable_changes}"
+        )
+    if require_exact_transform and transform_errors:
+        raise ValueError(
+            "exact peel transform failed: " + "; ".join(transform_errors)
+        )
+
     sealed_head = _seal_peeled_history(wt) if seal else None
+    post_seal_tree = provenance.source_tree_receipt(project)
+    post_seal_tree.pop("workspace_root", None)
+    post_seal_tree_unchanged = post_seal_tree == post_tree
+    if not post_seal_tree_unchanged:
+        raise ValueError("history sealing changed peeled source bytes")
+    sealed_worktree_clean = False
+    sealed_head_tree = None
+    if seal:
+        sealed_worktree_clean = not admit._git(
+            "status", "--porcelain", cwd=wt
+        ).strip()
+        if not sealed_worktree_clean:
+            raise ValueError("sealed peeled worktree is not clean")
+        sealed_head_tree = admit._git("rev-parse", "HEAD^{tree}", cwd=wt)
+    transform_receipt = {
+        "schema_version": 3,
+        "kind": "canonical_peel_start",
+        "source": {
+            "requested_ref": ref,
+            "resolved_commit": resolved_source_commit,
+            "resolved_tree": resolved_source_tree,
+            "pre_tree_receipt": pre_tree,
+        },
+        "transform": {
+            "manifest_sha256": manifest_sha256,
+            "tool_sha256": provenance.peel_transform_tool_hashes(
+                Path(__file__).resolve().parent
+            ),
+            "depth": depth,
+            "pin": pin,
+            "experiment_mode": manifest.get("experiment_mode"),
+            "editable_files": editable,
+            "changed_files": changed_paths,
+            "peeled": peeled,
+            "exact_required": require_exact_transform,
+            "errors": transform_errors,
+        },
+        "post_tree_receipt": post_tree,
+        "frozen_surface_unchanged": not frozen_changes,
+        "sealed_head": sealed_head,
+        "sealed_head_tree": sealed_head_tree,
+        "post_seal_tree_unchanged": post_seal_tree_unchanged,
+        "sealed_worktree_clean": sealed_worktree_clean,
+    }
+    transform_receipt["receipt_id"] = provenance.receipt_id(transform_receipt)
 
     # Run-side handoff: only the data run.py genuinely needs — the editable set
     # (its frozen guard = everything NOT here) and the declared pin. The
@@ -363,6 +517,7 @@ def peel_worktree(
         "editable_files": editable,
         "peeled": peeled,
         "sealed_head": sealed_head,
+        "transform_receipt": transform_receipt,
     }
 
 
@@ -658,6 +813,9 @@ def _build_file_parser() -> argparse.ArgumentParser:
                          "By default the peeled tree is sealed so the proven "
                          "original does not leak via git show/diff/log -p; pass "
                          "this only for transform debugging.")
+    wt.add_argument("--require-exact-transform", action="store_true",
+                    help="Fail unless every declared deletion/strip is observed, "
+                         "every editable file changes, and no frozen file changes.")
     # Inspection (no mutation): generate / preview a manifest.
     ins = ap.add_argument_group("inspection (no files touched)")
     ins.add_argument("--classify", type=Path, metavar="PROJECT",
@@ -720,7 +878,9 @@ def main() -> int:
             manifest = json.loads(args.manifest.read_text())
             summary = peel_worktree(
                 args.gitroot, args.ref, args.worktree, args.depth,
-                manifest, pin=args.pin, seal=not args.no_seal_history)
+                manifest, pin=args.pin, seal=not args.no_seal_history,
+                require_exact_transform=args.require_exact_transform,
+                manifest_sha256=provenance.sha256_file(args.manifest))
             print(json.dumps(summary, indent=2))
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as e:

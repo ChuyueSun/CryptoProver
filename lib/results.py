@@ -107,6 +107,8 @@ class RoundResult:
     # Stream parser evidence: terminal metadata can follow a valid `result`
     # event, so callers can distinguish that from a genuinely missing result.
     parser_provenance: dict = field(default_factory=dict)
+    # Stable scored-campaign lineage. Empty for generic/non-scoreable runs.
+    lineage_id: Optional[str] = None
 
 
 @dataclass
@@ -160,3 +162,6 @@ class TaskResult:
     agent_budget_seconds: float = 0.0
     agent_elapsed_seconds: float = 0.0
     final_gate_allowance_seconds: float = 0.0
+    # Validated pre-model campaign lineage context. Generic runs leave this
+    # empty and cannot emit a scoreable BANKED_PARTIAL.
+    lineage_context: dict = field(default_factory=dict)

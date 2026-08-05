@@ -1,0 +1,42 @@
+FROM scratch AS warm
+FROM scratch AS patched_verus
+
+FROM cryptoprover-harness:publish-check
+
+USER root
+RUN rm -rf /opt/verus && mkdir -p /opt/verus
+COPY --from=patched_verus . /opt/verus/
+RUN set -eux; \
+    test -x /opt/verus/verus; \
+    test -x /opt/verus/rust_verify; \
+    test -x /opt/verus/cargo-verus; \
+    test -x /opt/verus/z3; \
+    test -f /opt/verus/version.txt; \
+    test -f /opt/verus/vstd.vir; \
+    /opt/verus/verus --version; \
+    /opt/verus/cargo-verus --help >/dev/null
+
+RUN chmod -R u+w /opt/harness && rm -rf /opt/harness && mkdir -p /opt/harness
+WORKDIR /opt/harness
+
+COPY run.py admit.py peel.py replay.py strip_specs.py usage_audit.py trusted_core_profile.py ./
+COPY prompt.md prompt_decompose.md ./
+COPY skills/ ./skills/
+COPY lib/ ./lib/
+COPY peel_manifests/ ./peel_manifests/
+COPY docker/ ./docker/
+
+COPY --from=warm . /opt/warm-src/
+RUN set -eux; \
+    pkg=$(grep -rlE 'name *= *"curve25519-dalek"' /opt/warm-src --include=Cargo.toml 2>/dev/null | head -1 || true); \
+    [ -n "$pkg" ] || { echo "ERROR: trust-core final image requires --build-context warm=<canonical-source>" >&2; exit 1; }; \
+    cd "$(dirname "$pkg")"; \
+    CARGO_NET_OFFLINE=false cargo fetch; \
+    find /opt/cargo-target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; \
+    rm -rf /opt/warm-src
+
+RUN mkdir -p /opt/harness/.claude/skills \
+    && ln -sfn /opt/harness/skills /opt/harness/.claude/skills/dalek-lite-mvp \
+    && chmod -R a-w,a+rX /opt/harness
+
+WORKDIR /work

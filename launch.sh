@@ -340,9 +340,22 @@ finalize_audit_on_exit() {
   fi
   return 0
 }
+# Bash defers trap execution while a FOREGROUND child runs, so a TERM/INT to
+# the launcher would be silently ignored until the current (possibly
+# multi-hour) run.py target completed. run.py therefore runs in the
+# BACKGROUND with the launcher `wait`ing on it (wait IS interruptible by
+# traps); on a signal we forward TERM to the child — run.py's own handler
+# killpgs its agent process group — and reap it before exiting, so the child
+# never survives as an orphan.
+CHILD_PID=""
 exit_on_signal() {
   local signal_rc="$1"
   trap - HUP INT TERM
+  if [ -n "${CHILD_PID:-}" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    say "[$(date -u +%FT%TZ)] signal received — forwarding TERM to run.py pid=$CHILD_PID"
+    kill -TERM "$CHILD_PID" 2>/dev/null || true
+    wait "$CHILD_PID" 2>/dev/null || true
+  fi
   exit "$signal_rc"
 }
 trap finalize_audit_on_exit EXIT
@@ -448,12 +461,19 @@ sys.exit(0 if sys.argv[2] in names else 1)
   [ -n "$EXPERIMENT_MODE" ] && CMD+=(--experiment-mode "$EXPERIMENT_MODE"
                                      --experiment-allow-edit "$target")
 
+  # Background + wait (not a foreground call): keeps the HUP/INT/TERM traps
+  # responsive mid-target — see the trap block above. The process
+  # substitution keeps live tee output while $! stays run.py's own pid
+  # (a `cmd | tee` pipeline would make $! the tee).
   if [ "${_LAUNCH_DETACHED:-0}" = "1" ]; then
-    "${CMD[@]}"
+    "${CMD[@]}" &
   else
-    "${CMD[@]}" 2>&1 | tee -a "$LOG"
+    "${CMD[@]}" > >(tee -a "$LOG") 2>&1 &
   fi
-  rc=${PIPESTATUS[0]:-$?}
+  CHILD_PID=$!
+  rc=0
+  wait "$CHILD_PID" || rc=$?
+  CHILD_PID=""
   [ "$rc" -ne 0 ] && RC_TOTAL=$rc
 
   # rc 42 = run.py hit a 429 quota limit. Every remaining target would just

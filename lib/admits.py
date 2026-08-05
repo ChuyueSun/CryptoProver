@@ -198,6 +198,35 @@ _EXTERNAL_BODY_RE = re.compile(r"\bexternal_body\b")
 # in strings/comments never trip it (strip_comments_strings removes those
 # anyway).
 _VERIFIER_RLIMIT_RE = re.compile(r"\bverifier\s*::\s*rlimit\b")
+_VERIFIER_RLIMIT_ATTR_RE = re.compile(
+    r"#\s*\[\s*verifier\s*::\s*rlimit\s*"
+    r"\(\s*([0-9][0-9_]*(?:\.[0-9][0-9_]*)?)\s*\)\s*\]"
+)
+_FN_NAME_RE = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def rlimit_inventory(text: str) -> list[dict[str, str | int]]:
+    """Return the exact per-function verifier rlimit inventory.
+
+    Comments and strings are blanked while preserving offsets. Each entry
+    records the attribute line, the next owning function (or a line fallback
+    for malformed source), and the whitespace-normalized numeric value. The
+    harness freezes this inventory, rather than only its cardinality, because
+    moving an inherited attribute or changing 80 to 400 keeps the count
+    unchanged while changing the verifier configuration.
+    """
+    code = strip_comments_strings(text)
+    inventory: list[dict[str, str | int]] = []
+    for match in _VERIFIER_RLIMIT_ATTR_RE.finditer(code):
+        line = code.count("\n", 0, match.start()) + 1
+        owner_match = _FN_NAME_RE.search(code, match.end())
+        owner = owner_match.group(1) if owner_match else f"line:{line}"
+        inventory.append({
+            "line": line,
+            "owner": owner,
+            "value": re.sub(r"\s+", "", match.group(1)),
+        })
+    return inventory
 
 
 def count_forbidden_constructs(text: str) -> dict[str, int]:

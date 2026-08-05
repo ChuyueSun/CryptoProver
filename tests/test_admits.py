@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -531,6 +532,82 @@ class FrozenEditRecoveryFeedback(unittest.TestCase):
         self.assertEqual(msgs[0]["line"], 45)
         self.assertIn("sibling re-verify failed for", msgs[0]["data"])
         self.assertIn("opaque datatype", msgs[0]["data"])
+
+
+class RejectedRecoveryTransaction(unittest.TestCase):
+    def test_apparent_improvement_becomes_non_scoreable_after_recovery(self):
+        import run
+
+        rejected = {
+            "scope": "runner_round_boundary",
+            "classification": "IMPROVED",
+            "pre_tree_hash": "clean-before",
+            "post_tree_hash": "drifted-green",
+            "pre_vector": {"verification_errors": 4},
+            "post_vector": {"verification_errors": 0},
+            "obligation_identities": [],
+        }
+        restored = {
+            "schema_version": 1,
+            "tree_hash": "restored-ungated",
+            "files": [],
+        }
+
+        transaction = run._rejected_recovered_transaction(
+            rejected, "SPEC_DRIFT_RECOVERED", restored)
+
+        self.assertEqual(
+            transaction["classification"], "REJECTED_RECOVERED")
+        self.assertFalse(transaction["scoreable"])
+        self.assertEqual(transaction["rejected_tree_hash"], "drifted-green")
+        self.assertEqual(transaction["post_tree_hash"], "restored-ungated")
+        self.assertEqual(transaction["post_vector"], {})
+        self.assertEqual(transaction["obligation_identities"], [])
+        self.assertEqual(
+            transaction["rejected_transaction"]["classification"], "IMPROVED")
+
+    def test_pending_reset_is_retargeted_to_restored_ungated_tree(self):
+        import run
+
+        transaction = {
+            "classification": "REJECTED_RECOVERED",
+            "scoreable": False,
+        }
+        restored = {"tree_hash": "restored-ungated"}
+        events = [
+            {
+                "trigger_round": 3,
+                "planned_round": 4,
+                "actual_start_round": None,
+                "predecessor_tree_hash": "rejected",
+                "predecessor_gate_receipt": "/tmp/rejected-gate.json",
+                "predecessor_transaction": {"classification": "IMPROVED"},
+            },
+            {
+                "trigger_round": 2,
+                "planned_round": 3,
+                "actual_start_round": 3,
+                "predecessor_tree_hash": "older",
+            },
+        ]
+
+        run._retarget_pending_reset_events(
+            events, 3, transaction, restored)
+
+        self.assertEqual(events[0]["predecessor_tree_hash"], "restored-ungated")
+        self.assertIsNone(events[0]["predecessor_gate_receipt"])
+        self.assertEqual(
+            events[0]["predecessor_transaction"]["classification"],
+            "REJECTED_RECOVERED",
+        )
+        self.assertEqual(events[1]["predecessor_tree_hash"], "older")
+
+        gate = run._recovered_ungated_receipt(
+            restored, {"signature": "gate-config"}, "FROZEN_EDIT_RECOVERED")
+        self.assertEqual(gate["status"], "RECOVERED_UNGATED")
+        self.assertTrue(gate["compile_blocked"])
+        self.assertEqual(gate["tree_receipt"]["tree_hash"], "restored-ungated")
+        self.assertEqual(gate["vector"], {})
 
 
 class PostAgentStateSnapshot(unittest.TestCase):
@@ -1364,7 +1441,7 @@ class ForbiddenConstructCounter(unittest.TestCase):
     def test_counts_verifier_rlimit_attribute(self):
         # `#[verifier::rlimit(N)]` lifts one function's solver budget above
         # the package gate's CLI --rlimit — config, not proof (gcp27 R1).
-        from lib.admits import count_forbidden_constructs
+        from lib.admits import count_forbidden_constructs, rlimit_inventory
         src = (
             "#[verifier::rlimit(400)]\n"
             "fn compress() {}\n"
@@ -1373,9 +1450,16 @@ class ForbiddenConstructCounter(unittest.TestCase):
         )
         c = count_forbidden_constructs(src)
         self.assertEqual(c["rlimit"], 2)
+        self.assertEqual(
+            rlimit_inventory(src),
+            [
+                {"line": 1, "owner": "compress", "value": "400"},
+                {"line": 3, "owner": "step_2", "value": "80"},
+            ],
+        )
 
     def test_rlimit_in_comments_strings_cli_not_matched(self):
-        from lib.admits import count_forbidden_constructs
+        from lib.admits import count_forbidden_constructs, rlimit_inventory
         src = (
             "// use #[verifier::rlimit(400)] is forbidden\n"
             'let s = "verifier::rlimit in a string";\n'
@@ -1384,41 +1468,87 @@ class ForbiddenConstructCounter(unittest.TestCase):
         )
         c = count_forbidden_constructs(src)
         self.assertEqual(c["rlimit"], 0)
+        self.assertEqual(rlimit_inventory(src), [])
 
-    def test_gate_flags_post_baseline_rlimit_and_tolerates_seeded(self):
+    def test_gate_freezes_exact_rlimit_inventory_and_tolerates_seeded(self):
         # Exercise the REAL gate functions run_task uses (run.py's
-        # _count_forbidden_in_files / _forbidden_delta): a pre-existing
-        # #[verifier::rlimit] in the seed is tolerated (baseline-diff), an
-        # agent-introduced one is flagged; a nonempty delta is exactly the
-        # condition run_task's loop breaks on with FORBIDDEN_CONSTRUCT
-        # (terminality of that reason: test_forbidden_construct_is_terminal).
+        # _forbidden_baseline / _forbidden_delta): a pre-existing attribute is
+        # tolerated, but add/remove/move/value changes all alter gate identity.
         import run
         with tempfile.TemporaryDirectory() as td:
-            seeded = Path(td) / "seeded.rs"
-            seeded.write_text(
+            root = Path(td)
+            seeded = root / "seeded.rs"
+            seeded_source = (
                 "#[verifier::rlimit(120)]\n"   # pre-existing: tolerated
                 "fn legacy() {}\n"
             )
-            fresh = Path(td) / "fresh.rs"
-            fresh.write_text("fn clean() {}\n")
+            seeded.write_text(seeded_source)
+            fresh = root / "fresh.rs"
+            fresh_source = "fn clean() {}\n"
+            fresh.write_text(fresh_source)
             files = [seeded, fresh]
 
-            baseline = run._count_forbidden_in_files(files)
-            self.assertEqual(baseline["rlimit"], 1)
-            # No change -> nothing introduced (seeded attribute tolerated).
-            self.assertEqual(run._forbidden_delta(files, baseline), [])
+            baseline = run._forbidden_baseline(files, root=root)
+            self.assertEqual(baseline["counts"]["rlimit"], 1)
+            self.assertEqual(
+                baseline["rlimits"],
+                [{
+                    "file": "seeded.rs",
+                    "line": 1,
+                    "owner": "legacy",
+                    "value": "120",
+                }],
+            )
+            self.assertEqual(
+                run._forbidden_delta(files, baseline, root=root), [])
 
-            # Agent lifts a budget post-baseline -> flagged.
+            # Unrelated source inserted above the same owner does not move the
+            # attribute to another function and must not create false drift.
+            seeded.write_text("\n" + seeded_source)
+            self.assertEqual(
+                run._forbidden_delta(files, baseline, root=root), [])
+            seeded.write_text(seeded_source)
+
+            # Add.
             fresh.write_text(
                 "#[verifier::rlimit(400)]\n"
                 "fn compress() {}\n"
             )
             self.assertEqual(
-                run._forbidden_delta(files, baseline), ["rlimit (+1)"])
+                run._forbidden_delta(files, baseline, root=root),
+                ["rlimit (inventory changed: +1/-0)"])
 
-            # Removing it again clears the delta (revert path).
-            fresh.write_text("fn compress() {}\n")
-            self.assertEqual(run._forbidden_delta(files, baseline), [])
+            # Raise and lower, each with the same occurrence count.
+            fresh.write_text(fresh_source)
+            for changed_value in ("400", "80"):
+                seeded.write_text(
+                    f"#[verifier::rlimit({changed_value})]\n"
+                    "fn legacy() {}\n"
+                )
+                self.assertEqual(
+                    run._forbidden_delta(files, baseline, root=root),
+                    ["rlimit (inventory changed: +1/-1)"])
+
+            # Move to another file/function, again preserving count.
+            seeded.write_text("fn legacy() {}\n")
+            fresh.write_text(
+                "#[verifier::rlimit(120)]\n"
+                "fn clean() {}\n"
+            )
+            self.assertEqual(
+                run._forbidden_delta(files, baseline, root=root),
+                ["rlimit (inventory changed: +1/-1)"])
+
+            # Remove.
+            fresh.write_text(fresh_source)
+            self.assertEqual(
+                run._forbidden_delta(files, baseline, root=root),
+                ["rlimit (inventory changed: +0/-1)"])
+
+            # Exact restoration clears the drift.
+            seeded.write_text(seeded_source)
+            self.assertEqual(
+                run._forbidden_delta(files, baseline, root=root), [])
 
     def test_introduced_detected_by_count_diff(self):
         from lib.admits import count_forbidden_constructs
@@ -2300,6 +2430,59 @@ class FieldFloorPromptScope(unittest.TestCase):
             out,
         )
 
+    def test_continuation_rendered_prompt_rejects_full_rediscovery(self):
+        import run
+
+        out = run.render_prompt(
+            target=self._BASE / "ristretto.rs",
+            project=self._BASE.parent,
+            module="ristretto",
+            spec_snapshot=Path("/tmp/spec.json"),
+            catalog_cache=Path("/tmp/catalog.json"),
+            results_root=Path("/tmp/results"),
+            failure_block="",
+            experiment_block="## Runner-owned continuation frontier",
+            whole_crate_assignment=True,
+            continuation_assignment=True,
+        )
+        self.assertIn("continue the verifier-banked", out)
+        self.assertIn("runner-owned predecessor frontier", out)
+        self.assertIn("do not repeat a full workspace/admit survey", out)
+
+    def test_continuation_experiment_block_removes_stale_peel_claims(self):
+        import run
+
+        initial = self._block([
+            "ristretto.rs",
+            "specs/edwards_specs.rs",
+            "lemmas/common_lemmas/to_nat_lemmas.rs",
+            "backend/serial/u64/scalar.rs",
+            "traits.rs",
+        ], mode="field-floor")
+        self.assertIn("Entire in-repo proof layer peeled", initial)
+        rendered = run._render_continuation_frontier(
+            initial,
+            {
+                "tree_hash": "bank-tree",
+                "vector": {
+                    "hard_admits": 0, "verification_errors": 2,
+                    "resource_limits": 1, "raw_errors": 4,
+                    "verified_count": 10,
+                },
+                "owner_queue": [{
+                    "file": "curve25519-dalek/src/ristretto.rs",
+                    "kind": "verification", "count": 2,
+                }],
+            },
+            Path("/results/run/task/predecessor_frontier.json"),
+        )
+        self.assertIn("Verifier-banked trusted-core continuation", rendered)
+        self.assertIn("bank-tree", rendered)
+        self.assertNotIn("Entire in-repo proof layer peeled", rendered)
+        self.assertNotIn(
+            "The entire in-repo proof layer has been peeled", rendered,
+        )
+
 
 class FeedbackVisibilityHelpers(unittest.TestCase):
     """The corefloor_006 plateau was a blindness bug: whole-crate errors stored
@@ -2983,6 +3166,14 @@ class RetryMemoryTaint(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertTrue(run._should_persist_retry_memory(reason))
 
+    def test_tooling_gate_covers_top_level_and_post_run_authority(self):
+        source = (REPO_ROOT / "run.py").read_text()
+        for marker in (
+            '"prompt.md"', '"usage_audit.py"', '"trusted_core_profile.py"',
+            'HERE.glob("docker/*.py")', 'HERE.glob("docker/*.json")',
+        ):
+            self.assertIn(marker, source)
+
 
 class ProcessCrosstalkDetection(unittest.TestCase):
     def _raw(self, td: str, blocks: list[dict]) -> Path:
@@ -3436,6 +3627,1147 @@ class RunTaskShutilScope(unittest.TestCase):
             "run_task binds `shutil` as a local — a bare `import shutil` inside "
             "run_task shadows the module global, so shutil.copy2 in the "
             "git-recovery / budget rollback raises UnboundLocalError.")
+
+
+class ScoredLineageBoundaryTests(unittest.TestCase):
+    def test_premodel_warm_is_exact_tree_and_authoritative(self):
+        import run
+        from lib import provenance
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            project.mkdir()
+            target = project / "target.rs"
+            target.write_text("proof fn x() {}\n")
+            result = {
+                "okay": False,
+                "truncated": False,
+                "verified_count": 7,
+                "messages": [{
+                    "file": "target.rs", "line": 1,
+                    "data": "postcondition not satisfied",
+                }],
+            }
+            with mock.patch.object(
+                run, "run_subskill", return_value=(1, json.dumps(result), ""),
+            ) as subskill:
+                gate = run._premodel_verifier_warm(
+                    tdir=root, project=project,
+                    gate_commands=[["verus_check", str(target),
+                                    "--whole-crate", "--timeout", "900"]],
+                    env={}, lineage_id="lineage",
+                )
+            receipt = json.loads(
+                (root / "premodel_verifier_warm.json").read_text()
+            )
+            self.assertEqual(
+                receipt["tree_hash_before"], receipt["tree_hash_after"],
+            )
+            self.assertEqual(receipt["vector"]["verified_count"], 7)
+            self.assertEqual(receipt["receipt_id"], provenance.receipt_id(receipt))
+            self.assertEqual(receipt["gate_receipt_key"], gate["receipt_key"])
+            self.assertIn("--whole-crate", subskill.call_args.args[0])
+            self.assertEqual(
+                receipt["gate_receipt_sha256"],
+                provenance.sha256_file(Path(gate["receipt_path"])),
+            )
+            self.assertEqual(gate["round_number"], 0)
+            self.assertTrue(gate["premodel_warm"])
+            self.assertTrue(Path(gate["receipt_path"]).is_file())
+
+    def test_premodel_warm_rejects_source_mutation(self):
+        import run
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            project.mkdir()
+            target = project / "target.rs"
+            target.write_text("proof fn x() {}\n")
+            result = {
+                "okay": False,
+                "truncated": False,
+                "verified_count": 1,
+                "messages": [],
+            }
+
+            def mutate_source(*_args, **_kwargs):
+                target.write_text("proof fn x() { assert(true); }\n")
+                return 1, json.dumps(result), ""
+
+            with mock.patch.object(run, "run_subskill", mutate_source):
+                with self.assertRaisesRegex(ValueError, "changed the source tree"):
+                    run._premodel_verifier_warm(
+                        tdir=root, project=project,
+                        gate_commands=[["verus_check", str(target),
+                                        "--whole-crate", "--timeout", "900"]],
+                        env={}, lineage_id="lineage",
+                    )
+            failure = json.loads(
+                (root / "premodel_verifier_warm.json").read_text()
+            )
+            self.assertFalse(failure["completed"])
+            self.assertTrue(failure["retryable_infrastructure"])
+            self.assertEqual(failure["failure_reason"], "SOURCE_TREE_CHANGED")
+            self.assertNotEqual(
+                failure["tree_hash_before"], failure["tree_hash_after"],
+            )
+
+    def test_premodel_warm_rejects_indeterminate_result(self):
+        import run
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            project.mkdir()
+            target = project / "target.rs"
+            target.write_text("proof fn x() {}\n")
+            result = {
+                "okay": False,
+                "truncated": True,
+                "verified_count": None,
+                "messages": [{"kind": "timeout", "data": "timed out"}],
+            }
+            with mock.patch.object(
+                run, "run_subskill", return_value=(1, json.dumps(result), ""),
+            ):
+                with self.assertRaisesRegex(ValueError, "authoritatively"):
+                    run._premodel_verifier_warm(
+                        tdir=root, project=project,
+                        gate_commands=[["verus_check", str(target),
+                                        "--whole-crate", "--timeout", "900"]],
+                        env={}, lineage_id="lineage",
+                    )
+            failure = json.loads(
+                (root / "premodel_verifier_warm.json").read_text()
+            )
+            self.assertFalse(failure["completed"])
+            self.assertEqual(failure["failure_reason"], "INDETERMINATE_GATE")
+            self.assertTrue(failure["retryable_infrastructure"])
+
+    def test_premodel_warm_persists_malformed_result_before_raising(self):
+        import run
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            project.mkdir()
+            target = project / "target.rs"
+            target.write_text("proof fn x() {}\n")
+            with mock.patch.object(
+                run, "run_subskill", return_value=(1, "not-json", "detail"),
+            ):
+                with self.assertRaisesRegex(ValueError, "malformed JSON"):
+                    run._premodel_verifier_warm(
+                        tdir=root, project=project,
+                        gate_commands=[["verus_check", str(target),
+                                        "--whole-crate", "--timeout", "900"]],
+                        env={}, lineage_id="lineage",
+                    )
+            failure = json.loads(
+                (root / "premodel_verifier_warm.json").read_text()
+            )
+            self.assertFalse(failure["completed"])
+            self.assertEqual(failure["failure_reason"], "MALFORMED_RESULT")
+            self.assertEqual(len(failure["stdout_sha256"]), 64)
+            self.assertEqual(len(failure["stderr_sha256"]), 64)
+
+    def test_premodel_warm_rejects_member_filtered_gate(self):
+        import run
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            project.mkdir()
+            with self.assertRaisesRegex(ValueError, "whole-crate"):
+                run._premodel_verifier_warm(
+                    tdir=root, project=project,
+                    gate_commands=[["verus_check", "target.rs"]],
+                    env={}, lineage_id="lineage",
+                )
+
+    def test_context_binds_content_lineage_and_current_tree(self):
+        import run
+        from lib import provenance
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            project.mkdir()
+            (project / "Cargo.toml").write_text("[workspace]\n")
+            (project / "source.rs").write_text("proof fn x() { admit(); }\n")
+            tree = provenance.source_tree_receipt(project)
+            lineage = provenance.derive_lineage_id("campaign-a", "start-a")
+            vector = {
+                "hard_admits": 0,
+                "verification_errors": 1,
+                "resource_limits": 0,
+                "raw_errors": 2,
+                "verified_count": 10,
+            }
+            sidecar = {
+                "schema_version": 1,
+                "kind": "scored_predecessor_frontier",
+                "source_promotion_receipt_id": "bank-a",
+                "tree_hash": tree["tree_hash"],
+                "vector": vector,
+                "diagnostic_inventory": [{
+                    "file": "source.rs", "kind": "verification",
+                    "line": 1, "column": 1, "data": "test",
+                }],
+            }
+            sidecar["receipt_id"] = provenance.receipt_id(sidecar)
+            sidecar_path = root / "frontier.json"
+            provenance.write_immutable_json(sidecar_path, sidecar)
+            context = {
+                "schema_version": 1,
+                "kind": "scored_lineage_context",
+                "scoreable": True,
+                "lineage_id": lineage,
+                "campaign_spec_sha256": "campaign-a",
+                "start_receipt_id": "start-a",
+                "launch_registration_id": "launch-a",
+                "sterility_receipt_id": "sterility-a",
+                "hint_level": "H0",
+                "execution": {"model": "test"},
+                "expected_tree_hash": tree["tree_hash"],
+                "predecessor": {
+                    "lineage_id": lineage,
+                    "campaign_spec_sha256": "campaign-a",
+                    "tree_hash": tree["tree_hash"],
+                    "receipt_id": "bank-a",
+                    "frontier": {
+                        "schema_version": 1,
+                        "tree_hash": tree["tree_hash"],
+                        "vector": vector,
+                        "owner_queue": [{
+                            "file": "source.rs", "kind": "verification",
+                            "count": 1,
+                        }],
+                        "sidecar_name": sidecar_path.name,
+                        "sidecar_sha256": provenance.sha256_file(sidecar_path),
+                        "sidecar_receipt_id": sidecar["receipt_id"],
+                    },
+                },
+                "taints": [],
+            }
+            context["receipt_id"] = provenance.receipt_id(context)
+            path = root / "lineage.json"
+            path.write_text(json.dumps(context))
+            validated = run._validate_scored_lineage_context(
+                path, project=project, operator_events=[],
+            )
+            self.assertEqual(validated["lineage_id"], lineage)
+
+            original_sidecar = sidecar_path.read_text()
+            sidecar_path.unlink()
+            with self.assertRaisesRegex(ValueError, "sidecar is missing"):
+                run._validate_scored_lineage_context(
+                    path, project=project, operator_events=[],
+                )
+            sidecar_path.write_text(original_sidecar + " ")
+            with self.assertRaisesRegex(ValueError, "sidecar hash mismatch"):
+                run._validate_scored_lineage_context(
+                    path, project=project, operator_events=[],
+                )
+            sidecar_path.write_text(original_sidecar)
+
+            context["predecessor"]["lineage_id"] = "other"
+            context["receipt_id"] = provenance.receipt_id(context)
+            path.write_text(json.dumps(context))
+            with self.assertRaisesRegex(ValueError, "different lineage"):
+                run._validate_scored_lineage_context(
+                    path, project=project, operator_events=[],
+                )
+
+            context["predecessor"]["lineage_id"] = lineage
+            context["receipt_id"] = provenance.receipt_id(context)
+            path.write_text(json.dumps(context))
+            (project / "source.rs").write_text("tampered\n")
+            with self.assertRaisesRegex(ValueError, "tree mismatch"):
+                run._validate_scored_lineage_context(
+                    path, project=project, operator_events=[],
+                )
+
+    def test_operator_event_taints_scored_lineage(self):
+        import run
+        from lib import provenance
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tree = provenance.source_tree_receipt(root)
+            lineage = provenance.derive_lineage_id("campaign", "start")
+            context = {
+                "schema_version": 1,
+                "kind": "scored_lineage_context",
+                "scoreable": True,
+                "lineage_id": lineage,
+                "campaign_spec_sha256": "campaign",
+                "start_receipt_id": "start",
+                "launch_registration_id": "launch",
+                "sterility_receipt_id": "sterility",
+                "hint_level": "H0",
+                "execution": {"model": "test"},
+                "expected_tree_hash": tree["tree_hash"],
+                "taints": [],
+            }
+            context["receipt_id"] = provenance.receipt_id(context)
+            path = root / "lineage.json"
+            path.write_text(json.dumps(context))
+            with self.assertRaisesRegex(ValueError, "operator events"):
+                run._validate_scored_lineage_context(
+                    path, project=root, operator_events=[{"kind": "seed"}],
+                )
+
+    def test_promotion_binds_exact_lineage_and_sterility_context(self):
+        import run
+
+        context = {
+            "receipt_id": "context-receipt",
+            "sterility_receipt_id": "sterility-receipt",
+        }
+        self.assertEqual(
+            run._promotion_lineage_binding(context),
+            {
+                "lineage_context_receipt_id": "context-receipt",
+                "sterility_receipt_id": "sterility-receipt",
+            },
+        )
+
+    def test_round_budget_reserves_every_gate_command(self):
+        import run
+
+        whole = run._harness_gate_commands(
+            Path("/tmp/target.rs"),
+            Path("/tmp/project"),
+            "field-floor",
+            80,
+            [Path("/tmp/dep.rs")],
+        )
+        self.assertEqual(len(whole), 1)
+        self.assertEqual(run._round_gate_allowance_seconds(whole), 930.0)
+
+        module = run._harness_gate_commands(
+            Path("/tmp/target.rs"),
+            Path("/tmp/project"),
+            "proof-only",
+            80,
+            [Path("/tmp/dep-a.rs"), Path("/tmp/dep-b.rs")],
+        )
+        self.assertEqual(len(module), 3)
+        self.assertEqual(run._round_gate_allowance_seconds(module), 990.0)
+        self.assertEqual(
+            run._provider_deadline_seconds(2_000.0, 100.0, 990.0),
+            910.0,
+        )
+        self.assertLess(
+            run._provider_deadline_seconds(1_300.0, 20.0, 990.0),
+            run._MIN_PRODUCTIVE_ROUND_SEC,
+        )
+
+    def test_launch_budget_auto_raises_but_explicit_errors(self):
+        import run
+
+        # F3: whole-crate terminal reserve (930s) exceeds the 20-minute auto
+        # floor's headroom, so a bare whole-crate run would exit LIMIT with
+        # zero rounds. An AUTO budget raises to the launch minimum; an
+        # EXPLICIT budget stays a hard error.
+        minutes, agent_s, raised, error = run._resolve_launch_budget(
+            20.0, "field-floor", 930.0, budget_is_auto=True)
+        self.assertTrue(raised)
+        self.assertIsNone(error)
+        self.assertEqual(agent_s, 930.0 + run._MIN_PRODUCTIVE_ROUND_SEC)
+        self.assertAlmostEqual(
+            minutes, (930.0 + run._MIN_PRODUCTIVE_ROUND_SEC + 930.0) / 60.0)
+
+        minutes, agent_s, raised, error = run._resolve_launch_budget(
+            20.0, "field-floor", 930.0, budget_is_auto=False)
+        self.assertFalse(raised)
+        self.assertIn("cannot fund one provider round", error)
+        self.assertEqual(minutes, 20.0)
+
+        # A funded budget passes through unchanged in both modes.
+        minutes, agent_s, raised, error = run._resolve_launch_budget(
+            90.0, "field-floor", 930.0, budget_is_auto=True)
+        self.assertFalse(raised)
+        self.assertIsNone(error)
+        self.assertEqual(minutes, 90.0)
+        self.assertEqual(agent_s, 90.0 * 60 - 930.0)
+
+    def test_undersized_budget_fails_before_agent_or_gate(self):
+        import run
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            project.mkdir()
+            (project / "Cargo.toml").write_text("[package]\nname='p'\nversion='0.1.0'\n")
+            target = project / "target.rs"
+            target.write_text("proof fn x() { admit(); }\n")
+            results_root = root / "results"
+            with (
+                mock.patch.object(
+                    run, "run_claude_round",
+                    side_effect=AssertionError("provider must not launch"),
+                ),
+                mock.patch.object(
+                    run, "run_subskill",
+                    side_effect=AssertionError("gate must not launch"),
+                ),
+            ):
+                result = run.run_task(
+                    target=target,
+                    project=project,
+                    run_id="tiny-budget",
+                    results_root=results_root,
+                    max_rounds=1,
+                    max_task_minutes=1,
+                    skip_failure_memory=True,
+                    experiment_mode="proof-only",
+                )
+            self.assertFalse(result.success)
+            self.assertEqual(result.end_reason, "ERROR")
+            self.assertIn("cannot fund one provider round", result.error_message)
+            result_path = (
+                results_root
+                / "tiny-budget"
+                / run.results.target_id_from_path(target)
+                / "result.json"
+            )
+            self.assertTrue(result_path.exists())
+
+    def test_scored_module_mode_is_rejected_at_launch_validation(self):
+        import run
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "target.rs"
+            target.write_text("")
+            with self.assertRaisesRegex(
+                ValueError, "whole-crate experiment mode",
+            ):
+                run.run_task(
+                    target=target,
+                    project=root,
+                    run_id="module-lineage",
+                    results_root=root / "results",
+                    max_rounds=1,
+                    skip_failure_memory=True,
+                    experiment_mode="proof-only",
+                    lineage_context={"lineage_id": "lineage"},
+                )
+
+    def test_indeterminate_terminal_gate_persists_receipt(self):
+        import run
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "target.rs"
+            target.write_text("proof fn x() { admit(); }\n")
+            timeout_result = {
+                "okay": False,
+                "truncated": True,
+                "verified_count": None,
+                "messages": [{
+                    "severity": "error",
+                    "kind": "timeout",
+                    "data": "verus timed out",
+                }],
+            }
+            with (
+                mock.patch.object(
+                    run, "run_subskill",
+                    return_value=(1, json.dumps(timeout_result), ""),
+                ),
+                mock.patch.object(run, "_count_gate_admits", return_value=1),
+            ):
+                receipt = run._fresh_terminal_gate(
+                    tdir=root / "task",
+                    round_number=3,
+                    target=target,
+                    project=root,
+                    experiment_mode="field-floor",
+                    verus_rlimit=80,
+                    experiment_allow_edit=[target],
+                    env={},
+                    lineage_id="lineage",
+                    expected_tree_hash=run.provenance.source_tree_receipt(root)[
+                        "tree_hash"
+                    ],
+                )
+
+            self.assertTrue(receipt["compile_blocked"])
+            persisted = json.loads(Path(receipt["receipt_path"]).read_text())
+            self.assertTrue(persisted["compile_blocked"])
+            self.assertTrue(persisted["verus_result"]["truncated"])
+
+    def test_truthy_indeterminate_receipt_cannot_bank(self):
+        import run
+
+        indeterminate = {
+            "receipt_key": "timeout-receipt",
+            "compile_blocked": True,
+            "exact_tree_match": True,
+            "verus_result": {
+                "okay": False,
+                "truncated": True,
+                "verified_count": None,
+            },
+        }
+        outcome = run._terminal_disposition(
+            final_end_reason="LIMIT",
+            success=False,
+            requires_acceptance_gate=True,
+            lineage_scoreable=True,
+            banking_attempted=True,
+            banking_gate_receipt=indeterminate,
+        )
+        self.assertTrue(indeterminate)
+        self.assertEqual(outcome["promotion_decision"], "REJECTED")
+        self.assertFalse(outcome["scoreable"])
+        self.assertEqual(
+            outcome["terminal_disposition"]["state"],
+            "UNBANKABLE_INDETERMINATE",
+        )
+        self.assertFalse(outcome["terminal_disposition"]["reusable"])
+
+        decided = {
+            **indeterminate,
+            "receipt_key": "decided-receipt",
+            "compile_blocked": False,
+            "verus_result": {
+                "okay": False,
+                "truncated": False,
+                "verified_count": 17,
+            },
+        }
+        positive = run._terminal_disposition(
+            final_end_reason="LIMIT",
+            success=False,
+            requires_acceptance_gate=True,
+            lineage_scoreable=True,
+            banking_attempted=True,
+            banking_gate_receipt=decided,
+        )
+        self.assertEqual(positive["promotion_decision"], "BANKED_PARTIAL")
+        self.assertTrue(positive["scoreable"])
+        self.assertTrue(positive["terminal_disposition"]["reusable"])
+
+    def test_complete_indeterminate_fails_closed_without_exception(self):
+        import run
+
+        receipt = {
+            "receipt_key": "acceptance-timeout",
+            "fresh": True,
+            "exact_tree_match": True,
+            "compile_blocked": True,
+            "verus_result": {
+                "okay": False,
+                "truncated": True,
+                "verified_count": None,
+            },
+            "vector": {"hard_admits": 0},
+        }
+        outcome = run._terminal_disposition(
+            final_end_reason="COMPLETE",
+            success=True,
+            requires_acceptance_gate=True,
+            lineage_scoreable=True,
+            banking_attempted=False,
+            acceptance_gate_receipt=receipt,
+        )
+        self.assertFalse(outcome["success"])
+        self.assertEqual(outcome["end_reason"], "TERMINAL_GATE_INDETERMINATE")
+        self.assertEqual(outcome["promotion_decision"], "REJECTED")
+        self.assertEqual(
+            outcome["terminal_disposition"]["state"],
+            "REJECTED_INDETERMINATE",
+        )
+
+    def test_decided_gate_requires_a_complete_summary(self):
+        import run
+
+        self.assertFalse(run._gate_receipt_decided({
+            "compile_blocked": False,
+            "verus_result": {
+                "okay": True,
+                "truncated": False,
+                "verified_count": None,
+            },
+        }))
+        self.assertTrue(run._gate_receipt_decided({
+            "compile_blocked": False,
+            "verus_result": {
+                "okay": False,
+                "truncated": False,
+                "verified_count": 0,
+            },
+        }))
+
+    def test_partial_frontier_rejects_regression_and_preserves_round(self):
+        import run
+
+        def gate(tree, verification, rlimit, raw, verified, round_number):
+            return {
+                "round_number": round_number,
+                "compile_blocked": False,
+                "tree_receipt": {"tree_hash": tree},
+                "vector": {
+                    "verification_errors": verification,
+                    "resource_limits": rlimit,
+                    "timeouts": 0,
+                    "panics": 0,
+                    "build_wrappers": 1,
+                    "compile_errors": 0,
+                    "raw_errors": raw,
+                    "verified_count": verified,
+                },
+                "verus_result": {
+                    "truncated": False,
+                    "verified_count": verified,
+                },
+            }
+
+        best = gate("round-7", 54, 9, 64, 1580, 7)
+        regressed = gate("round-8", 57, 8, 66, 1589, 8)
+        self.assertEqual(
+            run._gate_frontier_relation(best, regressed), "REGRESSED"
+        )
+        self.assertFalse(run._gate_advances_frontier(best, regressed))
+        disposition = run._dominated_bank_disposition(
+            "LIMIT", regressed, best,
+        )
+        self.assertIsNotNone(disposition)
+        self.assertEqual(disposition["state"], "BANK_DOMINATED")
+        self.assertEqual(disposition["dominating_round"], 7)
+        self.assertFalse(disposition["reusable"])
+        self.assertEqual(
+            run._rollback_snapshot_round(
+                "field-floor", best_decided_round=7, last_green_round=0,
+            ),
+            7,
+        )
+        self.assertIsNone(run._dominated_bank_disposition("LIMIT", best, best))
+        self.assertIsNone(run._dominated_bank_disposition("LIMIT", {}, best))
+
+        primary_regression = gate("round-9", 55, 7, 63, 1581, 9)
+        self.assertEqual(
+            run._gate_frontier_relation(best, primary_regression),
+            "REGRESSED",
+        )
+        self.assertFalse(
+            run._gate_advances_frontier(best, primary_regression),
+        )
+        self.assertEqual(
+            run._dominated_bank_disposition(
+                "LIMIT", primary_regression, best,
+            )["bank_relation"],
+            "REGRESSED",
+        )
+
+    def test_single_target_rollback_keeps_last_green_semantics(self):
+        import run
+
+        self.assertEqual(
+            run._rollback_snapshot_round(
+                None, best_decided_round=7, last_green_round=3,
+            ),
+            3,
+        )
+
+    def test_timeout_chain_is_never_neutral(self):
+        import run
+
+        previous_gate = {
+            "compile_blocked": True,
+            "vector": {
+                "raw_errors": 1,
+                "verification_errors": 0,
+                "resource_limits": 0,
+                "timeouts": 1,
+                "panics": 0,
+                "build_wrappers": 0,
+                "compile_errors": 0,
+                "verified_count": None,
+            },
+        }
+        timeout_result = {
+            "okay": False,
+            "truncated": True,
+            "verified_count": None,
+            "messages": [{
+                "severity": "error",
+                "kind": "timeout",
+                "data": "timed out",
+            }],
+        }
+        for current_hash in ("same", "changed"):
+            with self.subTest(current_hash=current_hash):
+                transaction = run._classify_candidate_transaction(
+                    {"tree_hash": "same"},
+                    previous_gate,
+                    {"tree_hash": current_hash},
+                    timeout_result,
+                )
+                self.assertEqual(
+                    transaction["classification"],
+                    "INDETERMINATE_CONTINUED",
+                )
+
+    def test_decided_recovery_compares_with_last_decided_frontier(self):
+        import run
+
+        previous_timeout = {
+            "compile_blocked": True,
+            "vector": {
+                "raw_errors": 1,
+                "verification_errors": 0,
+                "verified_count": None,
+            },
+        }
+        last_decided = {
+            "tree_receipt": {"tree_hash": "r4"},
+            "compile_blocked": False,
+            "vector": {
+                "raw_errors": 2,
+                "verification_errors": 2,
+                "resource_limits": 0,
+                "timeouts": 0,
+                "panics": 0,
+                "build_wrappers": 0,
+                "compile_errors": 0,
+                "verified_count": 10,
+            },
+        }
+        decided_result = {
+            "okay": False,
+            "truncated": False,
+            "verified_count": 11,
+            "messages": [{
+                "severity": "error",
+                "file": "src/owner.rs",
+                "line": 7,
+                "data": "assertion failed",
+            }],
+        }
+        transaction = run._classify_candidate_transaction(
+            {"tree_hash": "timeout-tree"},
+            previous_timeout,
+            {"tree_hash": "recovered-tree"},
+            decided_result,
+            last_decided,
+        )
+        self.assertEqual(transaction["classification"], "IMPROVED")
+        self.assertEqual(transaction["pre_tree_hash"], "r4")
+        self.assertEqual(
+            transaction["immediate_pre_tree_hash"], "timeout-tree",
+        )
+        self.assertTrue(transaction["recovered_from_indeterminate"])
+        self.assertEqual(transaction["pre_vector"], last_decided["vector"])
+
+        without_decided_predecessor = run._classify_candidate_transaction(
+            {"tree_hash": "timeout-tree"},
+            previous_timeout,
+            {"tree_hash": "recovered-tree"},
+            decided_result,
+        )
+        self.assertEqual(
+            without_decided_predecessor["classification"], "INITIAL",
+        )
+        self.assertIsNone(without_decided_predecessor["pre_tree_hash"])
+
+    def test_candidate_transaction_persists_immediate_changed_paths(self):
+        import run
+
+        previous_tree = {
+            "tree_hash": "before",
+            "files": [{"path": "src/a.rs", "sha256": "old"}],
+        }
+        current_tree = {
+            "tree_hash": "after",
+            "files": [
+                {"path": "src/a.rs", "sha256": "new"},
+                {"path": "src/b.rs", "sha256": "added"},
+            ],
+        }
+        result = {
+            "okay": False,
+            "truncated": False,
+            "verified_count": 2,
+            "messages": [],
+        }
+        transaction = run._classify_candidate_transaction(
+            previous_tree, None, current_tree, result,
+        )
+        self.assertEqual(
+            transaction["changed_paths"], ["src/a.rs", "src/b.rs"],
+        )
+
+    def test_reset_handoff_keeps_decided_and_current_frontiers(self):
+        import run
+        from lib import provenance
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            decided_tree = {
+                "tree_hash": "r4",
+                "files": [{
+                    "path": "src/owner.rs",
+                    "kind": "file",
+                    "sha256": "old",
+                    "size": 3,
+                }],
+            }
+            current_tree = {
+                "tree_hash": "r6",
+                "files": [{
+                    "path": "src/owner.rs",
+                    "kind": "file",
+                    "sha256": "new",
+                    "size": 3,
+                }],
+            }
+            current_gate = {
+                "round_number": 6,
+                "receipt_key": "r6-gate",
+                "tree_receipt": current_tree,
+                "gate_signature": {"signature": "gate"},
+                "vector": {"raw_errors": 1, "timeouts": 1},
+                "compile_blocked": True,
+                "diagnostic_inventory": [{"kind": "timeout"}],
+                "lineage_id": "lineage",
+            }
+            decided_gate = {
+                "round_number": 4,
+                "receipt_key": "r4-gate",
+                "tree_receipt": decided_tree,
+                "vector": {
+                    "raw_errors": 190,
+                    "verification_errors": 181,
+                    "resource_limits": 9,
+                    "verified_count": 1231,
+                },
+                "compile_blocked": False,
+            }
+            gate_dir = root / "gate_receipts"
+            gate_dir.mkdir()
+            for receipt, name in (
+                (current_gate, "r6.json"), (decided_gate, "r4.json"),
+            ):
+                receipt["receipt_path"] = str(gate_dir / name)
+                provenance.write_immutable_json(gate_dir / name, receipt)
+            reset = {"predecessor_transaction": {
+                "classification": "INDETERMINATE_CONTINUED",
+                "changed_paths": ["src/owner.rs"],
+                "obligation_identities": [{"file": "large"}] * 100,
+            }}
+            rendered = run._canonical_reset_handoff(
+                root, 7, reset, current_gate, decided_gate,
+            )
+            handoff = json.loads(
+                (root / "reset_handoff_round_7.json").read_text()
+            )
+            self.assertEqual(handoff["schema_version"], 3)
+            self.assertEqual(handoff["current_tree_hash"], "r6")
+            self.assertTrue(handoff["current_gate"]["compile_blocked"])
+            self.assertEqual(
+                handoff["last_decided_gate_ref"]["tree_hash"],
+                "r4",
+            )
+            self.assertEqual(
+                handoff["post_decision_changes"], ["src/owner.rs"],
+            )
+            self.assertEqual(handoff["queue_source"], "changed_paths")
+            self.assertEqual(
+                handoff["owner_queue"],
+                [{"file": "src/owner.rs", "kind": "changed-path", "count": 1}],
+            )
+            self.assertEqual(
+                handoff["last_transaction_changed_owners"],
+                ["src/owner.rs"],
+            )
+            self.assertNotIn(
+                "obligation_identities",
+                handoff["reset_event"]["predecessor_transaction"],
+            )
+            self.assertNotIn("tree_receipt", handoff)
+            self.assertIn("indeterminate", rendered)
+            self.assertIn("last decided tree `r4`", rendered)
+
+    def test_reset_handoff_falls_back_to_current_gate_owner_queue(self):
+        import run
+        from lib import provenance
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tree = {"tree_hash": "same", "files": []}
+            gate = {
+                "round_number": 2,
+                "receipt_key": "gate",
+                "tree_receipt": tree,
+                "gate_signature": {"signature": "sig"},
+                "vector": {"verification_errors": 3},
+                "compile_blocked": False,
+                "diagnostic_inventory": [
+                    {"file": "src/b.rs", "kind": "verification"},
+                    {"file": "src/a.rs", "kind": "verification"},
+                    {"file": "src/a.rs", "kind": "verification"},
+                ],
+                "lineage_id": "lineage",
+            }
+            path = root / "gate.json"
+            gate["receipt_path"] = str(path)
+            provenance.write_immutable_json(path, gate)
+            run._canonical_reset_handoff(
+                root, 3, {"predecessor_transaction": {"changed_paths": []}},
+                gate, gate,
+            )
+            handoff = json.loads(
+                (root / "reset_handoff_round_3.json").read_text()
+            )
+            self.assertEqual(handoff["queue_source"], "current_gate")
+            self.assertEqual(handoff["owner_queue"][0], {
+                "file": "src/a.rs", "kind": "verification", "count": 2,
+            })
+
+    def test_reset_handoff_labels_synthetic_and_missing_gate_refs(self):
+        import run
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            synthetic = {
+                "round_number": 4,
+                "receipt_key": "synthetic-spec-drift",
+                "tree_receipt": {
+                    "tree_hash": "candidate",
+                    "files": [{"path": "src/a.rs", "sha256": "a"}],
+                },
+                "vector": {"verification_errors": 4},
+                "compile_blocked": True,
+                "diagnostic_inventory": [
+                    {"file": "src/a.rs", "kind": "verification"},
+                ],
+            }
+            run._canonical_reset_handoff(
+                root, 5,
+                {"predecessor_transaction": {"changed_paths": []}},
+                synthetic, None,
+            )
+            handoff = json.loads(
+                (root / "reset_handoff_round_5.json").read_text()
+            )
+            self.assertEqual(handoff["schema_version"], 3)
+            self.assertFalse(handoff["current_gate_ref"]["persisted"])
+            self.assertEqual(
+                handoff["current_gate_ref"]["reason"],
+                "SYNTHETIC_OR_UNPERSISTED_GATE",
+            )
+            self.assertEqual(
+                handoff["current_gate_ref"]["tree_hash"], "candidate",
+            )
+            self.assertFalse(handoff["last_decided_gate_ref"]["persisted"])
+            self.assertEqual(
+                handoff["last_decided_gate_ref"]["reason"],
+                "NO_GATE_RECEIPT",
+            )
+
+    def test_reset_handoff_references_large_receipts_without_embedding_them(self):
+        import run
+        from lib import provenance
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            huge = "x" * 500_000
+            tree = {
+                "tree_hash": "same",
+                "files": [{"path": "src/a.rs", "sha256": huge}],
+            }
+            gate = {
+                "round_number": 2,
+                "receipt_key": "gate",
+                "tree_receipt": tree,
+                "gate_signature": {"signature": "sig"},
+                "vector": {"verification_errors": 1, "verified_count": 10},
+                "compile_blocked": False,
+                "diagnostic_inventory": [
+                    {"file": "src/a.rs", "kind": "verification"},
+                ],
+                "verus_result": {"stdout": huge},
+                "lineage_id": "lineage",
+            }
+            path = root / "large-gate.json"
+            gate["receipt_path"] = str(path)
+            provenance.write_immutable_json(path, gate)
+            run._canonical_reset_handoff(
+                root, 3, {"predecessor_transaction": {"changed_paths": []}},
+                gate, gate,
+            )
+            handoff_path = root / "reset_handoff_round_3.json"
+            handoff = json.loads(handoff_path.read_text())
+            self.assertLess(handoff_path.stat().st_size, 50_000)
+            self.assertNotIn("tree_receipt", handoff["current_gate"])
+            self.assertNotIn("verus_result", handoff["current_gate"])
+            self.assertEqual(
+                handoff["current_gate_ref"]["sha256"],
+                provenance.sha256_file(path),
+            )
+
+    def test_banking_gate_is_fresh_exact_and_canonical(self):
+        import run
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "target.rs"
+            target.write_text("proof fn x() { admit(); }\n")
+            result = {
+                "okay": False,
+                "messages": [{
+                    "severity": "error",
+                    "kind": "resource-limit",
+                    "data": "resource limit",
+                }],
+                "error_count": 1,
+            }
+            with (
+                mock.patch.object(
+                    run, "run_subskill",
+                    return_value=(1, json.dumps(result), ""),
+                ),
+                mock.patch.object(run, "_count_gate_admits", return_value=1),
+                mock.patch.object(
+                    run, "_compile_blocked_or_indeterminate",
+                    return_value=False,
+                ),
+            ):
+                receipt = run._fresh_terminal_gate(
+                    tdir=root / "task",
+                    round_number=3,
+                    target=target,
+                    project=root,
+                    experiment_mode="field-floor",
+                    verus_rlimit=80,
+                    experiment_allow_edit=[target],
+                    env={},
+                    lineage_id="lineage",
+                    expected_tree_hash=run.provenance.source_tree_receipt(root)[
+                        "tree_hash"
+                    ],
+                )
+            self.assertTrue(receipt["fresh"])
+            self.assertTrue(receipt["exact_tree_match"])
+            self.assertEqual(receipt["lineage_id"], "lineage")
+            self.assertEqual(receipt["vector"]["hard_admits"], 1)
+            self.assertIn("resource_limits", receipt["vector"])
+            self.assertNotIn("resource_limit_errors", receipt["vector"])
+            promotion = {
+                "schema_version": 2,
+                "decision": "BANKED_PARTIAL",
+                "scoreable": True,
+                "lineage_id": "lineage",
+                "campaign_spec_sha256": "campaign",
+                "terminal_disposition": {
+                    "state": "BANKED_PARTIAL",
+                    "reusable": True,
+                },
+                "final_tree_receipt": receipt["tree_receipt"],
+                "banking_gate_receipt": receipt,
+            }
+            from lib import provenance
+            promotion["receipt_id"] = provenance.receipt_id(promotion)
+            path = root / "promotion.json"
+            path.write_text(json.dumps(promotion))
+            authority = provenance.reusable_seed_authority(path)
+            self.assertEqual(authority["tree_hash"], receipt["tree_receipt"]["tree_hash"])
+
+
+class VectorRelationSharedBody(unittest.TestCase):
+    """One production comparator body, imported by both trust boundaries.
+
+    The ordering lives in lib/frontier.py; run.py and the successor generator
+    must both bind the SAME function object. Divergent copies are the drift
+    class that produced the generator's F2 INITIAL-gap stall (2026-08-03).
+    """
+
+    def test_runner_and_generator_share_the_single_body(self):
+        import run
+        from lib import frontier as shared
+        sys.path.insert(0, str(REPO_ROOT / "docker"))
+        try:
+            import trusted_core_next_package as generator
+        finally:
+            sys.path.pop(0)
+        self.assertIs(run._vector_relation, shared.vector_relation)
+        self.assertIs(generator.frontier.vector_relation, shared.vector_relation)
+        source = (REPO_ROOT / "docker" / "trusted_core_next_package.py").read_text()
+        self.assertNotIn("def _vector_relation", source)
+        self.assertIn("frontier.vector_relation", source)
+
+    def test_transaction_now_regresses_on_verification_increase(self):
+        # Clean-pass semantic strengthening: +verification/-secondary was
+        # previously NEUTRAL in round telemetry; the shared comparator makes
+        # it REGRESSED there too, matching the frontier guard.
+        from lib.frontier import vector_relation
+        relation = vector_relation(
+            {"verification_errors": 54, "resource_limits": 9,
+             "raw_errors": 64, "verified_count": 1580},
+            {"verification_errors": 55, "resource_limits": 7,
+             "raw_errors": 63, "verified_count": 1581},
+            previous_tree_hash="a", current_tree_hash="b",
+            missing_previous="equal",
+        )
+        self.assertEqual(relation, "REGRESSED")
+
+    def test_complete_gate_deduplicates_target_in_allow_edit(self):
+        # F8 review blocker: launch paths routinely pass the target inside
+        # allow-edit too; the COMPLETE counter must not double-count it and
+        # hold a genuinely complete run at a phantom nonzero admit count.
+        import run
+        one_admit = (
+            "verus! {\nproof fn lemma_a()\n    ensures true,\n{\n"
+            "    admit();\n}\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "target.rs"
+            dep1 = root / "dep1.rs"
+            dep2 = root / "dep2.rs"
+            for path in (target, dep1, dep2):
+                path.write_text(one_admit)
+            self.assertEqual(
+                run._count_gate_admits(target, [target, dep1, dep2]), 3,
+            )
+            self.assertEqual(
+                run._count_gate_admits(target, [dep1, dep2]), 3,
+            )
+            self.assertEqual(run._count_gate_admits(target, []), 1)
+
+    def test_missing_previous_keys_compare_equal_in_equal_mode(self):
+        # Absent previous primary/raw keys can never regress; secondaries
+        # keep their registered zero-default (a NEW nonzero secondary against
+        # an empty previous is displacement, matching the pre-consolidation
+        # transaction semantics).
+        from lib.frontier import vector_relation
+        self.assertEqual(
+            vector_relation(
+                {},
+                {"verification_errors": 12, "resource_limits": 0,
+                 "raw_errors": 13, "verified_count": 100},
+                previous_tree_hash="", current_tree_hash="b",
+                missing_previous="equal",
+            ),
+            "NEUTRAL",
+        )
+        self.assertEqual(
+            vector_relation(
+                {},
+                {"verification_errors": 12, "resource_limits": 1,
+                 "raw_errors": 13, "verified_count": 100},
+                previous_tree_hash="", current_tree_hash="b",
+                missing_previous="equal",
+            ),
+            "DISPLACED",
+        )
 
 
 if __name__ == "__main__":

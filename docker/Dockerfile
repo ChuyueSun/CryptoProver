@@ -2,7 +2,7 @@
 #
 # Immutable image for the per-agent Verus proof-synthesis harness (GCP VM).
 #
-# Design (see docker/README.md for the rationale):
+# Design (see docker/README.md and AGENT_DEBATE.md T112 for the rationale):
 #   - The harness (run.py / skills / lib / peel.py / admit.py / prompt.md) is baked
 #     in READ-ONLY at /opt/harness. NEVER overwrite it on a live container — editing
 #     a verification skill mid-run trips the TOOLING gate (-> TOOLING_DRIFT) and
@@ -23,7 +23,7 @@
 #     --build-context verus=/path/to/verus-x86-linux \
 #     --build-context warm=/path/to/dalek-lite \
 #     -f docker/Dockerfile .
-# Pin RUST_TOOLCHAIN to the VM's rustc (1.92.0 on the benchmark VM). Provision
+# Pin RUST_TOOLCHAIN to the VM's rustc (1.92.0 on the build VM). Provision
 # Verus via the `verus` build-context (preferred); --build-arg VERUS_TARBALL_URL=<url>
 # is the fallback. The `warm` context may be EITHER the workspace root (dalek-lite, with
 # a curve25519-dalek/ member) OR the package dir (curve25519-dalek) — the build locates
@@ -86,10 +86,12 @@ ENV PATH="/opt/verus:${PATH}"
 # --- harness (read-only) ---------------------------------------------------
 # Copy only the code the agent runs; results/ and worktrees live on mounted vols.
 WORKDIR /opt/harness
-COPY run.py run_layer.py launch.sh usage_audit.py admit.py peel.py replay.py prompt.md prompt_decompose.md ./
+COPY run.py admit.py peel.py replay.py strip_specs.py usage_audit.py trusted_core_profile.py ./
+COPY prompt.md prompt_decompose.md ./
 COPY skills/ ./skills/
 COPY lib/ ./lib/
 COPY peel_manifests/ ./peel_manifests/
+COPY docker/ ./docker/
 # preflight.sh runs INSIDE the container (README path /opt/harness/docker/preflight.sh);
 # the rest of docker/ is harmless to carry. seal_into_volume.sh runs on the HOST.
 COPY docker/ ./docker/

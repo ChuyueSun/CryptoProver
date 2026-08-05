@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "skills"))
 import peel          # noqa: E402
 import spec_check    # noqa: E402  (skills/spec_check.py — the gate oracle, as a module)
 import lib.admits as admits  # noqa: E402
+import lib.provenance as provenance  # noqa: E402
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -102,6 +103,218 @@ class PeelDepths(unittest.TestCase):
         self.assertIn("lemma_step", rep["deleted"])
         self.assertIn("spec fn abstract_map", out)
         self.assertIn("requires x > 0", out)
+
+    def test_exact_transform_rejects_missing_declared_name(self):
+        _, report = peel.peel_file_text(
+            SRC, 2, path=PATH, lemmas=("missing_lemma",), proof_op="none",
+        )
+        self.assertEqual(report["deleted"], [])
+
+
+class ExactWorktreeTransform(unittest.TestCase):
+    def _repo(self, root):
+        repo = root / "repo"
+        project = repo / "crate"
+        (project / "src").mkdir(parents=True)
+        (repo / "Cargo.toml").write_text(
+            "[workspace]\nresolver = '2'\nmembers = ['crate']\n",
+        )
+        (project / "Cargo.toml").write_text(
+            "[package]\nname = 'crate'\nversion = '0.1.0'\n",
+        )
+        (project / "src" / "lib.rs").write_text(
+            "proof fn lemma_one()\\n"
+            "    ensures true,\\n"
+            "{\\n"
+            "    assert(true);\\n"
+            "}\\n",
+        )
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "-A"], check=True,
+        )
+        subprocess.run(
+            [
+                "git", "-C", str(repo),
+                "-c", "user.email=test@example.com",
+                "-c", "user.name=test",
+                "commit", "-q", "-m", "source",
+            ],
+            check=True,
+        )
+        return repo
+
+    def test_exact_receipt_binds_source_and_observed_deletion(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._repo(root)
+            manifest = {
+                "name": "tiny",
+                "experiment_mode": "field-floor",
+                "depth": 2,
+                "pin": "proof",
+                "files": [{
+                    "path": "crate/src/lib.rs",
+                    "lemmas": ["lemma_one"],
+                    "proof_op": "none",
+                }],
+            }
+            summary = peel.peel_worktree(
+                repo, "HEAD", root / "peeled", 2, manifest,
+                seal=False, require_exact_transform=True,
+                manifest_sha256="manifest-hash",
+            )
+            receipt = summary["transform_receipt"]
+            self.assertEqual(receipt["schema_version"], 3)
+            self.assertTrue(receipt["frozen_surface_unchanged"])
+            self.assertTrue(receipt["post_seal_tree_unchanged"])
+            self.assertEqual(
+                set(receipt["transform"]["tool_sha256"]),
+                set(provenance.PEEL_TRANSFORM_TOOL_PATHS),
+            )
+            self.assertEqual(
+                receipt["transform"]["peeled"][0]["deleted"],
+                ["lemma_one"],
+            )
+            self.assertEqual(
+                receipt["source"]["resolved_commit"],
+                subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip(),
+            )
+            self.assertEqual(len(receipt["receipt_id"]), 64)
+
+    def test_exact_transform_rejects_missing_declared_deletion(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._repo(root)
+            manifest = {
+                "pin": "proof",
+                "files": [{
+                    "path": "crate/src/lib.rs",
+                    "lemmas": ["missing_lemma"],
+                    "proof_op": "none",
+                }],
+            }
+            with self.assertRaisesRegex(ValueError, "deleted names expected"):
+                peel.peel_worktree(
+                    repo, "HEAD", root / "peeled", 2, manifest,
+                    seal=False, require_exact_transform=True,
+                    manifest_sha256="manifest-hash",
+                )
+
+    def test_exact_transform_rejects_duplicate_manifest_path_before_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._repo(root)
+            entry = {
+                "path": "crate/src/lib.rs",
+                "lemmas": ["lemma_one"],
+                "proof_op": "none",
+            }
+            with self.assertRaisesRegex(ValueError, "duplicate manifest path"):
+                peel.peel_worktree(
+                    repo, "HEAD", root / "peeled", 2,
+                    {"pin": "proof", "files": [entry, dict(entry)]},
+                    require_exact_transform=True,
+                    manifest_sha256="manifest-hash",
+                )
+            self.assertFalse((root / "peeled").exists())
+
+    def test_validated_start_rehashes_current_post_seal_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._repo(root)
+            manifest = {
+                "name": "tiny",
+                "experiment_mode": "field-floor",
+                "depth": 2,
+                "pin": "proof",
+                "files": [{
+                    "path": "crate/src/lib.rs",
+                    "lemmas": ["lemma_one"],
+                    "proof_op": "none",
+                }],
+            }
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest))
+            summary = peel.peel_worktree(
+                repo, "HEAD", root / "peeled", 2, manifest,
+                seal=True, require_exact_transform=True,
+                manifest_sha256=provenance.sha256_file(manifest_path),
+            )
+            receipt = summary["transform_receipt"]
+            validation = provenance.validate_peel_start_receipt(
+                receipt,
+                manifest_path=manifest_path,
+                project=Path(summary["project"]),
+                tool_root=Path(peel.__file__).resolve().parent,
+            )
+            self.assertEqual(validation["editable_file_count"], 1)
+            self.assertEqual(validation["observed_deleted_name_count"], 1)
+            changed_tool = json.loads(json.dumps(receipt))
+            changed_tool["transform"]["tool_sha256"]["peel.py"] = "0" * 64
+            changed_tool["receipt_id"] = provenance.receipt_id(changed_tool)
+            with self.assertRaisesRegex(ValueError, "tool hash mismatch"):
+                provenance.validate_peel_start_receipt(
+                    changed_tool,
+                    manifest_path=manifest_path,
+                    project=Path(summary["project"]),
+                    tool_root=Path(peel.__file__).resolve().parent,
+                )
+            changed_head = json.loads(json.dumps(receipt))
+            changed_head["sealed_head"] = "0" * 40
+            changed_head["receipt_id"] = provenance.receipt_id(changed_head)
+            with self.assertRaisesRegex(ValueError, "HEAD does not match"):
+                provenance.validate_peel_start_receipt(
+                    changed_head,
+                    manifest_path=manifest_path,
+                    project=Path(summary["project"]),
+                    tool_root=Path(peel.__file__).resolve().parent,
+                )
+            with self.assertRaisesRegex(
+                ValueError, "does not match registration",
+            ):
+                provenance.validate_peel_start_receipt(
+                    receipt,
+                    manifest_path=manifest_path,
+                    project=Path(summary["project"]),
+                    tool_root=Path(peel.__file__).resolve().parent,
+                    expected_post_tree_hash="0" * 64,
+                )
+            original_manifest = manifest_path.read_text()
+            manifest_path.write_text(original_manifest + "\n")
+            with self.assertRaisesRegex(ValueError, "manifest hash mismatch"):
+                provenance.validate_peel_start_receipt(
+                    receipt,
+                    manifest_path=manifest_path,
+                    project=Path(summary["project"]),
+                    tool_root=Path(peel.__file__).resolve().parent,
+                )
+            manifest_path.write_text(original_manifest)
+            (Path(summary["worktree"]) / "crate" / "src" / "lib.rs").write_text(
+                "proof fn replacement() {}\n"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "current source bytes do not match",
+            ):
+                provenance.validate_peel_start_receipt(
+                    receipt,
+                    manifest_path=manifest_path,
+                    project=Path(summary["project"]),
+                    tool_root=Path(peel.__file__).resolve().parent,
+                )
+
+    def test_launcher_requires_exact_start_and_refuses_direct_reuse(self):
+        launcher = (
+            Path(__file__).resolve().parents[1] / "peel_run.sh"
+        ).read_text()
+        self.assertIn("--require-exact-transform", launcher)
+        self.assertIn("--validate-peel-start", launcher)
+        self.assertIn("--reuse-worktree is disabled", launcher)
+        self.assertNotIn("Proceeding on trust", launcher)
+        self.assertNotIn(".peel_manifest_sha", launcher)
 
     def test_p2_drops_orphan_doc_comment_after_banner_separated_delete(self):
         src = '''\

@@ -6,7 +6,11 @@ walk the artifacts in this order to find the actual cause:
 ```
 results/<run_id>/<task_id>/
 ├── result.json              ← end_reason, success, rounds_used
+├── lineage_context.json     ← scored root/predecessor/tree authority (when present)
+├── predecessor_frontier.json ← copied, hash-bound exhaustive predecessor diagnostics
+├── promotion_receipt.json   ← ACCEPTED, BANKED_PARTIAL, or non-reusable rejection
 ├── round_N.json             ← per-round verus_okay, verus_errors[], spec_drift, end_reason
+├── gate_receipts/*.json     ← exact tree + argv + full canonical error vector
 ├── claude_raw/round_N.lifecycle.json ← pre-spawn/exit lifecycle receipt
 ├── claude_raw/round_N.jsonl ← agent's full reasoning + tool_use stream
 ├── cli.log                  ← which skills the agent invoked, in order
@@ -18,6 +22,81 @@ results/failure_memory.json  ← cumulative; fed back into next run's prompt
 `result.json` says "what". `round_N.json` says "why per round". The
 `claude_raw/*.jsonl` says "what the agent thought". Always read at least
 the first two before jumping to a hypothesis.
+
+**Looking for a PRIOR attempt of the same run-id + target?** Every path
+above names the *live* (most recent) attempt. When `launch.sh` re-launches
+the same run-id + target it first archives the whole previous task
+directory to `results/<run_id>/_usage_history/<launch_instance_id>/<task_id>/`
+— the same layout, one level down — so an "empty" or missing
+`results/<run_id>/<task_id>/` after a relaunch means the artifacts moved,
+not that they were lost. A direct `run.py` rerun (no launcher) instead
+moves only the immutable receipts (promotion/gate/reset-handoff) into the
+task dir's `_superseded_receipts/attempt_<n>/`; round and result JSON are
+overwritten in place.
+
+**Recovered integrity drift is not progress.** A round whose source or frozen
+surface drift is reverted records its apparent pre-revert transaction as audit
+evidence, then replaces it with `classification: REJECTED_RECOVERED` and
+`scoreable: false`. Its restored tree is deliberately marked ungated until a
+fresh verifier receipt covers those exact bytes. If a run reports
+`REJECTED_RECOVERED`, inspect `rejected_transaction`, the restored tree receipt,
+and the next round's gate rather than crediting that round's apparent
+improvement. The forbidden-construct gate similarly freezes the exact
+`(file, owning function/location, numeric value)` rlimit inventory; adding,
+removing, moving, raising, or lowering an rlimit is integrity drift even when
+the attribute count is unchanged. Numeric spellings are compared
+conservatively, so `20` and `20.0` are distinct identities.
+
+**A partial tree is reusable only when explicitly banked.** A scoreable run
+validates `lineage_context.json` against the current source tree before the
+model starts. Every round, gate, result, and promotion carries that lineage ID.
+A plain `LIMIT` remains `UNCOMMITTED_CANDIDATE`; it cannot seed another scored
+leg. `BANKED_PARTIAL` is different: the runner performed a new whole-crate
+gate on the exact final tree after all integrity checks, recorded the full
+hard-admit/raw/verification/resource-limit vector, and marked the disposition
+reusable without calling it scientific success. On replay, inspect
+`predecessor_receipt_id`, require the same campaign/lineage, and verify the
+canonical rebuild-plus-patch tree equals the predecessor tree hash before any
+model call. Scored lineage runs reject operator events and currently suppress
+unbound failure memory and discovery briefs rather than allowing target-only
+context to cross a lineage boundary.
+
+**A continuation frontier must be complete and hash-bound.** The compact
+`lineage_context.json` records the bank tree, canonical vector, deterministic
+owner queue, and the expected SHA/receipt for its frontier sidecar. At launch,
+`run.py` rejects a missing sidecar, a byte-hash mismatch, a receipt/source/tree
+binding mismatch, or a non-canonical queue before any model call. The rendered
+prompt includes only the compact queue and points to the copied exhaustive file
+as `predecessor_frontier.json`; seeing “entire proof layer peeled” in a banked
+continuation prompt indicates stale harness bytes.
+
+**Inspect reset handoffs by reference.** Schema-v3
+`reset_handoff_round_N.json` files contain `current_gate_ref` and
+`last_decided_gate_ref` records. Persisted gates carry immutable paths, SHA256s,
+tree hashes, and vectors; a synthetic drift/recovery gate or an absent first
+decided gate instead carries `persisted:false` plus an explicit reason and no
+invented path/hash. The full tree and verifier payloads live only in persisted
+gate receipts.
+`queue_source: changed_paths` means the current tree differs from the last
+decided tree. `queue_source: current_gate` means it does not, so the queue was
+aggregated from the current gate's exhaustive diagnostic inventory.
+`last_transaction_changed_owners` is separate: it records which Rust files the
+immediately preceding provider transaction actually changed, even when the
+current and last-decided gates are the same.
+
+**A continuation must warm before the provider.**
+`premodel_verifier_warm.json` references the persisted round-0 canonical
+whole-crate gate and binds its byte hash, unchanged pre/post tree hash,
+authoritative vector, and receipt ID. The gate must contain `--whole-crate`
+with the normal 900-second package budget; a focused member-module command can
+fail while cold vstd is compiling and is not a valid warm. Absence, an
+indeterminate result, or unequal tree hashes stops before model contact.
+Runtime indeterminacy writes the same file with `completed:false`, a failure
+class, command/output hashes, and `retryable_infrastructure:true`; the task also
+writes `result.json` with `PREMODEL_GATE_INDETERMINATE`. The durable supervisor
+may back off and retry only after an exact `not_run` audit with zero streams,
+zero provider events, zero unresolved streams, and zero recorded cost; the
+failed warm supplies no gate or frontier authority.
 
 **Ground-truth source.** When comparing the agent's output against a
 "correct" proof, **always pull from a canonical git ref**, never the
@@ -146,6 +225,15 @@ raw/round mismatch, or ambiguous multiple-result stream prevents an exact local
 total. For multiple terminal results, the auditor retains the maximum numeric
 event as a lower-bound contribution and marks the stream unresolved; it does
 not sum potentially cumulative events.
+
+Inspect `round_N.lifecycle.json` when the missing event coincides with the wall
+boundary. `configured_agent_max_turns` is the registered ceiling;
+`effective_agent_max_turns` may be lower when recent completed capped rounds
+predict that the ceiling will not finish before the 60-second drain reserve.
+The `turn_cap` object records the exact observations and calculation, while
+`deadline.graceful_signal_sent` and `deadline.hard_kill_sent` distinguish an
+orderly cap, a drained SIGINT exit, and the final SIGKILL backstop. None of
+these fields substitutes for the provider terminal event.
 
 **Reconcile**: obtain a provider report already isolated to this launch, then
 rerun `usage_audit.py` with the launch envelope's original timestamps and
@@ -371,6 +459,12 @@ the spec/verus gates. A trailing `api_retry` stream becomes
 outcomes, not proof LIMITs. Negative signal exits (for example a
 deadline SIGKILL) stay on the existing timeout/deadline path.
 
+The durable Trust Core supervisor treats `RATE_LIMIT_OR_HANG` as retryable only
+with complete accounting. `PREMODEL_GATE_INDETERMINATE` instead requires the
+exact provider-free `not_run` audit above. Neither is a proof terminal or
+reusable bank. Unknown/incomplete accounting still stops fail-closed rather
+than scheduling another attempt.
+
 ### 7. Spec drift
 
 **Symptom**: end_reason `SPEC_DRIFT`, loop terminated early.
@@ -453,6 +547,111 @@ add --detach <path> eval/admitted-start`) **and** its own `--results` dir
 `failure_memory.json` / `proven_registry.json` / `catalog_cache.json`
 read-modify-write race. See "Creating a clean admitted worktree" in
 README.md / CLAUDE.md / AGENTS.md for the full recipe.
+
+### 11. Whole-crate terminal bank loses partial progress
+
+**Symptom**: a `LIMIT` run contains improved round receipts, but
+`promotion_receipt.json.final_tree_receipt` points to the round-0 seed (or any
+tree worse than an earlier decided frontier).
+
+**Detect**:
+```bash
+jq '{bank: .final_tree_receipt.tree_hash,
+     bank_vector: .banking_gate_receipt.vector,
+     best: .best_decided_gate_receipt.tree_receipt.tree_hash,
+     best_vector: .best_decided_gate_receipt.vector,
+     disposition: .terminal_disposition}' \
+  results/<run>/<task>/promotion_receipt.json
+```
+
+**Cause**: the MVP budget/hang rollback used the most recent fully green
+snapshot. In whole-crate partial-progress mode no intermediate round is green,
+so that pointer remains round 0 even while authoritative gates improve.
+
+A large `bank changes unauthorized paths` list is not evidence of this bug by
+itself. The production peel-manifest schema is `files[].path`; a successor
+generator that reads a fixture-only key such as `editable_files` collapses its
+authority to `Cargo.lock` and rejects every legitimate proof edit. Check the
+manifest schema and the generator's extracted authority before attributing the
+stop to the bank tree. Production-schema regression tests must load the real
+`peel_manifests/trusted_core_floor.json`, not a hand-written surrogate.
+
+**Fix / invariant**: whole-crate rollback uses the best decided partial
+frontier, not the last fully green snapshot. Terminal promotion records that
+frontier and refuses a reusable bank with `state: BANK_DOMINATED`. The
+successor generator independently rechecks bank-versus-frontier ordering and
+tree identity, and derives edit authority from the validated production
+`files[].path` manifest entries plus generated `Cargo.lock`. Missing, empty,
+malformed, absolute, or parent-traversing authority fails closed rather than
+silently authorizing only `Cargo.lock`. Frontier retention is
+verification-primary: any increase in
+verification errors is `REGRESSED`, even if resource limits, raw errors, or
+verified count improve. Since the clean pass (2026-08-03) this is not a
+stricter side-channel: round transaction telemetry, the frontier guard, and
+the successor generator all delegate to the ONE production comparator in
+`lib/frontier.py` (pinned by a shared-body identity test), so a
+`+verification/-secondary` edit reads `REGRESSED` everywhere. Its purpose is
+to prevent primary-metric loss at rollback, terminal banking, and successor
+boundaries. Treat
+`BANK_DOMINATED` as a human-review stop; never manually advance the successor.
+Operational notes from the same pass: (a) the COMPLETE gate and the CLI
+auto-budget share the de-duplicated `_gate_admit_files` editable scope — a
+target listed inside allow-edit is counted once; (b) incidental `429` text in
+a codex error payload is NOT rate-limit authority — only an anchored
+status/HTTP match, the canonical `429 … Too Many Requests` phrasing, or an
+explicit rate-limit phrase classifies 429; (c) a root-leg successor inserts
+exactly the four registered seed roles (`--seed-wip`, `--seed-receipt`,
+`--predecessor-terminal`, `--campaign-state`) after `--launch-registration`,
+never any other option; (d) runner and supervisor routing labels both import
+`lib/taxonomy.py` — never edit either side's sets locally.
+For a root leg with no earlier decided frontier, a decided banking gate is
+classified `INITIAL` and may seed the first successor. A malformed nonempty
+previous receipt or an indeterminate current bank still fails closed.
+
+Because the canonical workspace deliberately ignores generated `Cargo.lock`,
+the isolated cumulative-patch builder must force-stage the validated authorized
+path set. Ordinary `git add` rejects the lock file and makes every honest
+successor fail after authority validation. The force applies only after the
+strict `files[].path` check and only to those paths; it does not widen edit
+authority.
+
+The verifier-policy hook tokenizes shell operators before applying pipe and
+stdout-redirection rules. Operators inside quoted semantic-search/Rust queries
+are data, and fd-2 append redirects such as `2>>file` are stderr-only; neither
+should consume a paid turn as a false policy block. Real unquoted pipelines and
+stdout file redirects remain blocked. Its pre-edit diagnostic guard recognizes
+unstaged changes, staged-only changes, and untracked active source files; an
+agent does not have to keep a legitimate edit unstaged merely to unlock scoped
+verification/search.
+
+### 12. Trust Core launch or continuation fails before promotion
+
+**Symptom**: the scored launcher rejects a registration/seed, or the durable
+supervisor records `STOP_FAIL_CLOSED` even though `result.json` says
+`COMPLETE` or `BANKED_PARTIAL`.
+
+**Invariant**: registration cost, wall-clock, task-minute, and verifier-limit
+numbers must be positive and finite; `NaN` and infinities are invalid JSON
+extensions for authority even though Python can parse them. `plateau_k` is a
+positive integer. A scored predecessor must be a content-addressed schema-v2
+promotion with `scoreable:true`, the correct decision-specific fresh
+exact-tree gate, a canonical non-negative vector, and—when ACCEPTED—a green
+zero-hard-admit result. Legacy unscored ACCEPTED receipts remain usable only
+for ordinary non-Trust-Core resumes. Finally, the registered launcher must
+exit 0 before the supervisor can classify any non-rate-limit terminal;
+`run_agents.sh` exit 45 means terminal/accounting validation failed and can
+never be converted into supervisor completion. `RATE_LIMITED` alone retains
+its explicit, audited 0/42 return-code rule. The supervisor debits every
+attempt—including transport/rate-limit retries—into durable cumulative cost
+and active-launch wall counters before choosing RETRY, ADVANCE, or COMPLETE;
+reaching a registered ceiling stops further attempts, and exceeding one
+invalidates even an otherwise accepted terminal.
+
+Inspect the registration values, predecessor promotion and terminal gate,
+`terminal_validation.json`, `campaign_state.json`, launcher return code, and
+the final `ERROR` ledger event together. Do not repair this class by editing a
+receipt or resetting supervisor state; generate a new registered package from
+the last independently validated authority.
 
 ---
 
