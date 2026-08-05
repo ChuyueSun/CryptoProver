@@ -2,7 +2,9 @@
 
 **Outcome: COMPLETE, reproducible, and cleanly stopped.**
 
-The runner-owned whole-crate Verus gate accepted terminal tree `978872a3850e74067068e8f3ff7375266740b83da37f1f8eaf6ca0cb2ef009c3` with 1,826 verified checks and zero verification, resource-limit, or raw Verus errors. The tree has zero hard admits and 27 intentional axioms. Forbidden-construct, frozen-definition, new-axiom, tooling-drift, and specification-drift inventories were empty. The supervisor then recorded `COMPLETE`, stopped without a successor, and left no campaign containers or network.
+The runner-owned whole-crate Verus gate accepted terminal tree `978872a3850e74067068e8f3ff7375266740b83da37f1f8eaf6ca0cb2ef009c3` with 1,826 verified checks and zero verification, resource-limit, or raw Verus errors. The tree has zero hard admits. Forbidden-construct, frozen-definition, new-axiom, tooling-drift, and specification-drift inventories were empty. The supervisor then recorded `COMPLETE`, stopped without a successor, and left no campaign containers or network.
+
+The terminal receipt's configured inventory reports 27 intentional axioms in its scored scope. A later independent crate-wide census found a broader fixed trust base: 50 pre-existing `axiom_*` functions (48 containing `admit()` and 2 containing `assume()`), 91 pre-existing `#[verifier::external_body]` attribute sites, 6 `assume_specification` declarations, and 6 `#[verifier::external]` functions outside the verified surface. None is among the agent-added forbidden constructs, and all 48 crate-wide admits occur inside `axiom_*` functions. Thus “1,826 verified, zero errors” is a Verus result for the checked surface relative to the fixed specifications, axioms, `vstd`, and toolchain—not an axiom-free result or a verification claim about excluded bodies.
 
 ## Result vector
 
@@ -15,7 +17,7 @@ The terminal run was `tcv14-000003`, used three rounds, and lasted 5,198.193452 
 
 ## Independent green executions
 
-The terminal tree passed four reviewed executions:
+The archived terminal tree passed four reviewed executions:
 
 1. The round-3 runner gate.
 2. A fresh, uncached terminal gate.
@@ -46,7 +48,7 @@ The binary patch is 1,245,606 bytes and modifies exactly 73 tracked paths. The r
 | Seven-line supervisor ledger | `6fc3ad860ed14e9b4562bbe5e37f84335e658c17ce65e9f28936683db71d40f9` |
 | Evidence archive | `eaa79428a6e8f9fe629ac0a2368e661479033fb22557815984a292dbb8c26845` |
 
-The byte-identical evidence archive is `artifacts/trust_core_final_20260804.tar.gz`. It contains selected primary receipts, the patch and lockfile, an internal `SHA256SUMS`, and exact reconstruction instructions.
+The byte-identical evidence archive is `artifacts/trust_core_final_20260804.tar.gz`. It contains selected primary receipts, the patch and lockfile, an internal `SHA256SUMS`, and the reconstruction instructions available at archive time. Two later read-only, networkless audits reproduced the same `1,826 / 0` result; those post-archive executions are independently signed in the campaign review ledger but are not represented as durable receipts inside this archive.
 
 ## Accounting boundary
 
@@ -54,7 +56,9 @@ Cost is the only unresolved result claim. The terminal run records `$36.9268345`
 
 ## Reproduction
 
-Extract the archive and first run its `verify_checksums.sh`. Check out baseline commit `4caeec90e06e53f1ca6b14980f64745caaf85868`, run `git apply --check` and then apply `reconstruction/cumulative.patch`, and copy `reconstruction/Cargo.lock` to the repository root. Require the canonical 726-file source receipt to equal the terminal tree before running the registered gate.
+Extract the archive and first run its `verify_checksums.sh`. The baseline named by the archive, `4caeec90e06e53f1ca6b14980f64745caaf85868`, is a parentless synthetic peel seal rather than a public Git commit. Its contents were independently shown to equal the deterministic peel of public source ref `corefloor-base-103b92b9` at commit `103b92b9ddd93a6a904f7c86a48ec911cf533717`, using `peel_manifests/trusted_core_floor.json` (SHA-256 `06b825104529cd07e2131aa811ca85d6c5cdb203409337fc608cd5042576e9f7`). A fully public replay must recreate that peel with the campaign-pinned `peel.py`; the present archive does not itself record all three of those source/manifest/tool pins and therefore is not yet a standalone public reconstruction bundle.
+
+From the recreated peel, run `git apply --check` and then apply `reconstruction/cumulative.patch`, and copy `reconstruction/Cargo.lock` to the repository root. Require the canonical 726-file source receipt to equal the terminal tree before running the registered gate.
 
 Use verifier image ID `sha256:062b832a08f9740d9865593d82240c5deb2c64fb8a78ab80f956dcba2272fed2`, with networking disabled, the reconstructed source mounted read-only at `/work`, and a fresh writable Cargo target directory:
 

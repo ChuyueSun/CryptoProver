@@ -8,12 +8,13 @@ specifications, field/common arithmetic facts, intentional axioms, and
 specifications and proofs between them, and Verus checks the result. The
 executable Rust code stays unchanged.
 
-This repository accompanies the paper **"An AI Approach to Verified Production
-Cryptographic Libraries."** The paper asks whether an AI agent can work at the
-scale of a production crate, where one proof depends on definitions and lemmas
-spread across many files. Most earlier proof-synthesis evaluations give the
-model one theorem, function, or module with the relevant specification already
-in scope. CryptoProver instead treats the library as the unit of work.
+This repository accompanies the paper [**"An AI Approach to Verified
+Production Cryptographic Libraries"**](https://arxiv.org/abs/2608.00965). The
+paper asks whether an AI agent can work at the scale of a production crate,
+where one proof depends on definitions and lemmas spread across many files.
+Most earlier proof-synthesis evaluations give the model one theorem, function,
+or module with the relevant specification already in scope. CryptoProver
+instead treats the library as the unit of work.
 
 > CryptoProver proves code relative to the supplied contracts and trusted
 > facts. It does not decide whether those contracts fully capture the intended
@@ -40,26 +41,49 @@ the agent in an isolated environment without the reference proof.
 
 ## Results in brief
 
-### Strongest accepted VM1 result by declared scope
+### Strongest accepted Trust Core result
 
-After the field-floor evaluation reported in the paper, CryptoProver completed
-a cumulative verification continuation under the declared trusted-core
-manifest. The manifest is a strict proof-obligation superset of field-floor: it
-assigns every in-repository non-axiom proof artifact to the agent while
-continuing to freeze executable code, public API contracts, specification
-definitions, axioms, and external `vstd`. The terminal tree passed the
-runner-owned whole-crate verification gate with zero failures and was accepted
-for promotion.
+After the field-floor evaluation reported in the
+[paper](https://arxiv.org/abs/2608.00965), CryptoProver completed the broader
+Trust Core continuation. The runner-owned whole-crate gate accepted the exact
+726-file terminal tree
+`978872a3850e74067068e8f3ff7375266740b83da37f1f8eaf6ca0cb2ef009c3`
+with **1,826 checks verified and zero verification, resource-limit, or raw
+Verus errors**. The crate-wide final tree contains zero hard admits. The
+campaign moved from 83 verification errors, 8 resource-limit obligations, and
+1,527 verified checks at its promoted start to `0 / 0 / 1,826`, then stopped
+without launching a successor.
 
-This is the strongest accepted VM1 result in declared proof-obligation scope,
-but it is not a cold-start trusted-core result. The successful chain began from
-a field-floor peel and later reused that partially reconstructed tree under the
-trusted-core manifest; no starting-tree-equivalence receipt establishes a fresh
-trusted-core peel. The result therefore demonstrates package verification by
-cumulative continuation under the broader declared scope, not reconstruction
-of the entire trusted-core peel from scratch. See the
-[trusted-core continuation record](docs/run_stats/trusted_core_continuation_record.md)
-and [field-layer census](docs/run_stats/field_layer_agent_vs_gt_gcp31.md).
+The archived evidence includes four reviewed green executions. The strongest
+reproduction starts from the sealed peel state, applies one cumulative binary
+patch plus the separately sealed `Cargo.lock`, reconstructs the terminal tree
+exactly, and verifies it again in the pinned image with networking disabled and
+the source mounted read-only. The patch changes 73 tracked paths and adds no
+`admit()`, `assume()`, `external_body`, `assume_specification`,
+`verifier::external`, per-function `rlimit`, or `axiom_*` definition. It removes
+no existing function or contract clause. All terminal-run model receipts name
+only `claude-fable-5`, and every integrity-drift inventory is empty.
+
+This is a result relative to the declared trust base, not an axiom-free proof.
+A post-result crate-wide census found 50 pre-existing `axiom_*` functions (48
+containing `admit()` and 2 containing `assume()`), 91 pre-existing
+`external_body` attribute sites, 6 `assume_specification` declarations, and 6
+`verifier::external` functions outside the verified surface. None was added or
+changed by the agent. Consequently, “1,826 verified, zero errors” applies to
+the Verus-checked surface under the fixed specifications, axioms, `vstd`, and
+toolchain; it does not independently establish those assumptions or the
+excluded function bodies.
+
+The paper's field-floor experiment and this later Trust Core continuation use
+different fixed starting surfaces; that is why the paper-evaluation summary
+below reports 48 pre-existing axioms while this terminal-tree census reports
+50.
+
+See the [final result record](docs/run_stats/trusted_core_final_results.md),
+the checked-in [evidence archive](artifacts/trust_core_final_20260804.tar.gz),
+the earlier
+[trusted-core continuation record](docs/run_stats/trusted_core_continuation_record.md),
+and the [field-layer census](docs/run_stats/field_layer_agent_vs_gt_gcp31.md).
 
 ### Paper evaluation
 
