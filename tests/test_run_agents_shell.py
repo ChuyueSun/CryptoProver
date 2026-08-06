@@ -17,6 +17,13 @@ def shell_function(source: str, name: str, following_marker: str) -> str:
 
 
 class RunAgentsShellTests(unittest.TestCase):
+    def test_custom_provider_policy_is_the_proxy_policy(self):
+        source = RUN_AGENTS.read_text()
+        self.assertIn(
+            '-v "$PROVIDER_POLICY:/run/provider-proxy-policy.json:ro"', source,
+        )
+        self.assertIn('--policy /run/provider-proxy-policy.json', source)
+
     def test_trusted_core_rate_limit_is_not_shadowed_by_terminal_validation(self):
         source = RUN_AGENTS.read_text()
         kill_agent_tap = shell_function(

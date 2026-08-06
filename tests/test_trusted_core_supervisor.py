@@ -11,6 +11,13 @@ SUPERVISOR = ROOT / "docker" / "trusted_core_supervisor.py"
 
 
 class TrustedCoreSupervisorTests(unittest.TestCase):
+    @staticmethod
+    def _seal_package(package: dict) -> None:
+        package.pop("package_id", None)
+        package["package_id"] = hashlib.sha256(json.dumps(
+            package, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+
     def _fixture(self, root: Path, mode: str, *, audit_complete: bool = True):
         immutable = root / "registration.json"
         immutable.write_text(json.dumps({
@@ -56,7 +63,6 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
         campaign.write_text(json.dumps({"stop": False, "stop_reasons": []}))
         package = {
             "schema_version": 1,
-            "package_id": "sealed-package",
             "run_id_prefix": "tc-auto",
             "prelaunch_argv": ["python3", "-c", "pass"],
             "launch_argv": [
@@ -72,6 +78,7 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
                 "sha256": hashlib.sha256(immutable.read_bytes()).hexdigest(),
             }],
         }
+        self._seal_package(package)
         package_path = root / "package.json"
         package_path.write_text(json.dumps(package))
         return package_path
@@ -220,6 +227,7 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             package_value["immutable_inputs"][0]["sha256"] = hashlib.sha256(
                 registration.read_bytes()
             ).hexdigest()
+            self._seal_package(package_value)
             package.write_text(json.dumps(package_value))
             (root / "state.json").write_text(json.dumps({
                 "schema_version": 1,
@@ -284,6 +292,33 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             events = [json.loads(line) for line in (root / "ledger.jsonl").read_text().splitlines()]
             self.assertEqual(events[-1]["event"], "ERROR")
             self.assertEqual(events[-1]["next_action"], "STOP_FAIL_CLOSED")
+
+    def test_package_command_mutation_between_retries_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = self._fixture(root, "rate")
+            first = self._run(root, package)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            state_path = root / "state.json"
+            state = json.loads(state_path.read_text())
+            state["next_attempt_epoch"] = 0
+            state_path.write_text(json.dumps(state))
+
+            mutated = json.loads(package.read_text())
+            mutated["launch_argv"][4] = "complete"
+            self._seal_package(mutated)
+            package.write_text(json.dumps(mutated))
+            second = self._run(root, package)
+
+            self.assertEqual(second.returncode, 2)
+            self.assertIn("persisted package_id", second.stderr)
+            final = json.loads(state_path.read_text())
+            self.assertEqual(final["status"], "error")
+            events = [json.loads(line) for line in
+                      (root / "ledger.jsonl").read_text().splitlines()]
+            self.assertEqual(
+                [event["event"] for event in events].count("LAUNCH"), 1,
+            )
 
 
 class TaxonomyParity(unittest.TestCase):

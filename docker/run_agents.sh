@@ -184,6 +184,7 @@ esac
 command -v docker >/dev/null || die "docker not on PATH"
 if [ "$PROVIDER_ONLY" = "1" ]; then
     [ -f "$PROVIDER_POLICY" ] || die "provider policy not found: $PROVIDER_POLICY"
+    PROVIDER_POLICY="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$PROVIDER_POLICY")"
     [ "$TAP" = "0" ] || die "--provider-only-network cannot use host --tap; the fixed sidecar is the sole egress"
     [ -z "$REGISTRY_RO" ] || die "--provider-only-network forbids extra --registry-ro mounts"
     PROVIDER_POLICY_SHA256="$(python3 - "$repo" "$PROVIDER_POLICY" <<'PY'
@@ -553,9 +554,10 @@ start_provider_network() {
         || { echo "provider network was not created internal" >&2; return 1; }
     docker run -d --init --name "$PROVIDER_PROXY_NAME" \
         --network "$PROVIDER_NETWORK" --network-alias provider-proxy \
+        -v "$PROVIDER_POLICY:/run/provider-proxy-policy.json:ro" \
         "$IMAGE" \
         python3 /opt/harness/docker/provider_proxy.py \
-            --policy /opt/harness/docker/provider_proxy_policy.json \
+            --policy /run/provider-proxy-policy.json \
             --host 0.0.0.0 --port 8080 >/dev/null \
         || { echo "failed to start fixed provider proxy" >&2; return 1; }
     docker network connect bridge "$PROVIDER_PROXY_NAME" \

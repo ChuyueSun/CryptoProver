@@ -21,11 +21,27 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-_IGNORED_DIRS = frozenset({
-    ".git", "target", "results", "claude_raw", "claude_memory",
-    "__pycache__", ".mypy_cache", ".pytest_cache",
+_ALWAYS_IGNORED_DIRS = frozenset({
+    ".git", "__pycache__", ".mypy_cache", ".pytest_cache",
+})
+_CARGO_OUTPUT_DIRS = frozenset({
+    "target", "results", "claude_raw", "claude_memory",
 })
 _IGNORED_FILES = frozenset({".DS_Store", ".git"})
+_LITERAL_RUST_INCLUDE = re.compile(
+    r"\b(?:include|include_str|include_bytes)!\s*\(\s*\"([^\"]+)\"\s*\)"
+)
+_LITERAL_RUST_INCLUDE_RAW = re.compile(
+    r"\b(?:include|include_str|include_bytes)!\s*\(\s*r(?P<hashes>#{0,255})"
+    r"\"(?P<path>[^\"]+)\"(?P=hashes)\s*\)"
+)
+_LITERAL_RUST_PATH = re.compile(
+    r"#\s*\[\s*path\s*=\s*\"([^\"]+)\"\s*\]"
+)
+_LITERAL_RUST_PATH_RAW = re.compile(
+    r"#\s*\[\s*path\s*=\s*r(?P<hashes>#{0,255})"
+    r"\"(?P<path>[^\"]+)\"(?P=hashes)\s*\]"
+)
 PEEL_TRANSFORM_TOOL_PATHS = (
     "peel.py",
     "admit.py",
@@ -732,14 +748,65 @@ def workspace_root(project: Path) -> Path:
 
 def _iter_relevant_files(root: Path) -> Iterable[Path]:
     for current, dirs, names in os.walk(root, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in _IGNORED_DIRS)
         base = Path(current)
+        dirs[:] = sorted(
+            directory for directory in dirs
+            if directory not in _ALWAYS_IGNORED_DIRS
+            and not (
+                directory in _CARGO_OUTPUT_DIRS
+                and (base == root or (base / "Cargo.toml").is_file())
+            )
+        )
         for name in sorted(names):
             if name in _IGNORED_FILES:
                 continue
             path = base / name
             if path.is_file() or path.is_symlink():
                 yield path
+
+
+def _literal_rust_include_files(root: Path, initial: Iterable[Path]) -> list[Path]:
+    """Return literal Rust include inputs, including those below ignored dirs.
+
+    Build outputs remain excluded from the ordinary walk, but a source file can
+    make any byte sequence compiler-visible with include!/include_str!/
+    include_bytes!. Those explicit dependencies must therefore enter the exact
+    source identity even when their directory is normally generated/noisy.
+    Dynamic include expressions are derived from already-receipted source/build
+    inputs and are checked by the fresh terminal build; literal paths are the
+    direct mutable-input hole this closure prevents.
+    """
+    pending = list(initial)
+    seen = {path.resolve() for path in pending}
+    included: list[Path] = []
+    while pending:
+        source = pending.pop()
+        if source.suffix != ".rs" or source.is_symlink():
+            continue
+        try:
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        dependencies = [
+            *_LITERAL_RUST_INCLUDE.findall(text),
+            *_LITERAL_RUST_PATH.findall(text),
+            *(match.group("path") for match in _LITERAL_RUST_INCLUDE_RAW.finditer(text)),
+            *(match.group("path") for match in _LITERAL_RUST_PATH_RAW.finditer(text)),
+        ]
+        for raw in dependencies:
+            candidate = (source.parent / raw).resolve()
+            try:
+                candidate.relative_to(root.resolve())
+            except ValueError as exc:
+                raise ValueError(
+                    f"literal Rust include escapes workspace: {source}: {raw}"
+                ) from exc
+            if not candidate.is_file() or candidate in seen:
+                continue
+            seen.add(candidate)
+            included.append(candidate)
+            pending.append(candidate)
+    return included
 
 
 def _file_entry(path: Path, root: Path) -> dict[str, Any]:
@@ -774,7 +841,10 @@ def source_tree_receipt(project: Path) -> dict[str, Any]:
     opaque hash.
     """
     root = workspace_root(project)
-    files = [_file_entry(path, root) for path in _iter_relevant_files(root)]
+    walked = list(_iter_relevant_files(root))
+    explicit_inputs = _literal_rust_include_files(root, walked)
+    paths = sorted({*walked, *explicit_inputs}, key=lambda path: path.relative_to(root).as_posix())
+    files = [_file_entry(path, root) for path in paths]
     canonical = canonical_json_bytes(files)
     return {
         "schema_version": 1,
@@ -782,7 +852,16 @@ def source_tree_receipt(project: Path) -> dict[str, Any]:
         "file_count": len(files),
         "tree_hash": hashlib.sha256(canonical).hexdigest(),
         "files": files,
+        "literal_compiler_inputs": sorted(
+            path.relative_to(root).as_posix() for path in explicit_inputs
+        ),
     }
+
+
+def supervisor_package_id(package: dict[str, Any]) -> str:
+    """Content identity for a supervisor package, excluding its ID field."""
+    content = {key: value for key, value in package.items() if key != "package_id"}
+    return hashlib.sha256(canonical_json_bytes(content)).hexdigest()
 
 
 def gate_signature(command: Iterable[str], *, tool_paths: Iterable[Path] = ()) -> dict[str, Any]:

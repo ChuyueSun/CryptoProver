@@ -58,6 +58,20 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
         ("direct verus no pipe", "Bash",
          {"command": "cd /work/curve25519-dalek && verus src/lib.rs --crate-type=lib"},
          True),
+        ("command-prefixed direct verus", "Bash",
+         {"command": "command verus src/lib.rs"}, True),
+        ("env-prefixed direct verus", "Bash",
+         {"command": "env VERUS_Z3_PATH=/tmp/z3 verus src/lib.rs"}, True),
+        ("exec-prefixed direct verus", "Bash",
+         {"command": "exec verus src/lib.rs"}, True),
+        ("assignment-prefixed direct verus", "Bash",
+         {"command": "VERUS_Z3_PATH=/tmp/z3 verus src/lib.rs"}, True),
+        ("variable-expanded direct verus", "Bash",
+         {"command": "V=verus; $V src/lib.rs"}, True),
+        ("bash-c direct verus", "Bash",
+         {"command": "bash -c 'verus src/lib.rs'"}, True),
+        ("sh-c direct verus", "Bash",
+         {"command": "sh -c 'verus src/lib.rs'"}, True),
         ("verus_check tail slice", "Bash",
          {"command": "python3 /opt/harness/skills/verus_check.py "
                      "/work/curve25519-dalek/src/ristretto.rs --project /work/curve25519-dalek "
@@ -119,6 +133,30 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
          {"command": "python3 verus_check.py x --project /p 1>| /work/out.json"}, True),
         ("verifier merged redirect shorthand", "Bash",
          {"command": "python3 verus_check.py x --project /p >& /work/out.json"}, True),
+        ("verifier stderr to inherited stdout", "Bash",
+         {"command": "python3 verus_check.py x --project /p >&2"}, False),
+        ("literal two argument does not hide stdout redirect", "Bash",
+         {"command": "python3 verus_check.py x --project /p --rlimit 2 > out.json"}, True),
+        ("fd marker text cannot forge stderr redirect", "Bash",
+         {"command": "bash -c 'python3 skills/verus_check.py x --project /p' "
+                     "__DALEK_FD2__ > out.json"}, True),
+        ("quoted marker concatenation cannot forge stderr redirect", "Bash",
+         {"command": "bash -c 'python3 skills/verus_check.py x --project /p' "
+                     "__DALEK\"_FD2__\" > out.json"}, True),
+        ("bash-c verifier stdout redirect", "Bash",
+         {"command": "bash -c 'python3 skills/verus_check.py x --project /p > out.json'"}, True),
+        ("bash-c verifier output slice", "Bash",
+         {"command": "bash -c 'python3 skills/verus_check.py x --project /p | head -5'"}, True),
+        ("bash option before c verifier redirect", "Bash",
+         {"command": "bash -o pipefail -c 'python3 skills/verus_check.py x --project /p > out.json'"}, True),
+        ("bash long option before c verifier slice", "Bash",
+         {"command": "bash --noprofile -c 'python3 skills/verus_check.py x --project /p | head -5'"}, True),
+        ("bash norc before c direct verus", "Bash",
+         {"command": "bash --norc -c 'verus src/lib.rs'"}, True),
+        ("exec inherited stdout capture", "Bash",
+         {"command": "exec > /work/wc.json; python3 verus_check.py x --project /p"}, True),
+        ("group inherited stdout capture", "Bash",
+         {"command": "{ python3 verus_check.py x --project /p; } > /work/wc.json"}, True),
         ("hash inside token cannot hide pipeline", "Bash",
          {"command": "python3 verus_check.py foo#bar --project /p | head -1"}, True),
         ("real shell comment hides non-executed pipeline", "Bash",
@@ -306,12 +344,28 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
             variable = evaluate("Bash", {
                 "command": "python3 /opt/harness/skills/verus_check.py x --project /p --timeout $N"
             })
+            quoted_name = evaluate("Bash", {
+                "command": "python3 /opt/harness/skills/verus_check.py x --project /p --timeout\"\" 1800"
+            })
+            quoted_option = evaluate("Bash", {
+                "command": "python3 /opt/harness/skills/verus_check.py x --project /p \"--timeout\" 1800"
+            })
+            escaped_name = evaluate("Bash", {
+                "command": "python3 /opt/harness/skills/verus_check.py x --project /p --timeou\\t 1800"
+            })
+            malformed_quote = evaluate("Bash", {
+                "command": "python3 /opt/harness/skills/verus_check.py x --project /p --timeout 99999 \""
+            })
         self.assertIn("whole-crate verifier is runner-owned for this experiment", whole)
         self.assertTrue(cap_tripped(slow), slow)
         self.assertEqual(focused, [])
         self.assertTrue(cap_tripped(equals_slow), equals_slow)
         self.assertEqual(equals_ok, [])
         self.assertTrue(cap_tripped(variable), variable)
+        self.assertTrue(cap_tripped(quoted_name), quoted_name)
+        self.assertTrue(cap_tripped(quoted_option), quoted_option)
+        self.assertTrue(cap_tripped(escaped_name), escaped_name)
+        self.assertTrue(cap_tripped(malformed_quote), malformed_quote)
 
 
 if __name__ == "__main__":

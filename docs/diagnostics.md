@@ -653,6 +653,30 @@ the final `ERROR` ledger event together. Do not repair this class by editing a
 receipt or resetting supervisor state; generate a new registered package from
 the last independently validated authority.
 
+The durable supervisor package is itself content-addressed: `package_id` is
+the canonical hash of every package field other than `package_id`. Any command,
+path, input inventory, or budget-routing mutation between retries therefore
+fails before prelaunch and records an `error` state. When generating or
+repairing a package, recompute it through the package generator; never edit the
+JSON or its ID independently.
+
+### 13. An integrity gate appears green after a new helper or baseline edit
+
+**Symptom**: a proof compiles through a newly created Rust helper, or an
+agent-side `spec_check` says a weakened contract matches after the snapshot was
+rewritten.
+
+**Invariant**: the frozen-path audit includes Git-untracked files, not only
+`git diff HEAD`; new paths outside the declared edit set are `FROZEN_EDIT`.
+The runner's `spec_snapshot.authority.json` is SHA-256-bound in process and is
+distinct from the agent-facing `spec_snapshot.json`; changing or removing the
+authority copy is `SPEC_DRIFT`. Source-tree identity also includes every
+literal Rust `include!`, `include_str!`, `include_bytes!`, or `#[path]` input
+even when it lives below `results/`, `target/`, or another ordinarily ignored
+directory; a new or changed off-walk compiler input is `FROZEN_EDIT`.
+Inspect the frozen-path list, both snapshot files, and the final source receipt
+before trusting the apparent green.
+
 ---
 
 ## Triage flowchart

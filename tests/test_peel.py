@@ -35,6 +35,15 @@ import lib.admits as admits  # noqa: E402
 import lib.provenance as provenance  # noqa: E402
 
 
+class PeelLauncherPreflight(unittest.TestCase):
+    def test_real_launch_checks_toolchain_before_worktree_build(self):
+        source = (Path(__file__).resolve().parents[1] / "peel_run.sh").read_text()
+        preflight = source.index("command -v cargo-verus")
+        build = source.index('PEEL_JSON="$(build_peel_worktree_locked')
+        self.assertLess(preflight, build)
+        self.assertIn("command -v claude", source[preflight:build])
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # A. UNIT TRANSFORMS
 # ═════════════════════════════════════════════════════════════════════════════

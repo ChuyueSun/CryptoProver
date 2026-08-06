@@ -353,11 +353,11 @@ def updated_package(
         {"path": str(path), "sha256": _sha(path)}
         for path in sorted(set(preserved) | new_role_paths, key=str)
     ]
-    identity = hashlib.sha256(
-        provenance.canonical_json_bytes(inputs)
-    ).hexdigest()
-    return {**current, "package_id": identity, "launch_argv": argv,
-            "immutable_inputs": inputs}
+    updated = {**current, "launch_argv": argv, "immutable_inputs": inputs}
+    return {
+        **updated,
+        "package_id": provenance.supervisor_package_id(updated),
+    }
 
 
 def generate(args: argparse.Namespace) -> None:

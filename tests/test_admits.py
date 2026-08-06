@@ -13,6 +13,7 @@ Run: `python3 -m unittest tests.test_admits`
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -508,6 +509,116 @@ class FrozenEditRecoveryFeedback(unittest.TestCase):
         self.assertEqual(paths, [])
         self.assertIsNotNone(err)
         self.assertIn("git diff rc=", err)
+
+    def test_frozen_git_audit_rejects_untracked_helper(self):
+        from run import _frozen_paths_changed_from_git
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            allowed = root / "src" / "allowed.rs"
+            allowed.parent.mkdir()
+            allowed.write_text("pub fn allowed() {}\n")
+            subprocess.run(["git", "-C", str(root), "add", "src/allowed.rs"], check=True)
+            subprocess.run([
+                "git", "-C", str(root), "-c", "user.name=test", "-c",
+                "user.email=test@example.com", "commit", "-q", "-m", "base",
+            ], check=True)
+            allowed.write_text("mod evil; pub fn allowed() { evil::cheat(); }\n")
+            (root / ".gitignore").write_text("src/evil.rs\n")
+            subprocess.run(["git", "-C", str(root), "add", ".gitignore"], check=True)
+            subprocess.run([
+                "git", "-C", str(root), "-c", "user.name=test", "-c",
+                "user.email=test@example.com", "commit", "-q", "-m", "ignore",
+            ], check=True)
+            (root / "src" / "evil.rs").write_text(
+                "#[verifier::external_body] pub proof fn cheat() {}\n"
+            )
+
+            paths, err = _frozen_paths_changed_from_git(
+                root, {"src/allowed.rs"},
+            )
+
+            self.assertIsNone(err)
+            self.assertEqual(paths, ["src/evil.rs"])
+
+    def test_untracked_audit_does_not_hide_source_directory_named_target(self):
+        from run import _untracked_paths_changed_from_git
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n")
+            (root / ".gitignore").write_text("target/\n**/target/\n")
+            subprocess.run(["git", "-C", str(root), "add", "Cargo.toml", ".gitignore"], check=True)
+            subprocess.run([
+                "git", "-C", str(root), "-c", "user.name=test", "-c",
+                "user.email=test@example.com", "commit", "-q", "-m", "base",
+            ], check=True)
+            (root / "target").mkdir()
+            (root / "target" / "artifact").write_text("noise")
+            (root / "src" / "target").mkdir(parents=True)
+            (root / "src" / "target" / "mod.rs").write_text(
+                "#[verifier::external_body] proof fn cheat() {}\n"
+            )
+            paths, err = _untracked_paths_changed_from_git(root)
+            self.assertIsNone(err)
+            self.assertEqual(paths, ["src/target/mod.rs"])
+
+    def test_bound_spec_baseline_detects_overwrite_and_removal(self):
+        from run import _bound_file_intact
+        with tempfile.TemporaryDirectory() as td:
+            snapshot = Path(td) / "spec_snapshot.authority.json"
+            original = b'{"functions": [{"ensures": "x > 0"}]}\n'
+            snapshot.write_bytes(original)
+            expected = hashlib.sha256(original).hexdigest()
+            self.assertTrue(_bound_file_intact(snapshot, expected))
+            snapshot.write_text('{"functions": [{"ensures": "true"}]}\n')
+            self.assertFalse(_bound_file_intact(snapshot, expected))
+            snapshot.unlink()
+            self.assertFalse(_bound_file_intact(snapshot, expected))
+
+    def test_literal_compiler_input_drift_rejects_new_or_changed_input(self):
+        from run import _literal_compiler_input_drift
+        baseline = {
+            "literal_compiler_inputs": ["crate/results/generated.rs"],
+            "files": [{"path": "crate/results/generated.rs", "sha256": "one"}],
+        }
+        changed = {
+            "literal_compiler_inputs": ["crate/results/generated.rs"],
+            "files": [{"path": "crate/results/generated.rs", "sha256": "two"}],
+        }
+        added = {
+            "literal_compiler_inputs": [
+                "crate/results/generated.rs", "crate/target/evil.rs",
+            ],
+            "files": [
+                {"path": "crate/results/generated.rs", "sha256": "one"},
+                {"path": "crate/target/evil.rs", "sha256": "evil"},
+            ],
+        }
+        self.assertEqual(
+            _literal_compiler_input_drift(baseline, changed),
+            ["crate/results/generated.rs"],
+        )
+        self.assertEqual(
+            _literal_compiler_input_drift(baseline, added),
+            ["crate/target/evil.rs"],
+        )
+
+    def test_active_edit_scope_remains_narrower_than_allow_edit(self):
+        from run import _declared_edit_scope
+        target = Path("target.rs")
+        allowed = [Path("active.rs"), Path("inactive_pin.rs")]
+        active = [Path("active.rs")]
+        self.assertEqual(
+            _declared_edit_scope(target, [], allowed, active), active,
+        )
+        self.assertEqual(
+            _declared_edit_scope(target, [], allowed, []), allowed,
+        )
+        self.assertEqual(
+            _declared_edit_scope(target, [Path("sibling.rs")], [], []),
+            [target, Path("sibling.rs")],
+        )
 
     def test_sibling_failures_are_flattened_into_verus_diagnostics(self):
         from run import _flatten_sibling_fail_messages
@@ -3169,8 +3280,9 @@ class RetryMemoryTaint(unittest.TestCase):
     def test_tooling_gate_covers_top_level_and_post_run_authority(self):
         source = (REPO_ROOT / "run.py").read_text()
         for marker in (
-            '"prompt.md"', '"usage_audit.py"', '"trusted_core_profile.py"',
-            'HERE.glob("docker/*.py")', 'HERE.glob("docker/*.json")',
+            'HERE.glob("*.py")', 'HERE.glob("*.sh")',
+            'HERE.glob("prompt*.md")', 'HERE.glob("docker/**/*.py")',
+            'HERE.glob("docker/**/*.json")', 'HERE.glob("scripts/**/*.py")',
         ):
             self.assertIn(marker, source)
 

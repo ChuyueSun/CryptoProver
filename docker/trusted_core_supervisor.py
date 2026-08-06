@@ -25,7 +25,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
-from lib import taxonomy  # noqa: E402
+from lib import provenance, taxonomy  # noqa: E402
 
 # Routing sets come from the single shared taxonomy (lib/taxonomy.py) — the
 # hand-copied versions of these two sets drifted from the runner's emitted
@@ -121,6 +121,11 @@ def _validate_package(path: Path) -> dict[str, Any]:
         expected = entry.get("sha256")
         if not source.is_file() or _sha256(source) != expected:
             raise SupervisorError(f"immutable input mismatch: {source}")
+    expected_package_id = provenance.supervisor_package_id(package)
+    if package.get("package_id") != expected_package_id:
+        raise SupervisorError(
+            "supervisor package_id does not bind the package contents"
+        )
     return package
 
 
@@ -397,7 +402,21 @@ def run(args: argparse.Namespace) -> int:
                     while time.time() < prior_wake:
                         time.sleep(min(60.0, prior_wake - time.time()))
             package_path = Path(state["package_path"])
-            package = _validate_package(package_path)
+            try:
+                package = _validate_package(package_path)
+            except SupervisorError as exc:
+                state.update({"status": "error", "terminal": {"error": str(exc)}})
+                _atomic_json(state_path, state)
+                raise
+            persisted_package_id = state.get("package_id")
+            if (persisted_package_id is not None
+                    and persisted_package_id != package["package_id"]):
+                exc = SupervisorError(
+                    "supervisor package does not match the persisted package_id"
+                )
+                state.update({"status": "error", "terminal": {"error": str(exc)}})
+                _atomic_json(state_path, state)
+                raise exc
             attempt = int(state.get("attempt") or 0) + 1
             run_id = f"{package['run_id_prefix']}-{attempt:06d}"
             if len(run_id) > 40:
@@ -474,6 +493,7 @@ def run(args: argparse.Namespace) -> int:
                     _atomic_json(state_path, state)
                     raise
                 state.update({"package_path": str(next_path), "status": "ready",
+                              "package_id": _validate_package(next_path)["package_id"],
                               "next_trigger": "BANKED_PARTIAL", "retry_streak": 0})
                 _atomic_json(state_path, state)
                 if args.once:

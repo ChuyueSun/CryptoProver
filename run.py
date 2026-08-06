@@ -1778,7 +1778,110 @@ def _frozen_paths_changed_from_git(
         else:
             detail = f"rc={proc.returncode}"
         return [], f"git diff rc={proc.returncode}: {detail}"
-    return _frozen_paths_from_diff_name_status_z(proc.stdout, allow_edit_rel), None
+    frozen = _frozen_paths_from_diff_name_status_z(proc.stdout, allow_edit_rel)
+    untracked_paths, untracked_error = _untracked_paths_changed_from_git(
+        project, env=env,
+    )
+    if untracked_error:
+        return [], untracked_error
+    for path in untracked_paths:
+        if path not in allow_edit_rel and path not in frozen:
+            frozen.append(path)
+    return sorted(frozen), None
+
+
+def _untracked_paths_changed_from_git(
+    project: Path,
+    env: Optional[dict[str, str]] = None,
+) -> tuple[list[str], Optional[str]]:
+    """Enumerate untracked paths; unlike git diff, these may be compiler inputs."""
+    commands = (
+        ["git", "-C", str(project), "ls-files", "--others",
+         "--exclude-standard", "--full-name", "-z"],
+        ["git", "-C", str(project), "ls-files", "--others", "--ignored",
+         "--exclude-standard", "--full-name", "-z"],
+    )
+    outputs = []
+    try:
+        for command in commands:
+            completed = subprocess.run(
+                command, env=env, capture_output=True, text=True, timeout=30,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "").strip()
+                return [], f"git ls-files rc={completed.returncode}: {detail[-1000:]}"
+            outputs.append(completed.stdout)
+    except Exception as e:
+        return [], f"git untracked-file audit failed: {e!r}"
+
+    try:
+        gitroot_result = subprocess.run(
+            ["git", "-C", str(project), "rev-parse", "--show-toplevel"],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+        if gitroot_result.returncode != 0:
+            return [], "cannot resolve git root for ignored-path audit"
+        gitroot = Path(gitroot_result.stdout.strip())
+    except Exception as e:
+        return [], f"git root audit failed: {e!r}"
+
+    def _generated_noise(path: str) -> bool:
+        current = gitroot
+        for component in Path(path).parts:
+            if component in {"__pycache__", ".mypy_cache", ".pytest_cache", ".verilib"}:
+                return True
+            if (component in {"target", "results", "claude_raw", "claude_memory"}
+                    and (current == gitroot or (current / "Cargo.toml").is_file())):
+                return True
+            current /= component
+        return False
+
+    return sorted(
+        {
+            path
+            for output in outputs
+            for path in output.split("\0")
+            if path and not _generated_noise(path)
+        }
+    ), None
+
+
+def _bound_file_intact(path: Path, expected_sha256: str) -> bool:
+    """Fail-closed equality check for an authority file exposed on disk."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest() == expected_sha256
+    except OSError:
+        return False
+
+
+def _literal_compiler_input_drift(baseline: dict, current: dict) -> list[str]:
+    """Detect new/changed compiler inputs that live below ignored directories."""
+    def _entries(receipt: dict) -> dict[str, str]:
+        explicit = set(receipt.get("literal_compiler_inputs") or [])
+        return {
+            str(entry.get("path")): str(entry.get("sha256"))
+            for entry in receipt.get("files") or []
+            if entry.get("path") in explicit
+        }
+
+    before = _entries(baseline)
+    after = _entries(current)
+    return sorted(
+        path for path in before.keys() | after.keys()
+        if before.get(path) != after.get(path)
+    )
+
+
+def _declared_edit_scope(
+    target: Path,
+    siblings: list[Path],
+    experiment_allow_edit: list[Path],
+    experiment_active_edit: list[Path],
+) -> list[Path]:
+    """Return the exact file set the agent is authorized to modify."""
+    if experiment_allow_edit:
+        return experiment_active_edit or experiment_allow_edit
+    return [target, *siblings]
 
 
 # Tokens that, inside a git command, name a NON-HEAD revision. On a SEALED
@@ -6640,11 +6743,16 @@ def run_task(
     # it, so the spec gate is the only thing freezing its contracts. After the
     # strip, an editable file's surviving fn headers ARE the frozen contracts
     # (deleted lemmas are gone; re-added ones are tolerated as additions).
-    spec_snapshot = tdir / "spec_snapshot.json"
+    # Keep the authority baseline distinct from the agent-facing convenience
+    # copy. The proof agent can write anywhere under results, so filesystem
+    # permissions are not an authority boundary; the runner binds the authority
+    # bytes in memory and checks them immediately after every agent turn.
+    spec_snapshot = tdir / "spec_snapshot.authority.json"
+    agent_spec_snapshot = tdir / "spec_snapshot.json"
     # Agent-facing spec_check invocations should still pass --against explicitly,
     # but expose the per-task snapshot path so a common omitted-flag invocation
     # remains tied to this run's authoritative baseline.
-    env["SPEC_SNAPSHOT"] = str(spec_snapshot)
+    env["SPEC_SNAPSHOT"] = str(agent_spec_snapshot)
     _snap_extra = [str(s) for s in siblings]
     for _p in (experiment_allow_edit or []):
         if str(_p) != str(target) and str(_p) not in _snap_extra:
@@ -6663,6 +6771,12 @@ def run_task(
             error_message="spec_check snapshot failed",
             experiment_provenance=experiment_provenance,
         )
+    spec_snapshot_bytes = spec_snapshot.read_bytes()
+    spec_snapshot_sha256 = hashlib.sha256(spec_snapshot_bytes).hexdigest()
+    agent_spec_snapshot.write_bytes(spec_snapshot_bytes)
+
+    def _spec_baseline_intact() -> bool:
+        return _bound_file_intact(spec_snapshot, spec_snapshot_sha256)
 
     # Bind prompt memory and every later gate to the exact baseline tree and
     # canonical runner argv. Older records remain useful as archival hints, but
@@ -6824,7 +6938,7 @@ def run_task(
               flush=True)
     prompt = render_prompt(
         target=target, project=project, module=module,
-        spec_snapshot=spec_snapshot, catalog_cache=catalog_cache,
+        spec_snapshot=agent_spec_snapshot, catalog_cache=catalog_cache,
         results_root=results_root, failure_block=failure_block,
         vstd_root=vstd_root, experiment_block=experiment_block,
         decompose_block=decompose_block,
@@ -7055,19 +7169,23 @@ def run_task(
     def _tooling_digest() -> dict[str, str]:
         digest: dict[str, str] = {}
         top_level = [
-            HERE / name for name in (
-                "run.py", "prompt.md", "prompt_decompose.md", "admit.py",
-                "peel.py", "strip_specs.py", "usage_audit.py",
-                "trusted_core_profile.py", "skills/SKILL.md",
-            )
+            *HERE.glob("*.py"), *HERE.glob("*.sh"),
+            *HERE.glob("prompt*.md"), HERE / "skills/SKILL.md",
         ]
         files = [
             *top_level,
             *HERE.glob("skills/**/*.py"),
+            *HERE.glob("skills/**/*.sh"),
+            *HERE.glob("skills/**/*.json"),
             *HERE.glob("lib/**/*.py"),
-            *HERE.glob("docker/*.py"),
-            *HERE.glob("docker/*.sh"),
-            *HERE.glob("docker/*.json"),
+            *HERE.glob("lib/**/*.sh"),
+            *HERE.glob("lib/**/*.json"),
+            *HERE.glob("docker/**/*.py"),
+            *HERE.glob("docker/**/*.sh"),
+            *HERE.glob("docker/**/*.json"),
+            *HERE.glob("scripts/**/*.py"),
+            *HERE.glob("scripts/**/*.sh"),
+            *HERE.glob("scripts/**/*.json"),
         ]
         for f in files:
             if "__pycache__" in f.parts:
@@ -7090,13 +7208,13 @@ def run_task(
             if baseline_tooling.get(k) != current.get(k)
         )
 
-    # Frozen-file guard (bridge-specs rung): the agent may edit ONLY the
-    # allow-edit set; every other tracked file must stay byte-identical to
-    # clean main. This is what makes the rung sound — the reconstructed map is
-    # PINNED by frozen consumers (montgomery::to_edwards's proof, decompress's
-    # contract, the curve lemmas), so the agent must not be able to weaken them
-    # to fit a convenient definition. We diff the worktree against HEAD (the
-    # committed clean main) and subtract the allow-edit files.
+    # Frozen-file guard: in every run mode the agent may edit ONLY the declared
+    # scope. Ordinary runs allow target + discovered siblings; experiments use
+    # the active-edit subset when present, otherwise their full allow-edit set.
+    # Every other tracked or untracked path must stay byte-identical to HEAD.
+    # Whole-crate modes rely on frozen consumers for semantic pinning, while
+    # module-mode runs need the same ownership boundary to prevent an unrelated
+    # implementation edit from making a focused verifier green.
     try:
         _rc, _gr, _ = run_subskill(
             ["git", "-C", str(project), "rev-parse", "--show-toplevel"], env=env)
@@ -7104,7 +7222,10 @@ def run_task(
     except Exception:
         _gitroot = project
     allow_edit_rel: set[str] = set()
-    for _p in experiment_edit_scope:
+    guard_edit_scope = _declared_edit_scope(
+        target, siblings, experiment_allow_edit, experiment_active_edit,
+    )
+    for _p in guard_edit_scope:
         try:
             allow_edit_rel.add(str(_p.resolve().relative_to(_gitroot)))
         except ValueError:
@@ -7454,7 +7575,31 @@ def run_task(
             print(f"[run] post-agent state snapshot -> "
                   f"{agent_state.get('manifest_path')} "
                   f"({changed_count} changed path(s))", flush=True)
+        if not _spec_baseline_intact():
+            print("[run] SPEC_DRIFT: authoritative spec baseline was modified "
+                  "or removed by the agent; failing closed.", flush=True)
+            end_reason = "SPEC_DRIFT"
+            break
+        if experiment_mode not in _WHOLE_CRATE_MODES:
+            untracked_paths, untracked_error = _untracked_paths_changed_from_git(
+                project, env=env,
+            )
+            if untracked_error or untracked_paths:
+                print("[run] FROZEN_EDIT: untracked source authority is not "
+                      f"permitted ({untracked_error or untracked_paths[:5]}); "
+                      "failing closed.", flush=True)
+                end_reason = "FROZEN_EDIT"
+                break
         current_tree_receipt = provenance.source_tree_receipt(project)
+        literal_input_drift = _literal_compiler_input_drift(
+            baseline_tree_receipt, current_tree_receipt,
+        )
+        if literal_input_drift:
+            print("[run] FROZEN_EDIT: compiler-visible input below an ignored "
+                  f"directory changed or appeared ({literal_input_drift[:5]}); "
+                  "failing closed.", flush=True)
+            end_reason = "FROZEN_EDIT"
+            break
 
         # Deterministic rate-limit halt. A 429 means the API rejected the
         # request outright (5-hour session limit, quota exhausted, overage
@@ -8300,8 +8445,8 @@ def run_task(
                 _spec_drift_continue_msg(spec_drift, restored_files))
         else:
             spec_drift_recovery_counts.clear()
-        if experiment_mode in _WHOLE_CRATE_MODES:
-            frozen_changed = _frozen_files_changed()
+        frozen_changed = _frozen_files_changed()
+        if frozen_check_error or frozen_changed:
             if frozen_check_error:
                 print(f"[run] FROZEN_EDIT: frozen-file audit failed "
                       f"({frozen_check_error}) — cannot prove frozen files "
@@ -8553,13 +8698,25 @@ def run_task(
             "SPEC_DRIFT", "PROCESS_CROSSTALK", "AXIOM_DRIFT"):
         end_reason = "TOOLING_DRIFT"
 
+    final_spec_baseline_intact = _spec_baseline_intact()
+    if not final_spec_baseline_intact and (end_reason or "").upper() not in (
+            "PROCESS_CROSSTALK", "AXIOM_DRIFT", "TOOLING_DRIFT"):
+        end_reason = "SPEC_DRIFT"
+    try:
+        final_literal_input_drift = _literal_compiler_input_drift(
+            baseline_tree_receipt, provenance.source_tree_receipt(project),
+        )
+    except (OSError, ValueError):
+        final_literal_input_drift = ["<compiler-input-audit-error>"]
+    if final_literal_input_drift and (end_reason or "").upper() not in (
+            "SPEC_DRIFT", "PROCESS_CROSSTALK", "AXIOM_DRIFT", "TOOLING_DRIFT"):
+        end_reason = "FROZEN_EDIT"
+
     # Frozen-file integrity (bridge-specs rung): any edit outside the bridge
     # module weakens a pinning consumer — fold into end_reason so a budget-bail
     # exit can't be promoted to COMPLETE off a tampered frozen file.
-    final_frozen_changed = (
-        _frozen_files_changed() if experiment_mode in _WHOLE_CRATE_MODES else [])
-    final_frozen_check_error = (
-        frozen_check_error if experiment_mode in _WHOLE_CRATE_MODES else None)
+    final_frozen_changed = _frozen_files_changed()
+    final_frozen_check_error = frozen_check_error
     if final_frozen_check_error and (end_reason or "").upper() not in (
             "SPEC_DRIFT", "PROCESS_CROSSTALK", "AXIOM_DRIFT", "TOOLING_DRIFT"):
         print(f"[run] FROZEN_EDIT: final frozen-file audit failed "
@@ -8603,6 +8760,8 @@ def run_task(
     # done, which is the safe direction.)
     done_for_real = (
         last_round_okay and admits_remaining == 0
+        and final_spec_baseline_intact
+        and not final_literal_input_drift
         and not final_new_axioms and not final_changed_tooling
         and not final_frozen_changed and not final_frozen_check_error
         and not final_forbidden

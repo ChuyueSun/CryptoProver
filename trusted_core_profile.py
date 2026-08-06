@@ -15,12 +15,7 @@ from typing import Any
 
 from lib import provenance
 
-_HARNESS_TOP_FILES = (
-    "run.py", "prompt.md", "prompt_decompose.md", "peel.py", "admit.py",
-    "strip_specs.py", "usage_audit.py", "trusted_core_profile.py",
-    "skills/SKILL.md",
-)
-_HARNESS_DIRS = ("lib", "skills", "docker")
+_HARNESS_DIRS = ("lib", "skills", "docker", "scripts")
 
 
 def _finite_number(value: Any, label: str, *, positive: bool = False) -> float:
@@ -82,13 +77,18 @@ def _git_value(root: Path, *args: str) -> str:
 
 def harness_source_receipt(repo_root: Path) -> dict[str, Any]:
     """Hash the executable harness surface, excluding ledgers/results/docs."""
-    paths = [repo_root / name for name in _HARNESS_TOP_FILES]
+    paths = [
+        *repo_root.glob("*.py"), *repo_root.glob("*.sh"),
+        *repo_root.glob("prompt*.md"), repo_root / "skills/SKILL.md",
+    ]
     for directory in _HARNESS_DIRS:
-        paths.extend(sorted((repo_root / directory).glob("*.py")))
-        paths.extend(sorted((repo_root / directory).glob("*.sh")))
-        paths.extend(sorted((repo_root / directory).glob("*.json")))
+        paths.extend(sorted((repo_root / directory).glob("**/*.py")))
+        paths.extend(sorted((repo_root / directory).glob("**/*.sh")))
+        paths.extend(sorted((repo_root / directory).glob("**/*.json")))
     entries = []
     for path in sorted(set(paths)):
+        if "__pycache__" in path.parts:
+            continue
         if not path.is_file():
             raise ValueError(f"required harness source is missing: {path}")
         data = path.read_bytes()

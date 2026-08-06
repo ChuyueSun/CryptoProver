@@ -73,6 +73,18 @@ _RAW_ADMIT_COUNT_FLAG = re.compile(r"\b(?:grep|rg)\b[\s\S]*\s(?:-[A-Za-z]*c[A-Za
 _RAW_ADMIT_COUNT_PIPE = re.compile(r"\|\s*wc\s+-l\b")
 
 
+class _Fd2Token(str):
+    """Out-of-band token marking a lexically adjacent fd-2 redirect."""
+
+
+def _is_shell_command_option(token):
+    """True only for short shell option words carrying the `-c` flag."""
+    return bool(
+        token.startswith("-") and not token.startswith("--")
+        and "c" in token[1:]
+    )
+
+
 def _is_verus_check_help_only(cmd):
     """Allow sliced `verus_check.py --help`; it is CLI help, not verifier truth."""
     segments = [s for s in re.split(r"[;&]", cmd) if _VERIFIER.search(s)]
@@ -93,13 +105,39 @@ def _is_raw_admit_count(cmd):
 def _shell_tokens(cmd):
     """Tokenize shell operators without treating quoted query text as syntax."""
     try:
+        source = _strip_shell_comments(cmd)
+        # Preserve adjacent fd-2 redirects (`2>file`) distinctly from a literal
+        # argument followed by stdout redirection (`--rlimit 2 > file`). shlex
+        # otherwise flattens both into the same token sequence. Choose a marker
+        # absent from the command, then convert it to a typed token immediately
+        # after lexing. NUL cannot occur in a command accepted by execve; if it
+        # arrives in tool JSON anyway, fail closed rather than treating it as a
+        # shell word. Quote concatenation therefore cannot forge this identity.
+        if "\0" in source:
+            return []
+        fd2_marker = "\0"
+        source = re.sub(r"(?<!\S)2(?=>)", fd2_marker, source)
         lexer = shlex.shlex(
-            _strip_shell_comments(cmd),
+            source,
             posix=True,
             punctuation_chars="|&;<>",
         )
         lexer.commenters = ""
-        tokens = list(lexer)
+        lexer.wordchars += fd2_marker
+        raw_tokens = [
+            _Fd2Token("2") if token == fd2_marker else token
+            for token in lexer
+        ]
+        tokens = []
+        index = 0
+        while index < len(raw_tokens):
+            if (raw_tokens[index] == "$" and index + 1 < len(raw_tokens)
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw_tokens[index + 1])):
+                tokens.append("$" + raw_tokens[index + 1])
+                index += 2
+                continue
+            tokens.append(raw_tokens[index])
+            index += 1
     except ValueError:
         # An incomplete quote is malformed shell anyway. Retain the regex
         # backstop instead of allowing it through because tokenization failed.
@@ -128,6 +166,16 @@ def _shell_tokens(cmd):
                 return []
             expanded.extend(_shell_tokens(token[start + 2:index]))
             cursor = index + 1
+    # Shell -c payloads are a nested command language. Expand them into the
+    # analysis stream so verifier pipes/redirects inside a wrapper receive the
+    # same policy as direct commands (conservative over-attribution is safer).
+    for index, token in enumerate(tokens[:-2]):
+        if os.path.basename(token) not in {"sh", "bash", "zsh"}:
+            continue
+        for option_index in range(index + 1, len(tokens) - 1):
+            if _is_shell_command_option(tokens[option_index]):
+                expanded.extend(_shell_tokens(tokens[option_index + 1]))
+                break
     return expanded
 
 
@@ -171,10 +219,11 @@ def _stdout_file_redirect(tokens):
     for index, token in enumerate(tokens):
         if token not in {">", ">>", ">|", ">&", "&>", "&>>"}:
             continue
-        if token in {">", ">>", ">|", ">&"} and index and tokens[index - 1] == "2":
+        if (token in {">", ">>", ">|", ">&"} and index
+                and isinstance(tokens[index - 1], _Fd2Token)):
             continue
         destination = tokens[index + 1] if index + 1 < len(tokens) else ""
-        if destination == "/dev/null":
+        if destination == "/dev/null" or (token == ">&" and destination == "2"):
             continue
         return True
     return False
@@ -220,9 +269,75 @@ def _token_segments(tokens):
     return segments
 
 
-def _segment_matches_verifier(segment_text):
+def _direct_verus_from_tokens(tokens):
+    """Recognize direct Verus after ordinary shell wrappers/assignments."""
+    assignments = {}
+    for token in tokens:
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.+)", token)
+        if match:
+            assignments[match.group(1)] = match.group(2)
+    command_separators = _CONTROL_TOKENS | {"|", "|&"}
+    commands, current = [], []
+    for token in tokens:
+        if token in command_separators:
+            if current:
+                commands.append(current)
+            current = []
+        else:
+            current.append(token)
+    if current:
+        commands.append(current)
+    for words in commands:
+        index = 0
+        while index < len(words) and (
+                words[index] in {"{", "}", "(", ")"}
+                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[index])):
+            index += 1
+        while index < len(words):
+            word = os.path.basename(words[index])
+            if word in {"command", "exec", "nohup", "eval"}:
+                index += 1
+                continue
+            if word == "env":
+                index += 1
+                while index < len(words) and (
+                        words[index].startswith("-")
+                        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[index])):
+                    index += 1
+                continue
+            if word == "timeout":
+                index += 1
+                while index < len(words) and words[index].startswith("-"):
+                    index += 1
+                if index < len(words):
+                    index += 1  # duration
+                continue
+            break
+        if index >= len(words):
+            continue
+        command = words[index]
+        shell = os.path.basename(command)
+        if shell in {"sh", "bash", "zsh"}:
+            for option_index in range(index + 1, len(words) - 1):
+                option = words[option_index]
+                if _is_shell_command_option(option):
+                    nested = _shell_tokens(words[option_index + 1])
+                    if nested and _direct_verus_from_tokens(nested):
+                        return True
+                    break
+        if os.path.basename(command) == "verus":
+            return True
+        variable = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", command)
+        if variable and os.path.basename(assignments.get(variable.group(1), "")) == "verus":
+            return True
+    return False
+
+
+def _segment_matches_verifier(segment):
+    segment_text = " ".join(segment)
     return bool(
-        (_VERIFIER.search(segment_text) or _DIRECT_VERUS_RAW.search(segment_text))
+        (_VERIFIER.search(segment_text) or _DIRECT_VERUS_RAW.search(segment_text)
+         or _direct_verus_from_tokens(segment))
         and not _is_verus_check_help_only(segment_text)
     )
 
@@ -291,7 +406,7 @@ def _pre_edit_guard_has_diff():
     return any(_path_has_git_diff(project_root, path) for path in paths)
 
 
-def _agent_timeout_exceeds_cap(cmd):
+def _agent_timeout_exceeds_cap(tokens, raw_cmd=""):
     raw_cap = os.environ.get("DALEK_AGENT_MAX_VERIFIER_TIMEOUT", "").strip()
     if not raw_cap:
         return False
@@ -303,7 +418,19 @@ def _agent_timeout_exceeds_cap(cmd):
     # that is not a numeric literal ($VAR, command substitution, quoted)
     # cannot be checked against the cap statically, so it fails closed — the
     # corrective reason tells the agent to pass a literal within the cap (F6).
-    for value in re.findall(r"(?:^|\s)--timeout(?:=|\s+)([^\s;|&]+)", cmd):
+    values = []
+    for index, token in enumerate(tokens):
+        if token == "--timeout":
+            values.append(tokens[index + 1] if index + 1 < len(tokens) else "")
+        elif token.startswith("--timeout="):
+            values.append(token.split("=", 1)[1])
+    if not tokens and "--timeout" in raw_cmd:
+        values = re.findall(
+            r"(?:^|\s)--timeout(?:=|\s+)([^\s;|&]+)", raw_cmd,
+        )
+        if not values:
+            return True
+    for value in values:
         try:
             if float(value) > cap:
                 return True
@@ -347,7 +474,10 @@ def evaluate(tool_name, tool_input):
     bg = bool((tool_input or {}).get("run_in_background"))
     shell_tokens = _shell_tokens(cmd)
     reasons = []
-    direct_verus = bool(_DIRECT_VERUS_RAW.search(cmd))
+    direct_verus = bool(
+        _DIRECT_VERUS_RAW.search(cmd)
+        or (shell_tokens and _direct_verus_from_tokens(shell_tokens))
+    )
     is_verifier = bool(_VERIFIER.search(cmd) or direct_verus) and not _is_verus_check_help_only(cmd)
     is_harness_skill = bool(_HARNESS_SKILL.search(cmd))
     if _pre_edit_guard_active() and (is_verifier or is_harness_skill) and not _pre_edit_guard_has_diff():
@@ -366,13 +496,21 @@ def evaluate(tool_name, tool_input):
         # unrelated segment of a compound command is plain shell.
         segments = _token_segments(shell_tokens)
         verifier_segments = [
-            seg for seg in segments if _segment_matches_verifier(" ".join(seg))
+            seg for seg in segments if _segment_matches_verifier(seg)
         ]
         guarded_segments = verifier_segments + [
             seg for seg in segments
             if _HARNESS_SKILL.search(" ".join(seg)) and seg not in verifier_segments
         ]
         redirect_hit = any(_stdout_file_redirect(seg) for seg in guarded_segments)
+        inherited_redirect_hit = any(
+            seg and os.path.basename(seg[0]) == "exec" and _stdout_file_redirect(seg)
+            for seg in segments
+        ) or (
+            any(token in {"{", "("} for token in shell_tokens)
+            and any(_stdout_file_redirect(seg) for seg in segments)
+        )
+        redirect_hit = redirect_hit or bool(verifier_segments and inherited_redirect_hit)
         slice_hit = any(_verifier_output_slice(seg) for seg in verifier_segments)
         pipe_hit = any(_verifier_pipe(seg) for seg in verifier_segments)
     else:
@@ -389,7 +527,7 @@ def evaluate(tool_name, tool_input):
         reasons.append("verifier output piped through head/tail/grep")
     if pipe_hit:
         reasons.append("verifier output piped to another command (read JSON stdout directly)")
-    if is_verifier and _agent_timeout_exceeds_cap(cmd):
+    if is_verifier and _agent_timeout_exceeds_cap(shell_tokens, cmd):
         raw_cap = os.environ.get("DALEK_AGENT_MAX_VERIFIER_TIMEOUT", "").strip()
         reasons.append(
             "agent verifier timeout exceeds runner policy cap "
@@ -406,7 +544,7 @@ def evaluate(tool_name, tool_input):
             reasons.append("raw cargo-verus | grep/head substitution (truncates errors)")
         else:
             reasons.append("raw cargo-verus substitution (use verus_check.py)")
-    if _DIRECT_VERUS_RAW.search(cmd):
+    if direct_verus:
         reasons.append("raw direct verus substitution (use verus_check.py)")
     return reasons
 

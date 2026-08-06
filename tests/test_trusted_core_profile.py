@@ -13,12 +13,28 @@ from trusted_core_profile import (
     _assert_registration_predecessor_consistency,
     advance_campaign_state,
     build_lineage_context,
+    harness_source_receipt,
     validate_root_replay,
     validate_terminal,
 )
 
 
 class TrustedCoreTerminalProfileTests(unittest.TestCase):
+    def test_harness_receipt_covers_top_level_and_nested_executables(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "skills" / "nested").mkdir(parents=True)
+            (root / "skills" / "SKILL.md").write_text("skill\n")
+            (root / "skills" / "nested" / "helper.py").write_text("one\n")
+            (root / "launch.sh").write_text("#!/bin/sh\n")
+            first = harness_source_receipt(root)
+            (root / "skills" / "nested" / "helper.py").write_text("two\n")
+            second = harness_source_receipt(root)
+            paths = {entry["path"] for entry in second["files"]}
+            self.assertIn("launch.sh", paths)
+            self.assertIn("skills/nested/helper.py", paths)
+            self.assertNotEqual(first["tree_hash"], second["tree_hash"])
+
     def test_registration_predecessor_accounting_mismatch_fails_closed(self):
         predecessor = {"receipt_id": "promotion", "tree_hash": "tree"}
         terminal = {"receipt_id": "terminal"}

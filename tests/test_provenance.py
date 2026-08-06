@@ -54,6 +54,76 @@ class ProvenanceReceiptTests(unittest.TestCase):
             self.assertNotEqual(first["tree_hash"], second["tree_hash"])
             self.assertEqual(second["file_count"], len(second["files"]))
 
+    def test_tree_hash_covers_literal_include_below_ignored_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            generated = project / "results" / "generated.rs"
+            generated.parent.mkdir()
+            generated.write_text("pub const VALUE: u8 = 1;\n")
+            (project / "src" / "lib.rs").write_text(
+                'include!("../results/generated.rs");\n'
+            )
+            first = source_tree_receipt(project)
+            generated.write_text("pub const VALUE: u8 = 2;\n")
+            second = source_tree_receipt(project)
+
+            self.assertNotEqual(first["tree_hash"], second["tree_hash"])
+            self.assertIn(
+                "crate/results/generated.rs",
+                {entry["path"] for entry in second["files"]},
+            )
+            self.assertEqual(
+                second["literal_compiler_inputs"],
+                ["crate/results/generated.rs"],
+            )
+
+    def test_tree_hash_covers_path_attribute_below_ignored_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            generated = project / "target" / "evil.rs"
+            generated.parent.mkdir()
+            generated.write_text("pub fn value() -> u8 { 1 }\n")
+            (project / "src" / "lib.rs").write_text(
+                '#[path = "../target/evil.rs"]\nmod evil;\n'
+            )
+            first = source_tree_receipt(project)
+            generated.write_text("pub fn value() -> u8 { 2 }\n")
+            second = source_tree_receipt(project)
+            self.assertNotEqual(first["tree_hash"], second["tree_hash"])
+
+    def test_tree_hash_covers_raw_string_include_and_path_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            first_input = project / "target" / "one.rs"
+            second_input = project / "target" / "two.rs"
+            first_input.parent.mkdir()
+            first_input.write_text("pub const ONE: u8 = 1;\n")
+            second_input.write_text("pub fn two() -> u8 { 2 }\n")
+            (project / "src" / "lib.rs").write_text(
+                'include!(r#"../target/one.rs"#);\n'
+                '#[path = r"../target/two.rs"] mod two;\n'
+            )
+            before = source_tree_receipt(project)
+            first_input.write_text("pub const ONE: u8 = 9;\n")
+            second_input.write_text("pub fn two() -> u8 { 9 }\n")
+            after = source_tree_receipt(project)
+            self.assertNotEqual(before["tree_hash"], after["tree_hash"])
+            self.assertEqual(
+                set(after["literal_compiler_inputs"]),
+                {"crate/target/one.rs", "crate/target/two.rs"},
+            )
+
+    def test_source_subdirectory_named_target_is_not_treated_as_build_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            module = project / "src" / "target" / "mod.rs"
+            module.parent.mkdir()
+            module.write_text("pub fn value() -> u8 { 1 }\n")
+            first = source_tree_receipt(project)
+            module.write_text("pub fn value() -> u8 { 2 }\n")
+            second = source_tree_receipt(project)
+            self.assertNotEqual(first["tree_hash"], second["tree_hash"])
+
     def test_linked_worktree_control_file_cannot_change_source_hash(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

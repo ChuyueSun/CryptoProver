@@ -254,6 +254,10 @@ fi
 [ -z "$REUSE_WT" ] || die \
   "--reuse-worktree is disabled: resume requires S3 BANKED_PARTIAL canonical replay"
 [ -d "$SRCREPO" ] || die "source repo missing: $SRCREPO (set DALEK_SRCREPO)"
+if [ "$DRYRUN" != "1" ]; then
+  command -v cargo-verus >/dev/null || die "cargo-verus not on PATH ($VERUS_DIR missing?)"
+  command -v claude      >/dev/null || die "claude not on PATH"
+fi
 
 TARGET_REL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("target") or "")' "$MANIFEST")"
 [ -n "$TARGET_REL" ] || die "manifest has no \"target\" key (run.py needs an anchor file)"
@@ -347,9 +351,6 @@ if [ "$DRYRUN" = "1" ]; then
   echo "ARGV ${CMD[*]}"
   exit 0
 fi
-
-command -v cargo-verus >/dev/null || die "cargo-verus not on PATH ($VERUS_DIR missing?)"
-command -v claude      >/dev/null || die "claude not on PATH"
 
 # ── one-time vstd/build warm (cold module-scoped check spuriously fails) ──────
 WARM_SENTINEL="$PROJECT/target/.peel_warmed"

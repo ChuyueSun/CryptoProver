@@ -10,11 +10,15 @@ all agents share one CPU pool. Design rationale recorded in internal review thre
 > verifier, a harness gate, not a Docker issue.) A full *parallel* multi-container
 > sweep hasn't been run yet.
 >
-> **Claim boundary:** this is an operational isolation profile, not yet a
-> `scoreable:true` campaign profile. Containers retain general network egress
-> (including public-source hosts), and `run_agents.sh` does not yet run and seal
-> `usage_audit.py` across every exit path. Do not use this profile alone as
-> evidence for an oracle-free or cost-complete evaluation.
+> **Claim boundary:** the default launcher mode remains an operational
+> isolation profile with general network egress. `--trusted-core-profile`
+> additionally requires `--provider-only-network`, a registered campaign and
+> launch budget, sealed source/harness identities, and a launch-wide
+> `usage_audit.json` across every exit path before it may emit
+> `scoreable:true`. The provider-only path puts agents on an internal network
+> and dual-homes only a fixed-upstream proxy; `--provider-policy FILE` is
+> resolved, hash-bound, and mounted read-only as the policy the proxy actually
+> enforces. Do not treat ordinary launcher mode as scoreable.
 
 ## The two requirements, and how they map
 
@@ -57,7 +61,12 @@ this (matches `_is_sealed_worktree`, run.py:1181-1198, and the `git fsck
   agents (a ro registry-cache miss fails hard; prove it once).
 - **`run_agents.sh`** — host launcher: serialized `peel.py --worktree` → seal →
   `docker run -d --init` per manifest, concurrency-capped at `nproc`, rc-42
-  (RATE_LIMITED) sweep-break, `--skip-existing` resume off a host-side ledger.
+  (RATE_LIMITED) sweep-break, `--skip-existing` resume off a host-side ledger,
+  and the registered provider-only/trusted-core profile.
+- **`trusted_core_supervisor.py`** — durable retry/continuation controller. Its
+  package ID hashes the complete package (commands, paths, inputs, and routing)
+  and is persisted across retries, so even editing and re-hashing a package
+  between attempts fails before prelaunch.
 
 ## CPU sharing, precisely
 

@@ -213,9 +213,11 @@ launcher (`docker/run_agents.sh`) for isolated one-container-per-target
 sweeps — sealed worktree per agent, shared CPU pool, `--tap` tracing and
 `--seed-wip` resume options. Image build, sealing, and a full single-container
 proof round are smoke-tested; a full parallel multi-container sweep has not
-been run yet. This is an operational container profile, not yet a
-`scoreable:true` evaluation boundary: general container egress is still open
-and the Docker launcher does not yet seal a launch-wide `usage_audit.json`.
+been run yet. The default operational profile retains general container
+egress. The stricter trusted-core profile instead uses an internal agent
+network with a fixed-upstream provider proxy, binds the selected proxy policy,
+seals a launch-wide `usage_audit.json`, and requires registered source,
+harness, budget, and terminal receipts before it may report `scoreable:true`.
 See [docker/README.md](docker/README.md).
 
 Documentation map:
