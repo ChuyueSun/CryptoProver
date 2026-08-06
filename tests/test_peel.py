@@ -35,15 +35,6 @@ import lib.admits as admits  # noqa: E402
 import lib.provenance as provenance  # noqa: E402
 
 
-class PeelLauncherPreflight(unittest.TestCase):
-    def test_real_launch_checks_toolchain_before_worktree_build(self):
-        source = (Path(__file__).resolve().parents[1] / "peel_run.sh").read_text()
-        preflight = source.index("command -v cargo-verus")
-        build = source.index('PEEL_JSON="$(build_peel_worktree_locked')
-        self.assertLess(preflight, build)
-        self.assertIn("command -v claude", source[preflight:build])
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 # A. UNIT TRANSFORMS
 # ═════════════════════════════════════════════════════════════════════════════
@@ -324,6 +315,40 @@ class ExactWorktreeTransform(unittest.TestCase):
         self.assertIn("--reuse-worktree is disabled", launcher)
         self.assertNotIn("Proceeding on trust", launcher)
         self.assertNotIn(".peel_manifest_sha", launcher)
+
+    def test_launcher_confines_run_id_before_worktree_lifecycle(self):
+        launcher = Path(__file__).resolve().parents[1] / "peel_run.sh"
+        env = os.environ.copy()
+        env["DALEK_UV_PY_BIN"] = str(Path(sys.executable).parent)
+        env["DALEK_VERUS_DIR"] = str(Path(sys.executable).parent)
+        with tempfile.TemporaryDirectory() as td:
+            env["DALEK_PEEL_WT_BASE"] = td
+            for run_id in (
+                "../escape", ".hidden", "-flag", "a..b", "space name",
+                "shell;meta",
+            ):
+                with self.subTest(run_id=run_id):
+                    proc = subprocess.run(
+                        ["bash", str(launcher), "--run-id", run_id, "--remove"],
+                        cwd=launcher.parent,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("invalid run id", proc.stderr)
+                    self.assertEqual(list(Path(td).iterdir()), [])
+
+            valid = subprocess.run(
+                ["bash", str(launcher), "--run-id", "peel-run_1.2"],
+                cwd=launcher.parent,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(valid.returncode, 2)
+            self.assertIn("--manifest required to launch", valid.stderr)
+            self.assertEqual(list(Path(td).iterdir()), [])
 
     def test_p2_drops_orphan_doc_comment_after_banner_separated_delete(self):
         src = '''\

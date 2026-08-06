@@ -13,9 +13,9 @@ Run: `python3 -m unittest tests.test_admits`
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -163,6 +163,91 @@ class CommentAndStringAwareAdmits(unittest.TestCase):
     def test_admit_inside_string_literal_not_counted(self):
         src = 'proof fn lemma_x() {\n    let s = "call admit() here";\n}\n'
         self.assertEqual(count_non_axiom(src), 0)
+
+    def test_whitespace_admit_variants_are_counted(self):
+        # T315 H1: Rust tokenization ignores whitespace, so `admit ( );` and
+        # a call whose parens span lines are the same call as `admit();`.
+        # The exact-substring counter scored them ZERO → false COMPLETE.
+        self.assertEqual(
+            count_non_axiom("proof fn f() ensures false { admit ( ); }\n"), 1)
+        self.assertEqual(
+            count_non_axiom("proof fn f() ensures false { admit(\n); }\n"), 1)
+        self.assertEqual(
+            count_non_axiom("proof fn f() { admit\n    (); }\n"), 1)
+        # Line attribution: the call starts on line 1 for the multiline form.
+        self.assertEqual(
+            classify_admit_lines(
+                "proof fn f() { admit(\n); }\n")["non_axiom_lines"],
+            [1],
+        )
+        # Word boundary: a user fn named my_admit() is NOT an admit.
+        self.assertEqual(count_non_axiom("fn g() { my_admit(); }\n"), 0)
+        # admit(x) — an argument — is not the nullary vstd admit call.
+        self.assertEqual(count_non_axiom("fn g() { admit(x); }\n"), 0)
+        # Axiom partition still applies to whitespace variants.
+        src = (
+            "proof fn axiom_a() { admit ( ); }\n"
+            "proof fn lemma_b() { admit ( ); }\n"
+        )
+        got = classify_admit_lines(src)
+        self.assertEqual(got["axiom_lines"], [1])
+        self.assertEqual(got["non_axiom_lines"], [2])
+
+    def test_inventory_scanners_agree_with_the_complete_gate(self):
+        # The whitespace-tolerant regex landed in lib.admits but run.py kept
+        # private substring scanners, so `admit ( );` made the gate refuse
+        # COMPLETE while result.json and the prompt inventory reported zero
+        # hard admits — the agent was told there was nothing to do.
+        import run
+        from lib.admits import has_admit_call
+        src = (
+            "verus! {\nproof fn lemma_a()\n    ensures true,\n{\n"
+            "    admit ( );\n}\n}\n"
+        )
+        self.assertTrue(has_admit_call(src))
+        self.assertFalse(has_admit_call("// mentions admit() in prose\n"))
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "t.rs"
+            target.write_text(src)
+            gate = run._count_gate_admits(target, [])
+            inventory = run.classify_remaining_admits(target, [])
+            self.assertEqual(gate, 1)
+            self.assertEqual(inventory["hard"], gate)
+            self.assertEqual(run._in_progress_fns(target), {"lemma_a"})
+
+    def test_parenthesized_admit_call_is_counted(self):
+        # `(admit)()` is the same call: vstd's admit is an ordinary zero-arg
+        # proof fn recognized by diagnostic item, so parenthesizing the path
+        # does not change its semantics. A turbofish form is NOT valid Rust
+        # here (the function is non-generic), so it is deliberately not
+        # matched — matching it would only invite false positives.
+        self.assertEqual(count_non_axiom("proof fn p(){ (admit)(); }\n"), 1)
+        self.assertEqual(count_non_axiom("proof fn p(){ ( admit )( ); }\n"), 1)
+        self.assertEqual(
+            classify_admit_lines(
+                "proof fn axiom_a(){ (admit)(); }\n")["axiom_lines"], [1])
+        # Still no false positives on neighbouring shapes.
+        for benign in (
+            "fn g(){ my_admit(); }\n",
+            "fn g(){ admit(x); }\n",
+            "// (admit)() in prose\n",
+            'let s = "(admit)()";\n',
+        ):
+            self.assertEqual(count_non_axiom(benign), 0, benign)
+
+    def test_admit_alias_import_is_a_forbidden_construct(self):
+        # T315 H1 companion: `use vstd::pervasive::admit as f;` lets f()
+        # bypass every textual counter — the forbidden-construct gate counts
+        # the alias itself (increase-only vs baseline).
+        from lib.admits import count_forbidden_constructs
+        src = "use vstd::pervasive::admit as f;\nproof fn l() { f(); }\n"
+        self.assertEqual(count_forbidden_constructs(src)["admit_alias"], 1)
+        self.assertEqual(
+            count_forbidden_constructs(
+                '// use admit as f in prose\nlet s = "admit as f";\n'
+            )["admit_alias"],
+            0,
+        )
 
     def test_admit_in_line_comment_not_counted(self):
         src = 'proof fn lemma_x() {\n    // TODO admit() later\n    assert(true);\n}\n'
@@ -510,115 +595,154 @@ class FrozenEditRecoveryFeedback(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertIn("git diff rc=", err)
 
-    def test_frozen_git_audit_rejects_untracked_helper(self):
-        from run import _frozen_paths_changed_from_git
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            allowed = root / "src" / "allowed.rs"
-            allowed.parent.mkdir()
-            allowed.write_text("pub fn allowed() {}\n")
-            subprocess.run(["git", "-C", str(root), "add", "src/allowed.rs"], check=True)
-            subprocess.run([
-                "git", "-C", str(root), "-c", "user.name=test", "-c",
-                "user.email=test@example.com", "commit", "-q", "-m", "base",
-            ], check=True)
-            allowed.write_text("mod evil; pub fn allowed() { evil::cheat(); }\n")
-            (root / ".gitignore").write_text("src/evil.rs\n")
-            subprocess.run(["git", "-C", str(root), "add", ".gitignore"], check=True)
-            subprocess.run([
-                "git", "-C", str(root), "-c", "user.name=test", "-c",
-                "user.email=test@example.com", "commit", "-q", "-m", "ignore",
-            ], check=True)
-            (root / "src" / "evil.rs").write_text(
-                "#[verifier::external_body] pub proof fn cheat() {}\n"
-            )
-
-            paths, err = _frozen_paths_changed_from_git(
-                root, {"src/allowed.rs"},
-            )
-
-            self.assertIsNone(err)
-            self.assertEqual(paths, ["src/evil.rs"])
-
-    def test_untracked_audit_does_not_hide_source_directory_named_target(self):
-        from run import _untracked_paths_changed_from_git
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            (root / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n")
-            (root / ".gitignore").write_text("target/\n**/target/\n")
-            subprocess.run(["git", "-C", str(root), "add", "Cargo.toml", ".gitignore"], check=True)
-            subprocess.run([
-                "git", "-C", str(root), "-c", "user.name=test", "-c",
-                "user.email=test@example.com", "commit", "-q", "-m", "base",
-            ], check=True)
-            (root / "target").mkdir()
-            (root / "target" / "artifact").write_text("noise")
-            (root / "src" / "target").mkdir(parents=True)
-            (root / "src" / "target" / "mod.rs").write_text(
-                "#[verifier::external_body] proof fn cheat() {}\n"
-            )
-            paths, err = _untracked_paths_changed_from_git(root)
-            self.assertIsNone(err)
-            self.assertEqual(paths, ["src/target/mod.rs"])
-
     def test_bound_spec_baseline_detects_overwrite_and_removal(self):
+        import hashlib
         from run import _bound_file_intact
         with tempfile.TemporaryDirectory() as td:
             snapshot = Path(td) / "spec_snapshot.authority.json"
-            original = b'{"functions": [{"ensures": "x > 0"}]}\n'
-            snapshot.write_bytes(original)
-            expected = hashlib.sha256(original).hexdigest()
+            snapshot.write_text("frozen\n")
+            expected = hashlib.sha256(snapshot.read_bytes()).hexdigest()
             self.assertTrue(_bound_file_intact(snapshot, expected))
-            snapshot.write_text('{"functions": [{"ensures": "true"}]}\n')
+            snapshot.write_text("agent rewrite\n")
             self.assertFalse(_bound_file_intact(snapshot, expected))
             snapshot.unlink()
             self.assertFalse(_bound_file_intact(snapshot, expected))
 
-    def test_literal_compiler_input_drift_rejects_new_or_changed_input(self):
-        from run import _literal_compiler_input_drift
-        baseline = {
-            "literal_compiler_inputs": ["crate/results/generated.rs"],
-            "files": [{"path": "crate/results/generated.rs", "sha256": "one"}],
-        }
-        changed = {
-            "literal_compiler_inputs": ["crate/results/generated.rs"],
-            "files": [{"path": "crate/results/generated.rs", "sha256": "two"}],
-        }
-        added = {
-            "literal_compiler_inputs": [
-                "crate/results/generated.rs", "crate/target/evil.rs",
-            ],
-            "files": [
-                {"path": "crate/results/generated.rs", "sha256": "one"},
-                {"path": "crate/target/evil.rs", "sha256": "evil"},
-            ],
-        }
-        self.assertEqual(
-            _literal_compiler_input_drift(baseline, changed),
-            ["crate/results/generated.rs"],
-        )
-        self.assertEqual(
-            _literal_compiler_input_drift(baseline, added),
-            ["crate/target/evil.rs"],
-        )
-
-    def test_active_edit_scope_remains_narrower_than_allow_edit(self):
+    def test_declared_edit_scope_covers_ordinary_and_experiment_modes(self):
         from run import _declared_edit_scope
         target = Path("target.rs")
+        sibling = Path("sibling.rs")
         allowed = [Path("active.rs"), Path("inactive_pin.rs")]
         active = [Path("active.rs")]
         self.assertEqual(
-            _declared_edit_scope(target, [], allowed, active), active,
+            _declared_edit_scope(target, [sibling], [], []),
+            [target, sibling],
         )
         self.assertEqual(
-            _declared_edit_scope(target, [], allowed, []), allowed,
-        )
+            _declared_edit_scope(target, [], allowed, active), active)
         self.assertEqual(
-            _declared_edit_scope(target, [Path("sibling.rs")], [], []),
-            [target, Path("sibling.rs")],
+            _declared_edit_scope(target, [], allowed, []), allowed)
+
+    def test_frozen_gate_covers_ordinary_mode_without_head_restore(self):
+        source = (REPO_ROOT / "run.py").read_text()
+        self.assertIn("guard_edit_scope = _declared_edit_scope(", source)
+        self.assertIn("ordinary target run modified", source)
+        self.assertIn("without restoring user-owned files", source)
+        self.assertIn("include_git_head=False", source)
+        self.assertIn(
+            "include_git_head=experiment_mode in _WHOLE_CRATE_MODES", source)
+        self.assertNotIn(
+            "_frozen_files_changed() if experiment_mode in _WHOLE_CRATE_MODES",
+            source,
         )
+
+    def test_runner_separates_agent_and_authority_spec_snapshots(self):
+        source = (REPO_ROOT / "run.py").read_text()
+        self.assertIn('spec_snapshot.authority.json', source)
+        self.assertIn('env["SPEC_SNAPSHOT"] = str(agent_spec_snapshot)', source)
+        self.assertIn('spec_snapshot=agent_spec_snapshot', source)
+        self.assertIn('final_spec_baseline_intact = _spec_baseline_intact()', source)
+        self.assertIn('and final_spec_baseline_intact', source)
+
+    def test_receipt_comparison_detects_added_removed_and_changed_bytes(self):
+        from run import _frozen_paths_changed_from_receipts
+        before = {"files": [
+            {"path": "src/edit.rs", "kind": "file", "sha256": "a", "size": 1},
+            {"path": "src/frozen.rs", "kind": "file", "sha256": "b", "size": 1},
+            {"path": "src/removed.rs", "kind": "file", "sha256": "c", "size": 1},
+        ]}
+        after = {"files": [
+            {"path": "src/edit.rs", "kind": "file", "sha256": "z", "size": 1},
+            {"path": "src/frozen.rs", "kind": "file", "sha256": "x", "size": 1},
+            {"path": "src/added.rs", "kind": "file", "sha256": "d", "size": 1},
+        ]}
+        self.assertEqual(
+            _frozen_paths_changed_from_receipts(
+                before, after, {"src/edit.rs"}),
+            ["src/added.rs", "src/frozen.rs", "src/removed.rs"],
+        )
+
+    def test_receipt_authority_defeats_assume_unchanged_git_blindness(self):
+        from lib.provenance import source_tree_receipt
+        from run import (
+            _frozen_paths_changed_from_git,
+            _frozen_paths_changed_from_receipts,
+            _tracked_receipt_paths_from_git,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "Cargo.toml").write_text(
+                "[package]\nname='probe'\nversion='0.1.0'\n")
+            src = root / "src"
+            src.mkdir()
+            frozen = src / "lib.rs"
+            frozen.write_text("pub fn value() -> u8 { 1 }\n")
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            subprocess.run([
+                "git", "-C", str(root), "-c", "user.name=Test",
+                "-c", "user.email=test@example.com", "commit", "-qm", "base",
+            ], check=True)
+            baseline = source_tree_receipt(root)
+            subprocess.run([
+                "git", "-C", str(root), "update-index", "--assume-unchanged",
+                "src/lib.rs",
+            ], check=True)
+            frozen.write_text("pub fn value() -> u8 { 9 }\n")
+            git_paths, error = _frozen_paths_changed_from_git(root, set())
+            self.assertIsNone(error)
+            self.assertEqual(git_paths, [])
+            tracked, tracked_error = _tracked_receipt_paths_from_git(
+                root, root)
+            self.assertIsNone(tracked_error)
+            self.assertIn("src/lib.rs", tracked)
+            self.assertEqual(
+                _frozen_paths_changed_from_receipts(
+                    baseline, source_tree_receipt(root), set(), tracked),
+                ["src/lib.rs"],
+            )
+
+    def test_receipt_filter_ignores_generated_untracked_but_keeps_compiler_inputs(self):
+        from run import _frozen_paths_changed_from_receipts
+        before = {"files": [
+            {"path": "src/frozen.rs", "kind": "file", "sha256": "a", "size": 1},
+        ]}
+        after = {"files": [
+            {"path": "src/frozen.rs", "kind": "file", "sha256": "b", "size": 1},
+            {"path": "Cargo.lock", "kind": "file", "sha256": "c", "size": 1},
+            {"path": "verus.log", "kind": "file", "sha256": "d", "size": 1},
+            {"path": "src/new_module.rs", "kind": "file", "sha256": "e", "size": 1},
+            {"path": "target/included.bin", "kind": "file", "sha256": "f", "size": 1},
+        ], "literal_compiler_inputs": ["target/included.bin"]}
+        self.assertEqual(
+            _frozen_paths_changed_from_receipts(
+                before, after, set(), {"src/frozen.rs"}),
+            ["src/frozen.rs", "src/new_module.rs", "target/included.bin"],
+        )
+
+    def test_invalid_frozen_manifest_is_located_for_whole_crate_recovery(self):
+        from run import (
+            SourceReceiptInvalid,
+            _recoverable_receipt_source_path,
+            _source_tree_receipt,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = root / "Cargo.toml"
+            manifest.write_text("[package\ninvalid = true\n")
+            with self.assertRaises(SourceReceiptInvalid) as raised:
+                _source_tree_receipt(root)
+            self.assertEqual(
+                raised.exception.source_path.resolve(), manifest.resolve())
+            self.assertEqual(
+                _recoverable_receipt_source_path(
+                    raised.exception, root, set(), "field-floor"),
+                "Cargo.toml",
+            )
+            self.assertIsNone(_recoverable_receipt_source_path(
+                raised.exception, root, {"Cargo.toml"}, "field-floor"))
+            self.assertIsNone(_recoverable_receipt_source_path(
+                raised.exception, root, set(), None))
 
     def test_sibling_failures_are_flattened_into_verus_diagnostics(self):
         from run import _flatten_sibling_fail_messages
@@ -764,6 +888,256 @@ class PostAgentStateSnapshot(unittest.TestCase):
 
 
 # ---------- final-state gate / NEEDS_DECOMP escalation ------------------
+
+class AbortPersistenceAndSourceReceiptInvalid(unittest.TestCase):
+    """Every early exit must leave a classifiable result.json.
+
+    The durable supervisor polls for that file and classifies the leg from it.
+    An early return that skips the write is not a failure it can act on — the
+    campaign stalls on a missing verdict instead of failing closed on a
+    recorded one. One of the five exits had already drifted into that shape,
+    which is why persistence now lives in the helper rather than in each
+    site's memory.
+    """
+
+    def test_helper_persists_and_returns_a_failed_result(self):
+        import run
+        with tempfile.TemporaryDirectory() as td:
+            tdir = Path(td)
+            result = run._persisted_abort(
+                tdir, task_id="t", run_id="r", target=Path("/x/y.rs"),
+                module="y", backend="claude", end_reason="ERROR",
+                message="boom",
+            )
+            self.assertFalse(result.success)
+            self.assertEqual(result.end_reason, "ERROR")
+            written = json.loads((tdir / "result.json").read_text())
+            self.assertEqual(written["end_reason"], "ERROR")
+            self.assertEqual(written["error_message"], "boom")
+            self.assertIs(written["success"], False)
+
+    def test_helper_carries_optional_receipt_fields(self):
+        # The five sites do not share one field set; the helper takes the
+        # union rather than silently normalizing a site's output away.
+        import run
+        with tempfile.TemporaryDirectory() as td:
+            tdir = Path(td)
+            run._persisted_abort(
+                tdir, task_id="t", run_id="r", target=Path("/x/y.rs"),
+                module="y", backend="claude",
+                end_reason="PREMODEL_GATE_INDETERMINATE", message="warm",
+                duration_seconds=12.5,
+                final_tree_receipt={"tree_hash": "abc"},
+                lineage_context={"predecessor": "p"},
+            )
+            written = json.loads((tdir / "result.json").read_text())
+            self.assertEqual(written["duration_seconds"], 12.5)
+            self.assertEqual(written["final_tree_receipt"]["tree_hash"], "abc")
+            self.assertEqual(written["lineage_context"]["predecessor"], "p")
+
+    def test_every_early_exit_routes_through_the_persisting_helper(self):
+        # Structural pin: a sixth early exit cannot be added that constructs a
+        # TaskResult directly and forgets to persist it. The only permitted
+        # constructions are the helper itself and the terminal result.
+        import inspect
+        import run
+        source = inspect.getsource(run)
+        self.assertEqual(source.count("TaskResult("), 2, source.count("TaskResult("))
+        self.assertIn("def _persisted_abort(", source)
+
+    def test_unbindable_source_tree_raises_typed_not_bare(self):
+        # provenance refuses to hash a tree it cannot bind. That refusal must
+        # be catchable, not an unhandled traceback at one of fourteen call
+        # sites — a dead process gives the supervisor no verdict at all.
+        import run
+        with tempfile.TemporaryDirectory() as td, \
+                tempfile.TemporaryDirectory() as external:
+            project = Path(td) / "crate"
+            (project / "src").mkdir(parents=True)
+            (Path(td) / "Cargo.toml").write_text(
+                "[workspace]\nmembers = ['crate']\n")
+            (project / "Cargo.toml").write_text(
+                "[package]\nname='crate'\nversion='0.1.0'\n")
+            (project / "src" / "lib.rs").write_text("pub fn a() {}\n")
+            (Path(external) / "oracle.rs").write_text("pub fn o() {}\n")
+            (project / "src" / "oracle").symlink_to(external)
+            with self.assertRaises(run.SourceReceiptInvalid):
+                run._source_tree_receipt(project)
+            # A bindable tree still returns normally.
+            (project / "src" / "oracle").unlink()
+            self.assertIn("tree_hash", run._source_tree_receipt(project))
+
+    def test_both_receipt_phases_of_main_can_persist_a_verdict(self):
+        # Scored-lineage validation hashes the tree BEFORE run_task, so an
+        # unbindable tree there escaped the run_task handler entirely — and
+        # run_id/results_root were not yet defined, so there was nowhere to
+        # write the verdict even if it had been caught. Pin both the ordering
+        # and the shared handler.
+        source = (REPO_ROOT / "run.py").read_text()
+        run_id_at = source.index("    run_id = args.run_id or results.run_id_new()")
+        lineage_at = source.index("            lineage_context = _validate_scored_lineage_context(")
+        run_task_at = source.index("    result = run_task_persisting(")
+        self.assertLess(run_id_at, lineage_at,
+                        "run_id must exist before the lineage receipt phase")
+        self.assertLess(run_id_at, run_task_at)
+        # Exactly TWO call sites route to the one persisting handler: the
+        # run_task boundary wrapper, and the pre-run scored-lineage phase
+        # (which is not a run_task call and so needs its own). main() keeps no
+        # third catch of its own — it routes through the wrapper, so there is
+        # one mechanism per entry rather than two that can drift apart.
+        self.assertEqual(
+            source.count("_abort_source_receipt_invalid(") - 1, 2)
+        self.assertEqual(source.count("def _abort_source_receipt_invalid("), 1)
+        self.assertEqual(source.count("def run_task_persisting("), 1)
+
+    def test_source_receipt_invalid_handler_writes_a_classifiable_result(self):
+        import run
+        with tempfile.TemporaryDirectory() as td:
+            results_root = Path(td) / "results"
+            target = Path(td) / "crate" / "src" / "lib.rs"
+            target.parent.mkdir(parents=True)
+            target.write_text("pub fn a() {}\n")
+            aborted = run._abort_source_receipt_invalid(
+                results_root, "run-1", target, "claude",
+                run.SourceReceiptInvalid("source symlink escapes workspace"),
+            )
+            self.assertEqual(aborted.end_reason, "SOURCE_RECEIPT_INVALID")
+            self.assertFalse(aborted.success)
+            target_id = run.results.target_id_from_path(target)
+            written = json.loads(
+                (run.task_dir(results_root, "run-1", target_id)
+                 / "result.json").read_text()
+            )
+            self.assertEqual(written["end_reason"], "SOURCE_RECEIPT_INVALID")
+            self.assertIs(written["success"], False)
+            self.assertIn("escapes workspace", written["error_message"])
+
+    def test_direct_caller_of_run_task_still_persists_a_verdict(self):
+        # EXECUTABLE, not a source-string count: main() is not the only entry
+        # point. run_layer.py imports and calls the run_task boundary directly,
+        # so a handler living only in main() left the documented layer-set
+        # entry point with no per-target result.json when the tree cannot be
+        # bound. Drive the boundary with a run_task that raises, exactly as an
+        # unbindable tree would, and assert the verdict lands on disk.
+        import run
+        with tempfile.TemporaryDirectory() as td:
+            results_root = Path(td) / "results"
+            target = Path(td) / "crate" / "src" / "lib.rs"
+            target.parent.mkdir(parents=True)
+            target.write_text("pub fn a() {}\n")
+
+            real = run.run_task
+
+            def exploding(**kwargs):
+                raise run.SourceReceiptInvalid(
+                    "source symlink escapes workspace: src/oracle")
+
+            run.run_task = exploding
+            try:
+                result = run.run_task_persisting(
+                    results_root=results_root, run_id="run-1",
+                    target=target, backend="claude",
+                )
+            finally:
+                run.run_task = real
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.end_reason, "SOURCE_RECEIPT_INVALID")
+            target_id = run.results.target_id_from_path(target)
+            written = json.loads(
+                (run.task_dir(results_root, "run-1", target_id)
+                 / "result.json").read_text()
+            )
+            self.assertEqual(written["end_reason"], "SOURCE_RECEIPT_INVALID")
+            self.assertIn("escapes workspace", written["error_message"])
+
+    def test_layer_runner_uses_the_persisting_boundary(self):
+        # The layer runner must be bound to the boundary wrapper itself, not
+        # to bare run_task — the blocker codex found.
+        import run
+        import run_layer
+        self.assertIs(run_layer.run_task_persisting, run.run_task_persisting)
+        source = (REPO_ROOT / "run_layer.py").read_text()
+        self.assertNotIn("from run import run_task\n", source)
+        self.assertNotIn("result = run_task(", source)
+
+    def test_layer_budget_uses_authoritative_admit_counter(self):
+        source = (REPO_ROOT / "run_layer.py").read_text()
+        self.assertIn(
+            "_admits.count_non_axiom(target.read_text())", source)
+        self.assertNotIn('.count("admit()")', source)
+
+    def test_no_call_site_bypasses_the_typed_wrapper(self):
+        # Structural pin: exactly one direct provenance call may remain, and
+        # it is the one inside the wrapper.
+        source = (REPO_ROOT / "run.py").read_text()
+        self.assertEqual(
+            source.count("provenance.source_tree_receipt(project)"), 1)
+        self.assertIn("class SourceReceiptInvalid", source)
+        self.assertIn("except SourceReceiptInvalid as exc:", source)
+
+
+class PublicReadinessPathLeaks(unittest.TestCase):
+    """No tracked source may embed a developer's home directory.
+
+    This repository is published. A hardcoded `/Users/<name>` or
+    `/home/<name>` leaks whoever built it, and in `--help` text it leaks to
+    every user who runs the tool. The gate is a PATTERN, deliberately: an
+    earlier hand-audit of this same question grepped for the three usernames
+    the auditor happened to know and passed while a fourth sat in a demo
+    script. A scan whose completeness depends on the scanner's memory is a
+    spot check, not a gate.
+    """
+
+    _HOME_PATH = re.compile(r"/(?:Users|home)/[a-z][a-z0-9_-]*", re.IGNORECASE)
+
+    def _tracked_sources(self) -> list[Path]:
+        listed = subprocess.run(
+            ["git", "ls-files", "-z", "*.py", "*.sh"],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        ).stdout.split("\0")
+        return [REPO_ROOT / name for name in listed if name]
+
+    def test_no_home_directory_paths_in_tracked_sources(self):
+        offenders: list[str] = []
+        for path in self._tracked_sources():
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for number, line in enumerate(text.splitlines(), start=1):
+                match = self._HOME_PATH.search(line)
+                if match:
+                    rel = path.relative_to(REPO_ROOT).as_posix()
+                    offenders.append(f"{rel}:{number}: {match.group(0)}")
+        self.assertEqual(
+            offenders, [],
+            "tracked source embeds developer home paths:\n  "
+            + "\n  ".join(offenders),
+        )
+
+    def test_cli_help_text_is_free_of_home_paths(self):
+        # The narrower, higher-severity case: --help is printed to users.
+        import run
+        parser_source = (REPO_ROOT / "run.py").read_text(encoding="utf-8")
+        start = parser_source.index("def main() -> int:")
+        self.assertIsNone(
+            self._HOME_PATH.search(parser_source[start:]),
+            "run.py CLI help must not contain a developer home path",
+        )
+
+    def test_tooling_gate_covers_all_live_harness_surfaces(self):
+        source = (REPO_ROOT / "run.py").read_text()
+        for marker in (
+            'HERE.glob("*.py")', 'HERE.glob("*.sh")',
+            'HERE.glob("prompt*.md")', 'HERE / "skills/SKILL.md"',
+            'HERE.glob("skills/**/*.json")', 'HERE.glob("lib/**/*.json")',
+            'HERE.glob("docker/**/*.py")', 'HERE.glob("docker/**/*.sh")',
+            'HERE.glob("docker/**/*.json")', 'HERE.glob("scripts/**/*.py")',
+        ):
+            self.assertIn(marker, source)
+        self.assertIn("for f in sorted(files):", source)
+
 
 class FinalEndReasonGate(unittest.TestCase):
     """`run._final_end_reason` resolves the recorded end_reason from the
@@ -2713,7 +3087,7 @@ class FeedbackVisibilityHelpers(unittest.TestCase):
             ("whole-crate source-span Verus errors", 2),
         )
 
-    def test_resource_limit_diagnostic_is_not_source_span_progress(self):
+    def test_resource_limit_diagnostic_is_tracked_as_separate_proof_progress(self):
         import run
         verus_result = {
             "okay": False,
@@ -2736,6 +3110,15 @@ class FeedbackVisibilityHelpers(unittest.TestCase):
             {"resource-limit": 1},
         )
         self.assertEqual(run._verification_error_count(verus_result), 0)
+        self.assertTrue(run._has_determinate_proof_diagnostic(verus_result))
+        self.assertFalse(run._compile_blocked_or_indeterminate(verus_result))
+        self.assertFalse(
+            run._plateau_metric_indeterminate("field-floor", 0, verus_result)
+        )
+        self.assertEqual(
+            run._plateau_progress_metric("field-floor", 0, verus_result),
+            ("whole-crate resource-limit proof obligations", 1),
+        )
 
     def test_complete_gate_blocks_unreplayed_resource_limit_group(self):
         import run
@@ -3277,15 +3660,6 @@ class RetryMemoryTaint(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertTrue(run._should_persist_retry_memory(reason))
 
-    def test_tooling_gate_covers_top_level_and_post_run_authority(self):
-        source = (REPO_ROOT / "run.py").read_text()
-        for marker in (
-            'HERE.glob("*.py")', 'HERE.glob("*.sh")',
-            'HERE.glob("prompt*.md")', 'HERE.glob("docker/**/*.py")',
-            'HERE.glob("docker/**/*.json")', 'HERE.glob("scripts/**/*.py")',
-        ):
-            self.assertIn(marker, source)
-
 
 class ProcessCrosstalkDetection(unittest.TestCase):
     def _raw(self, td: str, blocks: list[dict]) -> Path:
@@ -3546,6 +3920,167 @@ class TaskResultFinalTelemetry(unittest.TestCase):
         self.assertEqual(run._diagnostic_kind_counts(verus_result)["build-wrapper"], 1)
         self.assertEqual(run._verification_error_count(verus_result), 1)
         self.assertFalse(run._compile_blocked_or_indeterminate(verus_result))
+
+    def test_build_wrapper_does_not_mask_resource_limit_proof_owner(self):
+        import run
+
+        # Exact diagnostic shape observed at tcv14-000002 round 1: the final
+        # verification error was discharged, leaving only source-spanned
+        # rlimits plus Cargo's generic failed-build wrapper.
+        verus_result = {
+            "okay": False,
+            "messages": [
+                {
+                    "severity": "error",
+                    "file": "curve25519-dalek/src/lizard/lizard_ristretto.rs",
+                    "line": 775,
+                    "column": 5,
+                    "data": "function body check: Resource limit (rlimit) exceeded",
+                },
+                {
+                    "severity": "error",
+                    "file": "curve25519-dalek/src/ristretto.rs",
+                    "line": 1710,
+                    "column": 9,
+                    "data": "while loop: Resource limit (rlimit) exceeded",
+                },
+                {
+                    "severity": "error",
+                    "file": "",
+                    "line": 0,
+                    "column": 0,
+                    "data": (
+                        "could not compile `curve25519-dalek` (lib) "
+                        "due to 2 previous errors"
+                    ),
+                },
+            ],
+        }
+
+        self.assertEqual(
+            run._diagnostic_kind_counts(verus_result),
+            {"resource-limit": 2, "build-wrapper": 1},
+        )
+        self.assertTrue(run._has_determinate_proof_diagnostic(verus_result))
+        self.assertFalse(run._compile_blocked_or_indeterminate(verus_result))
+        self.assertFalse(
+            run._plateau_metric_indeterminate("field-floor", 0, verus_result)
+        )
+        self.assertEqual(
+            run._plateau_progress_metric("field-floor", 0, verus_result),
+            ("whole-crate resource-limit proof obligations", 2),
+        )
+
+    def test_resource_limit_plus_timeout_remains_indeterminate(self):
+        import run
+
+        verus_result = {
+            "okay": False,
+            "messages": [
+                {
+                    "severity": "error",
+                    "file": "curve25519-dalek/src/ristretto.rs",
+                    "line": 1710,
+                    "column": 9,
+                    "data": "while loop: Resource limit (rlimit) exceeded",
+                },
+                {
+                    "severity": "error",
+                    "file": "",
+                    "line": 0,
+                    "column": 0,
+                    "data": "verus timed out after 900s and was killed",
+                },
+                {
+                    "severity": "error",
+                    "file": "",
+                    "line": 0,
+                    "column": 0,
+                    "data": (
+                        "could not compile `curve25519-dalek` (lib) "
+                        "due to 2 previous errors"
+                    ),
+                },
+            ],
+        }
+
+        self.assertFalse(run._has_determinate_proof_diagnostic(verus_result))
+        self.assertTrue(run._compile_blocked_or_indeterminate(verus_result))
+        self.assertTrue(
+            run._plateau_metric_indeterminate("field-floor", 0, verus_result)
+        )
+
+    def test_resource_limit_plus_compile_error_remains_indeterminate(self):
+        import run
+
+        verus_result = {
+            "okay": False,
+            "messages": [
+                {
+                    "severity": "error",
+                    "file": "curve25519-dalek/src/ristretto.rs",
+                    "line": 1710,
+                    "column": 9,
+                    "data": "while loop: Resource limit (rlimit) exceeded",
+                },
+                {
+                    "severity": "error",
+                    "file": "curve25519-dalek/src/field.rs",
+                    "line": 18,
+                    "column": 5,
+                    "data": "cannot find function `missing_lemma` in this scope",
+                },
+            ],
+        }
+
+        self.assertFalse(run._has_determinate_proof_diagnostic(verus_result))
+        self.assertTrue(run._compile_blocked_or_indeterminate(verus_result))
+        self.assertTrue(
+            run._plateau_metric_indeterminate("field-floor", 0, verus_result)
+        )
+
+    def test_spanless_resource_limit_remains_indeterminate(self):
+        import run
+
+        verus_result = {
+            "okay": False,
+            "messages": [{
+                "severity": "error",
+                "file": "",
+                "line": 0,
+                "column": 0,
+                "data": "Resource limit (rlimit) exceeded",
+            }],
+        }
+
+        self.assertFalse(run._has_determinate_proof_diagnostic(verus_result))
+        self.assertTrue(run._compile_blocked_or_indeterminate(verus_result))
+        self.assertTrue(
+            run._plateau_metric_indeterminate("field-floor", 0, verus_result)
+        )
+
+    def test_build_wrapper_only_remains_indeterminate(self):
+        import run
+
+        verus_result = {
+            "okay": False,
+            "messages": [{
+                "severity": "error",
+                "file": "",
+                "line": 0,
+                "column": 0,
+                "data": (
+                    "could not compile `curve25519-dalek` (lib) "
+                    "due to 1 previous error"
+                ),
+            }],
+        }
+
+        self.assertFalse(run._has_determinate_proof_diagnostic(verus_result))
+        self.assertTrue(run._compile_blocked_or_indeterminate(verus_result))
+        self.assertTrue(
+            run._plateau_metric_indeterminate("field-floor", 0, verus_result)
+        )
 
     def test_resolve_error_is_compile_blocker_not_proof_obligation(self):
         import run
@@ -3855,8 +4390,80 @@ class ScoredLineageBoundaryTests(unittest.TestCase):
                 (root / "premodel_verifier_warm.json").read_text()
             )
             self.assertFalse(failure["completed"])
-            self.assertEqual(failure["failure_reason"], "INDETERMINATE_GATE")
+            self.assertEqual(
+                failure["failure_reason"],
+                "INCOHERENT_OR_INDETERMINATE_GATE",
+            )
             self.assertTrue(failure["retryable_infrastructure"])
+
+    def test_premodel_warm_rejects_empty_or_returncode_incoherent_result(self):
+        import run
+
+        cases = (
+            (
+                "empty_failed",
+                1,
+                {"okay": False, "truncated": False, "verified_count": 0,
+                 "error_count": 1, "messages": []},
+            ),
+            (
+                "green_nonzero",
+                1,
+                {"okay": True, "truncated": False, "verified_count": 1,
+                 "messages": []},
+            ),
+            (
+                "failed_zero",
+                0,
+                {"okay": False, "truncated": False, "verified_count": 0,
+                 "messages": [{"file": "x.rs", "line": 1,
+                                "data": "postcondition not satisfied"}]},
+            ),
+            (
+                "unexpected_rc",
+                2,
+                {"okay": False, "truncated": False, "verified_count": 0,
+                 "messages": [{"file": "x.rs", "line": 1,
+                                "data": "postcondition not satisfied"}]},
+            ),
+        )
+        for name, returncode, result in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                project = root / "project"
+                project.mkdir()
+                target = project / "target.rs"
+                target.write_text("proof fn x() {}\n")
+                with mock.patch.object(
+                    run, "run_subskill",
+                    return_value=(returncode, json.dumps(result), ""),
+                ):
+                    with self.assertRaisesRegex(ValueError, "authoritatively"):
+                        run._premodel_verifier_warm(
+                            tdir=root, project=project,
+                            gate_commands=[["verus_check", str(target),
+                                            "--whole-crate", "--timeout", "900"]],
+                            env={}, lineage_id="lineage",
+                        )
+                failure = json.loads(
+                    (root / "premodel_verifier_warm.json").read_text()
+                )
+                self.assertFalse(failure["completed"])
+                self.assertEqual(
+                    failure["failure_reason"],
+                    "INCOHERENT_OR_INDETERMINATE_GATE",
+                )
+
+    def test_all_gate_parsers_use_fail_closed_malformed_shape(self):
+        import run
+
+        parsed, malformed = run._parse_verus_gate_stdout("not-json")
+        self.assertTrue(malformed)
+        self.assertFalse(parsed["okay"])
+        self.assertTrue(parsed["truncated"])
+        self.assertIsNone(parsed.get("verified_count"))
+        receipt = {"verus_result": parsed, "vector": {"verified_count": None}}
+        self.assertFalse(run._gate_receipt_decided(receipt))
 
     def test_premodel_warm_persists_malformed_result_before_raising(self):
         import run
@@ -4077,35 +4684,6 @@ class ScoredLineageBoundaryTests(unittest.TestCase):
             run._provider_deadline_seconds(1_300.0, 20.0, 990.0),
             run._MIN_PRODUCTIVE_ROUND_SEC,
         )
-
-    def test_launch_budget_auto_raises_but_explicit_errors(self):
-        import run
-
-        # F3: whole-crate terminal reserve (930s) exceeds the 20-minute auto
-        # floor's headroom, so a bare whole-crate run would exit LIMIT with
-        # zero rounds. An AUTO budget raises to the launch minimum; an
-        # EXPLICIT budget stays a hard error.
-        minutes, agent_s, raised, error = run._resolve_launch_budget(
-            20.0, "field-floor", 930.0, budget_is_auto=True)
-        self.assertTrue(raised)
-        self.assertIsNone(error)
-        self.assertEqual(agent_s, 930.0 + run._MIN_PRODUCTIVE_ROUND_SEC)
-        self.assertAlmostEqual(
-            minutes, (930.0 + run._MIN_PRODUCTIVE_ROUND_SEC + 930.0) / 60.0)
-
-        minutes, agent_s, raised, error = run._resolve_launch_budget(
-            20.0, "field-floor", 930.0, budget_is_auto=False)
-        self.assertFalse(raised)
-        self.assertIn("cannot fund one provider round", error)
-        self.assertEqual(minutes, 20.0)
-
-        # A funded budget passes through unchanged in both modes.
-        minutes, agent_s, raised, error = run._resolve_launch_budget(
-            90.0, "field-floor", 930.0, budget_is_auto=True)
-        self.assertFalse(raised)
-        self.assertIsNone(error)
-        self.assertEqual(minutes, 90.0)
-        self.assertEqual(agent_s, 90.0 * 60 - 930.0)
 
     def test_undersized_budget_fails_before_agent_or_gate(self):
         import run
@@ -4377,6 +4955,185 @@ class ScoredLineageBoundaryTests(unittest.TestCase):
             )["bank_relation"],
             "REGRESSED",
         )
+
+    def test_terminal_path_restores_regressed_best_before_fresh_gate(self):
+        """A post-round wall exit cannot strand the earlier decided best."""
+        import run
+
+        def gate(tree_hash, verification, raw, round_number):
+            return {
+                "round_number": round_number,
+                "compile_blocked": False,
+                "tree_receipt": {"tree_hash": tree_hash},
+                "vector": {
+                    "verification_errors": verification,
+                    "resource_limits": 5,
+                    "timeouts": 0,
+                    "panics": 0,
+                    "build_wrappers": 1,
+                    "compile_errors": 0,
+                    "raw_errors": raw,
+                    "verified_count": 1695,
+                },
+                "verus_result": {
+                    "truncated": False,
+                    "verified_count": 1695,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td)
+            (project / "Cargo.toml").write_text(
+                "[package]\nname='terminal-restore-test'\nversion='0.1.0'\n"
+            )
+            target = project / "src" / "lib.rs"
+            target.parent.mkdir()
+            target.write_text("// round 6 best\n")
+            snapshots = project / "receipts" / "snapshots"
+            run.snapshot_files([target], snapshots / "round_6")
+            best_tree = run.provenance.source_tree_receipt(project)
+
+            target.write_text("// round 8 regressed\n")
+            last_tree = run.provenance.source_tree_receipt(project)
+            receipt = run._prepare_terminal_best_frontier(
+                experiment_mode="field-floor",
+                final_end_reason="LIMIT",
+                best_decided_gate=gate(best_tree["tree_hash"], 10, 16, 6),
+                last_gate=gate(last_tree["tree_hash"], 12, 18, 8),
+                best_snapshot_round=6,
+                snapshot_targets=[target],
+                snapshots_root=snapshots,
+                project=project,
+            )
+
+            self.assertEqual(receipt["relation"], "REGRESSED")
+            self.assertEqual(receipt["status"], "RESTORED")
+            self.assertTrue(receipt["attempted"])
+            self.assertTrue(receipt["okay"])
+            self.assertEqual(target.read_text(), "// round 6 best\n")
+            self.assertEqual(
+                receipt["restored_tree_receipt"]["tree_hash"],
+                best_tree["tree_hash"],
+            )
+
+    def test_terminal_restore_tree_mismatch_fails_closed_without_copy(self):
+        import run
+
+        def gate(tree_hash, verification, raw, round_number):
+            return {
+                "round_number": round_number,
+                "compile_blocked": False,
+                "tree_receipt": {"tree_hash": tree_hash},
+                "vector": {
+                    "verification_errors": verification,
+                    "resource_limits": 5,
+                    "timeouts": 0,
+                    "panics": 0,
+                    "build_wrappers": 1,
+                    "compile_errors": 0,
+                    "raw_errors": raw,
+                    "verified_count": 1695,
+                },
+                "verus_result": {
+                    "truncated": False,
+                    "verified_count": 1695,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td)
+            (project / "Cargo.toml").write_text(
+                "[package]\nname='terminal-restore-test'\nversion='0.1.0'\n"
+            )
+            target = project / "src" / "lib.rs"
+            target.parent.mkdir()
+            target.write_text("// best\n")
+            snapshots = project / "receipts" / "snapshots"
+            run.snapshot_files([target], snapshots / "round_6")
+            best_tree = run.provenance.source_tree_receipt(project)
+            target.write_text("// regressed sealed round\n")
+            last_tree = run.provenance.source_tree_receipt(project)
+            target.write_text("// unbound post-gate mutation\n")
+
+            receipt = run._prepare_terminal_best_frontier(
+                experiment_mode="field-floor",
+                final_end_reason="LIMIT",
+                best_decided_gate=gate(best_tree["tree_hash"], 10, 16, 6),
+                last_gate=gate(last_tree["tree_hash"], 12, 18, 8),
+                best_snapshot_round=6,
+                snapshot_targets=[target],
+                snapshots_root=snapshots,
+                project=project,
+            )
+
+            self.assertTrue(receipt["attempted"])
+            self.assertFalse(receipt["okay"])
+            self.assertEqual(receipt["status"], "FAILED")
+            self.assertEqual(
+                receipt["failure_reason"],
+                "CURRENT_TREE_DOES_NOT_MATCH_LAST_GATE",
+            )
+            self.assertEqual(target.read_text(), "// unbound post-gate mutation\n")
+
+    def test_terminal_restore_recognizes_already_restored_best(self):
+        # T315 H4: a loop-local budget-bail rollback restores the best tree
+        # WITHOUT refreshing last_gate. The terminal path used to reject that
+        # honest state as CURRENT_TREE_DOES_NOT_MATCH_LAST_GATE, destroying
+        # the bank — it must recognize current==expected_best instead.
+        import run
+
+        def gate(tree_hash, verification, raw, round_number):
+            return {
+                "round_number": round_number,
+                "compile_blocked": False,
+                "tree_receipt": {"tree_hash": tree_hash},
+                "vector": {
+                    "verification_errors": verification,
+                    "resource_limits": 5,
+                    "timeouts": 0,
+                    "panics": 0,
+                    "build_wrappers": 1,
+                    "compile_errors": 0,
+                    "raw_errors": raw,
+                    "verified_count": 1695,
+                },
+                "verus_result": {
+                    "truncated": False,
+                    "verified_count": 1695,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td)
+            (project / "Cargo.toml").write_text(
+                "[package]\nname='terminal-restore-test'\nversion='0.1.0'\n"
+            )
+            target = project / "src" / "lib.rs"
+            target.parent.mkdir()
+            target.write_text("// round 6 best\n")
+            snapshots = project / "receipts" / "snapshots"
+            run.snapshot_files([target], snapshots / "round_6")
+            best_tree = run.provenance.source_tree_receipt(project)
+            target.write_text("// round 8 regressed\n")
+            last_tree = run.provenance.source_tree_receipt(project)
+            # The budget-bail rollback already restored the best bytes:
+            target.write_text("// round 6 best\n")
+
+            receipt = run._prepare_terminal_best_frontier(
+                experiment_mode="field-floor",
+                final_end_reason="LIMIT",
+                best_decided_gate=gate(best_tree["tree_hash"], 10, 16, 6),
+                last_gate=gate(last_tree["tree_hash"], 12, 18, 8),
+                best_snapshot_round=6,
+                snapshot_targets=[target],
+                snapshots_root=snapshots,
+                project=project,
+            )
+
+            self.assertEqual(receipt["status"], "ALREADY_RESTORED")
+            self.assertTrue(receipt["attempted"])
+            self.assertTrue(receipt["okay"])
+            self.assertEqual(target.read_text(), "// round 6 best\n")
 
     def test_single_target_rollback_keeps_last_green_semantics(self):
         import run
@@ -4814,6 +5571,136 @@ class VectorRelationSharedBody(unittest.TestCase):
         source = (REPO_ROOT / "docker" / "trusted_core_next_package.py").read_text()
         self.assertNotIn("def _vector_relation", source)
         self.assertIn("frontier.vector_relation", source)
+
+    def test_admit_increase_dominates_verification_decrease(self):
+        # T315 H2: admit() erases verification errors trivially, so an
+        # admit-stuffed tree (verification 1->0, hard_admits 0->50) must be
+        # REGRESSED, never IMPROVED/banked. Terminal vectors always carry
+        # hard_admits; the key is compared before verification.
+        from lib.frontier import vector_relation
+        prev = {"verification_errors": 1, "resource_limits": 0,
+                "raw_errors": 2, "verified_count": 1800, "hard_admits": 0}
+        cur = {"verification_errors": 0, "resource_limits": 0,
+               "raw_errors": 1, "verified_count": 1800, "hard_admits": 50}
+        for mode in ("equal", "zero"):
+            self.assertEqual(
+                vector_relation(prev, cur, previous_tree_hash="a",
+                                current_tree_hash="b", missing_previous=mode),
+                "REGRESSED",
+            )
+        # Round telemetry vectors may lack the key on BOTH sides — no effect.
+        self.assertEqual(
+            vector_relation(
+                {"verification_errors": 2, "raw_errors": 3},
+                {"verification_errors": 1, "raw_errors": 2},
+                previous_tree_hash="a", current_tree_hash="b",
+                missing_previous="equal",
+            ),
+            "IMPROVED",
+        )
+        # Admit-decrease alone does not promote; verification still decides.
+        self.assertEqual(
+            vector_relation(
+                {"verification_errors": 1, "hard_admits": 3,
+                 "raw_errors": 2, "verified_count": 10},
+                {"verification_errors": 1, "hard_admits": 0,
+                 "raw_errors": 2, "verified_count": 10},
+                previous_tree_hash="a", current_tree_hash="b",
+                missing_previous="zero",
+            ),
+            "NEUTRAL",
+        )
+
+    def test_mixed_hard_admit_presence_never_falsely_regresses(self):
+        # Review of the first fix: round/premodel gate vectors historically
+        # omit hard_admits while fresh terminal vectors carry it. Coercing an
+        # absent previous to 0 read a false REGRESSED against every honest
+        # bank that still had admits in scope, destroying the leg. Absent on
+        # either side means unknown, and unknown must not decide the order.
+        from lib.frontier import vector_relation
+        legacy_prev = {"verification_errors": 12, "resource_limits": 2,
+                       "raw_errors": 15, "verified_count": 1500}
+        terminal_cur = {"verification_errors": 8, "resource_limits": 2,
+                        "raw_errors": 11, "verified_count": 1540,
+                        "hard_admits": 3}
+        for mode in ("equal", "zero"):
+            self.assertEqual(
+                vector_relation(legacy_prev, terminal_cur,
+                                previous_tree_hash="a", current_tree_hash="b",
+                                missing_previous=mode),
+                "IMPROVED",
+            )
+        # Reverse asymmetry (previous carries it, current does not) is also
+        # unknown — not a free pass to REGRESSED.
+        self.assertEqual(
+            vector_relation({**legacy_prev, "hard_admits": 0},
+                            {k: v for k, v in terminal_cur.items()
+                             if k != "hard_admits"},
+                            previous_tree_hash="a", current_tree_hash="b",
+                            missing_previous="zero"),
+            "IMPROVED",
+        )
+        # When BOTH carry it, the dominance rule still fires.
+        self.assertEqual(
+            vector_relation({**legacy_prev, "hard_admits": 0}, terminal_cur,
+                            previous_tree_hash="a", current_tree_hash="b",
+                            missing_previous="zero"),
+            "REGRESSED",
+        )
+
+    def test_round_gate_vectors_carry_hard_admits(self):
+        # The dominance rule is only live where both vectors carry the key, so
+        # the in-loop promotion path (where admit stuffing actually happens)
+        # must emit it — not just the fresh terminal gate.
+        import inspect
+        import run
+        source = inspect.getsource(run._gate_receipt)
+        self.assertIn("hard_admits", source)
+        signature = inspect.signature(run._gate_receipt)
+        self.assertIn("hard_admits", signature.parameters)
+        with tempfile.TemporaryDirectory() as td:
+            receipt = run._gate_receipt(
+                Path(td), 3, {"tree_hash": "t"}, [["verus"]],
+                {"okay": False, "messages": []}, 1, hard_admits=7,
+            )
+            self.assertEqual(receipt["vector"]["hard_admits"], 7)
+            # Omitted stays omitted (legacy shape), never a silent zero.
+            plain = run._gate_receipt(
+                Path(td), 3, {"tree_hash": "t"}, [["verus"]],
+                {"okay": False, "messages": []}, 1,
+            )
+            self.assertNotIn("hard_admits", plain["vector"])
+
+    def test_verification_decrease_with_rlimit_growth_is_displaced(self):
+        # T315 M2: erasing source verification errors while GROWING the
+        # solver-limit set is displacement (same principle as the wrapper
+        # kinds) — otherwise 1 verif -> 0 verif + 30 rlimit reads IMPROVED
+        # and the terminal restore prefers the rlimit explosion.
+        from lib.frontier import vector_relation
+        self.assertEqual(
+            vector_relation(
+                {"verification_errors": 1, "resource_limits": 0,
+                 "raw_errors": 2, "verified_count": 1800, "hard_admits": 0},
+                {"verification_errors": 0, "resource_limits": 30,
+                 "raw_errors": 31, "verified_count": 1800, "hard_admits": 0},
+                previous_tree_hash="a", current_tree_hash="b",
+                missing_previous="zero",
+            ),
+            "DISPLACED",
+        )
+        # The real campaign shape (verification AND rlimits both decreased)
+        # stays IMPROVED: tcv14-000002 R1, 1/3 -> 0/2.
+        self.assertEqual(
+            vector_relation(
+                {"verification_errors": 1, "resource_limits": 3,
+                 "raw_errors": 5, "verified_count": 1790, "hard_admits": 0},
+                {"verification_errors": 0, "resource_limits": 2,
+                 "raw_errors": 3, "verified_count": 1793, "hard_admits": 0},
+                previous_tree_hash="a", current_tree_hash="b",
+                missing_previous="zero",
+            ),
+            "IMPROVED",
+        )
 
     def test_transaction_now_regresses_on_verification_increase(self):
         # Clean-pass semantic strengthening: +verification/-secondary was

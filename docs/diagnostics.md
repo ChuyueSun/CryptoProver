@@ -29,10 +29,10 @@ the same run-id + target it first archives the whole previous task
 directory to `results/<run_id>/_usage_history/<launch_instance_id>/<task_id>/`
 — the same layout, one level down — so an "empty" or missing
 `results/<run_id>/<task_id>/` after a relaunch means the artifacts moved,
-not that they were lost. A direct `run.py` rerun (no launcher) instead
-moves only the immutable receipts (promotion/gate/reset-handoff) into the
-task dir's `_superseded_receipts/attempt_<n>/`; round and result JSON are
-overwritten in place.
+not that they were lost. A direct `run.py` or `run_layer.py` rerun instead
+moves only immutable promotion/warm/lineage/frontier/gate/reset-handoff
+receipts into the task dir's `_superseded_receipts/attempt_<n>/`; mutable
+round, result, and stream evidence remains in the live task directory.
 
 **Recovered integrity drift is not progress.** A round whose source or frozen
 surface drift is reverted records its apparent pre-revert transaction as audit
@@ -568,6 +568,12 @@ jq '{bank: .final_tree_receipt.tree_hash,
 snapshot. In whole-crate partial-progress mode no intermediate round is green,
 so that pointer remains round 0 even while authoritative gates improve.
 
+A second exit-path variant was observed in production on 2026-08-03: the wall
+deadline expired after a regressed round had sealed, without returning through
+the next top-of-loop budget check. The loop-local best restore therefore never
+ran. `BANK_DOMINATED` still prevented a bad successor, but a strictly better
+decided snapshot was left stranded until human review.
+
 A large `bank changes unauthorized paths` list is not evidence of this bug by
 itself. The production peel-manifest schema is `files[].path`; a successor
 generator that reads a fixture-only key such as `editable_files` collapses its
@@ -579,7 +585,17 @@ stop to the bank tree. Production-schema regression tests must load the real
 **Fix / invariant**: whole-crate rollback uses the best decided partial
 frontier, not the last fully green snapshot. Terminal promotion records that
 frontier and refuses a reusable bank with `state: BANK_DOMINATED`. The
-successor generator independently rechecks bank-versus-frontier ordering and
+terminal path also prepares the frontier immediately before the fresh banking
+gate, independent of how the loop exited: when the shared comparator says the
+last decided gate `REGRESSED`, the runner first requires the live tree to equal
+that last gate, restores the recorded best snapshot, and requires the restored
+tree to hash exactly to the best gate. Only then may the fresh gate run. A
+missing snapshot or either tree mismatch yields
+`TERMINAL_FRONTIER_RESTORE_FAILED`, nonreusable and non-scoreable. An
+incomparable `DISPLACED` frontier is deliberately not auto-selected; it
+continues to the existing `BANK_DOMINATED` human-review stop.
+
+The successor generator independently rechecks bank-versus-frontier ordering and
 tree identity, and derives edit authority from the validated production
 `files[].path` manifest entries plus generated `Cargo.lock`. Missing, empty,
 malformed, absolute, or parent-traversing authority fails closed rather than
@@ -594,6 +610,21 @@ the successor generator all delegate to the ONE production comparator in
 to prevent primary-metric loss at rollback, terminal banking, and successor
 boundaries. Treat
 `BANK_DOMINATED` as a human-review stop; never manually advance the successor.
+
+An exhaustive whole-crate gate whose remaining source diagnostics are only
+SMT resource limits is still a **decided partial frontier**. Cargo appends a
+generic `could not compile ... previous errors` build wrapper to those proof
+obligations; that wrapper must not relabel the gate compile-blocked merely
+because the verification-error count reached zero. This exact terminal-phase
+shape occurred in `tcv14-000002` round 1: `0 verification / 2 rlimit /
+build-wrapper1`, and the old classifier stranded a strictly better tree behind
+the earlier `1 verification / 3 rlimit` authority. Treat `rlimit + wrapper` as
+determinate, and let the plateau guard count the remaining rlimit owners once
+the verification-error phase is empty. A timeout, panic, meta failure,
+truncated stream, real compile/missing-module diagnostic, or wrapper with no
+source-spanned proof owner remains indeterminate; `rlimit + timeout` is not an
+exhaustive frontier.
+
 Operational notes from the same pass: (a) the COMPLETE gate and the CLI
 auto-budget share the de-duplicated `_gate_admit_files` editable scope — a
 target listed inside allow-edit is counted once; (b) incidental `429` text in
@@ -619,63 +650,54 @@ The verifier-policy hook tokenizes shell operators before applying pipe and
 stdout-redirection rules. Operators inside quoted semantic-search/Rust queries
 are data, and fd-2 append redirects such as `2>>file` are stderr-only; neither
 should consume a paid turn as a false policy block. Real unquoted pipelines and
-stdout file redirects remain blocked. Its pre-edit diagnostic guard recognizes
+stdout file redirects remain blocked. Direct Verus hidden behind process
+wrappers (`nice`, `stdbuf`, `xargs`, and enumerated peers), Python `subprocess`/`os.system`
+payloads, a shell-background `&`, or the Bash tool's background flag is also
+blocked; ordinary source searches and Python strings that merely mention
+`verus` remain allowed. The wrapper list is defence in depth rather than a
+complete shell-language boundary; add newly observed executable prefixes to
+the hook and its tests. Its pre-edit diagnostic guard recognizes
 unstaged changes, staged-only changes, and untracked active source files; an
 agent does not have to keep a legitimate edit unstaged merely to unlock scoped
 verification/search.
 
-### 12. Trust Core launch or continuation fails before promotion
+### `SOURCE_RECEIPT_INVALID`: the workspace cannot be bound
 
-**Symptom**: the scored launcher rejects a registration/seed, or the durable
-supervisor records `STOP_FAIL_CLOSED` even though `result.json` says
-`COMPLETE` or `BANKED_PARTIAL`.
+**Symptom:** `result.json` has `end_reason: SOURCE_RECEIPT_INVALID` and the
+runner exits nonzero before accepting or banking a tree.
 
-**Invariant**: registration cost, wall-clock, task-minute, and verifier-limit
-numbers must be positive and finite; `NaN` and infinities are invalid JSON
-extensions for authority even though Python can parse them. `plateau_k` is a
-positive integer. A scored predecessor must be a content-addressed schema-v2
-promotion with `scoreable:true`, the correct decision-specific fresh
-exact-tree gate, a canonical non-negative vector, and—when ACCEPTED—a green
-zero-hard-admit result. Legacy unscored ACCEPTED receipts remain usable only
-for ordinary non-Trust-Core resumes. Finally, the registered launcher must
-exit 0 before the supervisor can classify any non-rate-limit terminal;
-`run_agents.sh` exit 45 means terminal/accounting validation failed and can
-never be converted into supervisor completion. `RATE_LIMITED` alone retains
-its explicit, audited 0/42 return-code rule. The supervisor debits every
-attempt—including transport/rate-limit retries—into durable cumulative cost
-and active-launch wall counters before choosing RETRY, ADVANCE, or COMPLETE;
-reaching a registered ceiling stops further attempts, and exceeding one
-invalidates even an otherwise accepted terminal.
+```bash
+jq '{end_reason, error_message, success}' results/<run>/<task>/result.json
+```
 
-Inspect the registration values, predecessor promotion and terminal gate,
-`terminal_validation.json`, `campaign_state.json`, launcher return code, and
-the final `ERROR` ledger event together. Do not repair this class by editing a
-receipt or resetting supervisor state; generate a new registered package from
-the last independently validated authority.
+The source receipt rejects inputs it cannot bind to the workspace identity,
+including escaping, dangling, or cyclic source symlinks. Treat this as a
+fail-closed integrity stop: inspect the reported path and repair or remove the
+invalid input before rerunning. Do not bypass the receipt or relabel the run as
+`COMPLETE`. Both single-target and layer entry points persist this verdict; a
+missing `result.json` on this path is a harness regression.
 
-The durable supervisor package is itself content-addressed: `package_id` is
-the canonical hash of every package field other than `package_id`. Any command,
-path, input inventory, or budget-routing mutation between retries therefore
-fails before prelaunch and records an `error` state. When generating or
-repairing a package, recompute it through the package generator; never edit the
-JSON or its ID independently.
+### Hidden frozen-byte drift: Git is clean but `FROZEN_EDIT` fires
 
-### 13. An integrity gate appears green after a new helper or baseline edit
+**Symptom:** `git diff HEAD` reports no frozen path, but the runner reports
+`FROZEN_EDIT` for one. Check whether an index hint is suppressing Git's view:
 
-**Symptom**: a proof compiles through a newly created Rust helper, or an
-agent-side `spec_check` says a weakened contract matches after the snapshot was
-rewritten.
+```bash
+git ls-files -v | grep '^[a-zS]'
+```
 
-**Invariant**: the frozen-path audit includes Git-untracked files, not only
-`git diff HEAD`; new paths outside the declared edit set are `FROZEN_EDIT`.
-The runner's `spec_snapshot.authority.json` is SHA-256-bound in process and is
-distinct from the agent-facing `spec_snapshot.json`; changing or removing the
-authority copy is `SPEC_DRIFT`. Source-tree identity also includes every
-literal Rust `include!`, `include_str!`, `include_bytes!`, or `#[path]` input
-even when it lives below `results/`, `target/`, or another ordinarily ignored
-directory; a new or changed off-walk compiler input is `FROZEN_EDIT`.
-Inspect the frozen-path list, both snapshot files, and the final source receipt
-before trusting the apparent green.
+The source receipt reads compiler-input bytes from disk and is authoritative;
+Git diff is only a second signal for index and rename state. Clear accidental
+`assume-unchanged`/`skip-worktree` flags and restore the frozen file rather than
+bypassing the receipt. Also inspect `git status --short --untracked-files=all`:
+an untracked Rust module or explicit compiler input outside the editable set is
+visible to the receipt even though `git diff HEAD` omits it. Ordinary untracked
+generated bytes such as `Cargo.lock` and verifier logs are excluded from the
+frozen comparison; HEAD-tracked paths remain authoritative regardless of index
+flags.
+Literal Rust includes and Cargo-declared inputs below
+`target/`, `results/`, or `.verilib/` are frozen when they are compiler-visible,
+even though ordinary generated noise in those directories is excluded.
 
 ---
 

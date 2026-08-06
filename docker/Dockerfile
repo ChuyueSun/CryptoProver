@@ -23,7 +23,7 @@
 #     --build-context verus=/path/to/verus-x86-linux \
 #     --build-context warm=/path/to/dalek-lite \
 #     -f docker/Dockerfile .
-# Pin RUST_TOOLCHAIN to the VM's rustc (1.92.0 on the build VM). Provision
+# Pin RUST_TOOLCHAIN to the VM's rustc (1.92.0 on andtruth-benchmarks-x86). Provision
 # Verus via the `verus` build-context (preferred); --build-arg VERUS_TARBALL_URL=<url>
 # is the fallback. The `warm` context may be EITHER the workspace root (dalek-lite, with
 # a curve25519-dalek/ member) OR the package dir (curve25519-dalek) — the build locates
@@ -45,24 +45,20 @@ FROM scratch AS warm
 # GCP VM has). Without it, the install-verus.sh URL hook is used instead.
 FROM scratch AS verus
 
-FROM node:22-bookworm-slim AS node
-
 FROM rust:${RUST_TOOLCHAIN}-bookworm AS base
 
 # --- system deps -----------------------------------------------------------
-# z3 + python3.11 + git/tar (seal recipe). Node/npm come from the official
-# Node 22 stage because current Claude Code requires Node >=22; Debian
-# Bookworm's nodejs package is Node 18.
+# z3 + python3.11 + git/tar (seal recipe) + nodejs/npm (claude CLI).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv python3-pip \
         z3 \
         git ca-certificates curl tar xz-utils \
+        nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 # --- claude CLI ------------------------------------------------------------
 # OAuth token is injected at RUN time (-e CLAUDE_CODE_OAUTH_TOKEN), never baked
 # (memory:run-claude-auth).
-COPY --from=node /usr/local/ /usr/local/
 RUN npm install -g @anthropic-ai/claude-code
 
 # --- verus -----------------------------------------------------------------
@@ -84,14 +80,15 @@ RUN if [ -x /opt/verus/verus ]; then \
 ENV PATH="/opt/verus:${PATH}"
 
 # --- harness (read-only) ---------------------------------------------------
-# Copy only the code the agent runs; results/ and worktrees live on mounted vols.
+# Copy the exact Git-tracked top-level surface bound by both run.py's tooling
+# gate and trusted_core_profile.py's host/image receipt. The suite keeps this
+# explicit list synchronized; results and worktrees live on mounted volumes.
 WORKDIR /opt/harness
-COPY run.py admit.py peel.py replay.py strip_specs.py usage_audit.py trusted_core_profile.py ./
-COPY prompt.md prompt_decompose.md ./
+COPY admit.py bounce_tap.sh demo_decompress.sh demo_pool_setup.sh launch.sh launch_spec_proof.sh launch_specgen.sh monitor_run.sh peel.py peel_run.sh prompt.md prompt_decompose.md race.py render_transcript.py replay.py run.py run_layer.py run_proofonly_layers.sh strip_specs.py trust_report.py trusted_core_profile.py usage_audit.py ./
 COPY skills/ ./skills/
 COPY lib/ ./lib/
+COPY scripts/ ./scripts/
 COPY peel_manifests/ ./peel_manifests/
-COPY docker/ ./docker/
 # preflight.sh runs INSIDE the container (README path /opt/harness/docker/preflight.sh);
 # the rest of docker/ is harmless to carry. seal_into_volume.sh runs on the HOST.
 COPY docker/ ./docker/

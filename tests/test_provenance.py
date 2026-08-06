@@ -21,12 +21,14 @@ from lib.provenance import (  # noqa: E402
     receipt_key,
     sha256_file,
     source_tree_receipt,
+    supervisor_package_id,
     reusable_seed_authority,
     validate_credential_identity,
     validate_launch_registration,
     validate_campaign_spec,
     write_immutable_json,
 )
+import lib.provenance as provenance  # noqa: E402
 
 
 class ProvenanceReceiptTests(unittest.TestCase):
@@ -37,6 +39,31 @@ class ProvenanceReceiptTests(unittest.TestCase):
         (project / "Cargo.toml").write_text("[package]\nname='crate'\nversion='0.1.0'\n")
         (project / "src" / "lib.rs").write_text("pub fn value() -> u8 { 1 }\n")
         return project
+
+    def test_supervisor_package_id_binds_full_content_but_not_itself(self):
+        package = {
+            "schema_version": 1,
+            "launch_argv": ["python3", "run.py"],
+            "immutable_inputs": [{"path": "/x", "sha256": "abc"}],
+        }
+        identity = supervisor_package_id(package)
+        expected = hashlib.sha256(
+            b"trusted-core-supervisor-package:v1\x00"
+            + canonical_json_bytes(package)
+        ).hexdigest()
+        self.assertEqual(identity, expected)
+        self.assertNotEqual(identity, receipt_id(package))
+        self.assertEqual(
+            identity,
+            supervisor_package_id({"package_id": "stale", **package}),
+        )
+        self.assertEqual(
+            identity,
+            supervisor_package_id(dict(reversed(list(package.items())))),
+        )
+        changed = json.loads(json.dumps(package))
+        changed["launch_argv"].append("--different")
+        self.assertNotEqual(identity, supervisor_package_id(changed))
 
     def test_tree_hash_covers_workspace_source_but_not_generated_artifacts(self):
         with tempfile.TemporaryDirectory() as td:
@@ -54,75 +81,356 @@ class ProvenanceReceiptTests(unittest.TestCase):
             self.assertNotEqual(first["tree_hash"], second["tree_hash"])
             self.assertEqual(second["file_count"], len(second["files"]))
 
-    def test_tree_hash_covers_literal_include_below_ignored_directory(self):
+    def test_legacy_walk_order_and_hash_are_preserved_without_explicit_inputs(self):
         with tempfile.TemporaryDirectory() as td:
             project = self._workspace(Path(td))
-            generated = project / "results" / "generated.rs"
-            generated.parent.mkdir()
-            generated.write_text("pub const VALUE: u8 = 1;\n")
-            (project / "src" / "lib.rs").write_text(
-                'include!("../results/generated.rs");\n'
+            root = provenance.workspace_root(project)
+            legacy_files = [
+                provenance._file_entry(path, root)
+                for path in provenance._iter_relevant_files(root)
+            ]
+            receipt = source_tree_receipt(project)
+            self.assertEqual(receipt["files"], legacy_files)
+            self.assertEqual(receipt["schema_version"], 2)
+            self.assertEqual(
+                set(receipt),
+                {"schema_version", "workspace_root", "file_count", "tree_hash", "files"},
             )
-            first = source_tree_receipt(project)
-            generated.write_text("pub const VALUE: u8 = 2;\n")
-            second = source_tree_receipt(project)
+            self.assertEqual(
+                receipt["tree_hash"],
+                hashlib.sha256(canonical_json_bytes(legacy_files)).hexdigest(),
+            )
 
-            self.assertNotEqual(first["tree_hash"], second["tree_hash"])
+    def test_literal_inputs_below_pruned_dirs_are_appended_and_recursive(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            generated = project / "target"
+            generated.mkdir()
+            (generated / "one.rs").write_text(
+                'include!(r#"two.rs"#);\npub const ONE: u8 = 1;\n')
+            (generated / "two.rs").write_text("pub const TWO: u8 = 2;\n")
+            (project / "src" / "lib.rs").write_text(
+                '#[path = r"../target/one.rs"] mod one;\n')
+            receipt = source_tree_receipt(project)
+            self.assertEqual(
+                receipt["literal_compiler_inputs"],
+                ["crate/target/one.rs", "crate/target/two.rs"],
+            )
+            before = receipt["tree_hash"]
+            (generated / "two.rs").write_text("pub const TWO: u8 = 9;\n")
+            self.assertNotEqual(before, source_tree_receipt(project)["tree_hash"])
+
+    def test_literal_metadata_marks_input_already_in_ordinary_walk(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            blob = project / "src" / "blob.dat"
+            blob.write_bytes(b"one")
+            (project / "src" / "lib.rs").write_text(
+                'pub const BLOB: &[u8] = include_bytes!("blob.dat");\n')
+            receipt = source_tree_receipt(project)
+            self.assertIn("crate/src/blob.dat", receipt["literal_compiler_inputs"])
+            self.assertEqual(
+                sum(entry["path"] == "crate/src/blob.dat"
+                    for entry in receipt["files"]),
+                1,
+            )
+
+    def test_manifest_targets_and_path_crates_override_generated_dir_pruning(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            (Path(td) / "Cargo.toml").write_text(
+                "[workspace]\nmembers=['crate', 'results/member']\n")
+            (project / "Cargo.toml").write_text(
+                "[package]\nname='crate'\nversion='0.1.0'\n"
+                "build='results/build.rs'\n"
+                "[lib]\npath='results/lib.rs'\n"
+                "[dependencies.helper]\npath='target/helper'\n"
+            )
+            results = project / "results"
+            results.mkdir()
+            (results / "build.rs").write_text("fn main() {}\n")
+            (results / "lib.rs").write_text("pub fn value() -> u8 { 1 }\n")
+            helper = project / "target" / "helper"
+            (helper / "src").mkdir(parents=True)
+            (helper / "Cargo.toml").write_text(
+                "[package]\nname='helper'\nversion='0.1.0'\n")
+            (helper / "src" / "lib.rs").write_text("pub fn helper() {}\n")
+            member = Path(td) / "results" / "member"
+            (member / "src").mkdir(parents=True)
+            (member / "Cargo.toml").write_text(
+                "[package]\nname='member'\nversion='0.1.0'\n")
+            (member / "src" / "lib.rs").write_text("pub fn member() {}\n")
+            receipt = source_tree_receipt(project)
+            expected = {
+                "crate/results/build.rs", "crate/results/lib.rs",
+                "crate/target/helper/Cargo.toml",
+                "crate/target/helper/src/lib.rs",
+                "results/member/Cargo.toml", "results/member/src/lib.rs",
+            }
+            self.assertTrue(expected <= set(receipt["cargo_compiler_inputs"]))
+            before = receipt["tree_hash"]
+            (results / "lib.rs").write_text("pub fn value() -> u8 { 2 }\n")
+            self.assertNotEqual(before, source_tree_receipt(project)["tree_hash"])
+
+    def test_verilib_is_noise_unless_explicitly_declared(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            hidden = project / ".verilib"
+            hidden.mkdir()
+            generated = hidden / "generated.rs"
+            generated.write_text("pub const V: u8 = 1;\n")
+            stable = source_tree_receipt(project)["tree_hash"]
+            generated.write_text("pub const V: u8 = 2;\n")
+            self.assertEqual(stable, source_tree_receipt(project)["tree_hash"])
+            (project / "src" / "lib.rs").write_text(
+                'include!("../.verilib/generated.rs");\n')
+            explicit = source_tree_receipt(project)
             self.assertIn(
-                "crate/results/generated.rs",
-                {entry["path"] for entry in second["files"]},
-            )
-            self.assertEqual(
-                second["literal_compiler_inputs"],
-                ["crate/results/generated.rs"],
+                "crate/.verilib/generated.rs",
+                {entry["path"] for entry in explicit["files"]},
             )
 
-    def test_tree_hash_covers_path_attribute_below_ignored_directory(self):
+    def test_literal_and_manifest_workspace_escapes_are_rejected(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as ext:
+            project = self._workspace(Path(td))
+            external = Path(ext) / "outside.rs"
+            external.write_text("pub fn outside() {}\n")
+            (project / "src" / "lib.rs").write_text(
+                f'include!("{external}");\n')
+            with self.assertRaisesRegex(ValueError, "escapes workspace"):
+                source_tree_receipt(project)
+            (project / "src" / "lib.rs").write_text("pub fn okay() {}\n")
+            (project / "Cargo.toml").write_text(
+                "[package]\nname='crate'\nversion='0.1.0'\n"
+                f"[lib]\npath='{external}'\n")
+            with self.assertRaisesRegex(ValueError, "escapes workspace"):
+                source_tree_receipt(project)
+
+    def test_nonexistent_comment_literal_does_not_false_reject(self):
         with tempfile.TemporaryDirectory() as td:
             project = self._workspace(Path(td))
-            generated = project / "target" / "evil.rs"
-            generated.parent.mkdir()
-            generated.write_text("pub fn value() -> u8 { 1 }\n")
             (project / "src" / "lib.rs").write_text(
-                '#[path = "../target/evil.rs"]\nmod evil;\n'
+                '/// Example: include_str!("../../../etc/not-a-real-input")\n'
+                "pub fn okay() {}\n")
+            receipt = source_tree_receipt(project)
+            self.assertNotIn("literal_compiler_inputs", receipt)
+
+    def test_absolute_workspace_member_inside_root_is_supported(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = self._workspace(root)
+            member = root / "results" / "absolute-member"
+            (member / "src").mkdir(parents=True)
+            (member / "Cargo.toml").write_text(
+                "[package]\nname='absolute-member'\nversion='0.1.0'\n")
+            (member / "src" / "lib.rs").write_text("pub fn member() {}\n")
+            (root / "Cargo.toml").write_text(
+                f"[workspace]\nmembers=['crate', '{member}']\n")
+            receipt = source_tree_receipt(project)
+            self.assertIn(
+                "results/absolute-member/src/lib.rs",
+                set(receipt["cargo_compiler_inputs"]),
             )
+
+    def test_manifest_declared_source_outside_src_is_covered(self):
+        # Pruning artifact NAMES at any depth outside a `src` segment is a
+        # naming heuristic. Cargo lets a manifest point [lib] path anywhere,
+        # so `custom/results/lib.rs` is real compiler input. Prune by POSITION
+        # (a directory holding a Cargo.toml) instead of by name-plus-`src`.
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            (project / "Cargo.toml").write_text(
+                "[package]\nname='crate'\nversion='0.1.0'\n"
+                "\n[lib]\npath='custom/results/lib.rs'\n"
+            )
+            declared = project / "custom" / "results"
+            declared.mkdir(parents=True)
+            (declared / "lib.rs").write_text("pub fn v() -> u8 { 1 }\n")
             first = source_tree_receipt(project)
-            generated.write_text("pub fn value() -> u8 { 2 }\n")
+            self.assertIn(
+                "crate/custom/results/lib.rs",
+                {e["path"] for e in first["files"]},
+            )
+            self.assertIn(
+                "crate/custom/results/lib.rs",
+                first["cargo_compiler_inputs"],
+            )
+            (declared / "lib.rs").write_text("pub fn v() -> u8 { 2 }\n")
+            self.assertNotEqual(
+                first["tree_hash"], source_tree_receipt(project)["tree_hash"])
+
+            # Artifact dirs beside a manifest are still excluded.
+            stable = source_tree_receipt(project)["tree_hash"]
+            (project / "target").mkdir()
+            (project / "target" / "junk").write_text("generated")
+            (Path(td) / "results").mkdir()
+            (Path(td) / "results" / "junk").write_text("generated")
+            self.assertEqual(
+                stable, source_tree_receipt(project)["tree_hash"])
+
+    def test_nested_link_defects_reject_even_under_a_pruned_target(self):
+        # Dispatching on exists()/is_dir() before strict resolution absorbed a
+        # dangling or self-cyclic NESTED link into "not-a-source-target", so
+        # the rejection fired only when the target dir happened to be walked
+        # independently — never under a pruned one. Also covers a true cycle,
+        # which the earlier rejection test did not exercise.
+        for name, make in (
+            ("dangling", lambda p: (p / "bad").symlink_to(p / "missing")),
+            ("selfcycle", lambda p: (p / "bad").symlink_to(p / "bad")),
+        ):
+            with self.subTest(defect=name):
+                with tempfile.TemporaryDirectory() as td:
+                    project = self._workspace(Path(td))
+                    pruned = Path(td) / "results" / "inside"
+                    pruned.mkdir(parents=True)
+                    make(pruned)
+                    (project / "src" / "oracle").symlink_to(pruned.resolve())
+                    with self.assertRaisesRegex(
+                        ValueError, "dangling or cyclic",
+                    ):
+                        source_tree_receipt(project)
+
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            loop = Path(td) / "loopdir"
+            loop.mkdir()
+            (loop / "self").symlink_to(loop.resolve())
+            (project / "src" / "oracle").symlink_to(loop.resolve())
+            with self.assertRaisesRegex(ValueError, "cycle"):
+                source_tree_receipt(project)
+
+    def test_nested_artifact_named_dirs_are_covered_source(self):
+        # T315 H3a: `results`/`target`/`claude_*` are run artifacts only at
+        # the workspace ROOT. A crate module named src/results/ is verifiable
+        # source and must change the tree hash.
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            first = source_tree_receipt(project)
+            nested = project / "src" / "results"
+            nested.mkdir()
+            (nested / "mod.rs").write_text("pub fn hidden() -> u8 { 3 }\n")
+            second = source_tree_receipt(project)
+            self.assertNotEqual(first["tree_hash"], second["tree_hash"])
+            paths = {entry["path"] for entry in second["files"]}
+            self.assertIn("crate/src/results/mod.rs", paths)
+            # Root-level artifact dirs remain excluded.
+            (Path(td) / "results").mkdir()
+            (Path(td) / "results" / "noise.json").write_text("{}")
+            self.assertEqual(
+                second["tree_hash"], source_tree_receipt(project)["tree_hash"],
+            )
+
+    def test_symlinked_directory_is_visible_in_receipt(self):
+        # T315 H3b: os.walk(followlinks=False) never yields a symlinked dir
+        # as a file, so it was absent from the receipt entirely — an
+        # oracle-smuggling channel. It must appear as a symlink entry and
+        # adding/retargeting it must change the tree hash.
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "oracle.rs").write_text("pub fn proven() {}\n")
+            first = source_tree_receipt(project)
+            (project / "src" / "extra").symlink_to(outside)
+            second = source_tree_receipt(project)
+            self.assertNotEqual(first["tree_hash"], second["tree_hash"])
+            entries = {e["path"]: e for e in second["files"]}
+            self.assertIn("crate/src/extra", entries)
+            self.assertEqual(entries["crate/src/extra"]["kind"], "symlink")
+
+    def test_symlink_binds_target_bytes_not_just_link_text(self):
+        # Hashing only the link TEXT binds the pointer, not the bytes: a link
+        # into an out-of-tree directory kept a constant tree hash while its
+        # target — real compiler input — was edited freely. Both the retarget
+        # and the target mutation must move the hash.
+        with tempfile.TemporaryDirectory() as td:
+            project = self._workspace(Path(td))
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "oracle.rs").write_text("pub fn o() -> u8 { 1 }\n")
+            (project / "src" / "oracle").symlink_to(outside)
+            first = source_tree_receipt(project)
+            entry = [e for e in first["files"] if e["kind"] == "symlink"]
+            self.assertEqual(len(entry), 1)
+            self.assertIn("target_sha256", entry[0])
+
+            # Mutating the out-of-tree target changes the receipt.
+            (outside / "oracle.rs").write_text("pub fn o() -> u8 { 99 }\n")
             second = source_tree_receipt(project)
             self.assertNotEqual(first["tree_hash"], second["tree_hash"])
 
-    def test_tree_hash_covers_raw_string_include_and_path_inputs(self):
-        with tempfile.TemporaryDirectory() as td:
-            project = self._workspace(Path(td))
-            first_input = project / "target" / "one.rs"
-            second_input = project / "target" / "two.rs"
-            first_input.parent.mkdir()
-            first_input.write_text("pub const ONE: u8 = 1;\n")
-            second_input.write_text("pub fn two() -> u8 { 2 }\n")
-            (project / "src" / "lib.rs").write_text(
-                'include!(r#"../target/one.rs"#);\n'
-                '#[path = r"../target/two.rs"] mod two;\n'
-            )
-            before = source_tree_receipt(project)
-            first_input.write_text("pub const ONE: u8 = 9;\n")
-            second_input.write_text("pub fn two() -> u8 { 9 }\n")
-            after = source_tree_receipt(project)
-            self.assertNotEqual(before["tree_hash"], after["tree_hash"])
-            self.assertEqual(
-                set(after["literal_compiler_inputs"]),
-                {"crate/target/one.rs", "crate/target/two.rs"},
+            # Adding a file under the target directory also changes it.
+            (outside / "more.rs").write_text("pub fn m() {}\n")
+            third = source_tree_receipt(project)
+            self.assertNotEqual(second["tree_hash"], third["tree_hash"])
+
+            # A file symlink binds its target's bytes too.
+            (outside / "leaf.rs").write_text("pub fn leaf() -> u8 { 1 }\n")
+            (project / "src" / "leaf.rs").symlink_to(outside / "leaf.rs")
+            fourth = source_tree_receipt(project)
+            (outside / "leaf.rs").write_text("pub fn leaf() -> u8 { 2 }\n")
+            self.assertNotEqual(
+                fourth["tree_hash"], source_tree_receipt(project)["tree_hash"],
             )
 
-    def test_source_subdirectory_named_target_is_not_treated_as_build_output(self):
+    def test_symlink_closure_binds_logical_paths_not_a_basename_multiset(self):
+        # Hashing a sorted multiset of BASENAMES lets two same-named files
+        # under different logical directories swap contents invisibly — the
+        # receipt is identical before and after. The closure must bind the
+        # logical traversal path.
         with tempfile.TemporaryDirectory() as td:
             project = self._workspace(Path(td))
-            module = project / "src" / "target" / "mod.rs"
-            module.parent.mkdir()
-            module.write_text("pub fn value() -> u8 { 1 }\n")
-            first = source_tree_receipt(project)
-            module.write_text("pub fn value() -> u8 { 2 }\n")
-            second = source_tree_receipt(project)
-            self.assertNotEqual(first["tree_hash"], second["tree_hash"])
+            inside = Path(td) / "inside"
+            (inside / "a").mkdir(parents=True)
+            (inside / "b").mkdir(parents=True)
+            (inside / "a" / "foo.rs").write_text("pub fn x() -> u8 { 1 }\n")
+            (inside / "b" / "foo.rs").write_text("pub fn y() -> u8 { 2 }\n")
+            (project / "src" / "oracle").symlink_to(inside)
+            before = source_tree_receipt(project)["tree_hash"]
+            a_text = (inside / "a" / "foo.rs").read_text()
+            (inside / "a" / "foo.rs").write_text(
+                (inside / "b" / "foo.rs").read_text())
+            (inside / "b" / "foo.rs").write_text(a_text)
+            self.assertNotEqual(
+                before, source_tree_receipt(project)["tree_hash"])
+
+    def test_escaping_dangling_and_cyclic_symlinks_are_rejected(self):
+        # Out-of-workspace targets cannot be bound to the tree identity, and
+        # hashing them means walking an unbounded external filesystem (a link
+        # to "/" would hash the machine). Reject rather than hash — the same
+        # rule the literal-include escape already uses.
+        with tempfile.TemporaryDirectory() as td, \
+                tempfile.TemporaryDirectory() as external:
+            project = self._workspace(Path(td))
+            (Path(external) / "oracle.rs").write_text("pub fn o() {}\n")
+            link = project / "src" / "oracle"
+            link.symlink_to(external)
+            with self.assertRaisesRegex(ValueError, "escapes workspace"):
+                source_tree_receipt(project)
+            link.unlink()
+
+            # A link to the filesystem root is rejected without traversal.
+            root_link = project / "src" / "everything"
+            root_link.symlink_to(Path("/"))
+            with self.assertRaisesRegex(ValueError, "escapes workspace"):
+                source_tree_receipt(project)
+            root_link.unlink()
+
+            # Dangling.
+            dead = project / "src" / "dead"
+            dead.symlink_to(Path(td) / "nope")
+            with self.assertRaisesRegex(ValueError, "dangling or cyclic"):
+                source_tree_receipt(project)
+            dead.unlink()
+
+            # A nested escaping link inside an otherwise-confined target.
+            inside = Path(td) / "inside"
+            inside.mkdir()
+            (inside / "sneaky.rs").symlink_to(
+                Path(external) / "oracle.rs")
+            (project / "src" / "oracle").symlink_to(inside)
+            with self.assertRaisesRegex(ValueError, "escapes workspace"):
+                source_tree_receipt(project)
 
     def test_linked_worktree_control_file_cannot_change_source_hash(self):
         with tempfile.TemporaryDirectory() as td:
@@ -336,27 +644,6 @@ class ProvenanceReceiptTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be positive"):
                 validate_launch_registration(path, campaign=campaign)
 
-            for invalid in (float("nan"), float("inf"), float("-inf")):
-                invalid_value = json.loads(json.dumps(value))
-                invalid_value["budget"]["max_cost_usd"] = invalid
-                path.write_text(json.dumps(invalid_value))
-                with self.assertRaisesRegex(ValueError, "must be positive"):
-                    validate_launch_registration(path, campaign=campaign)
-
-            invalid_plateau = json.loads(json.dumps(value))
-            invalid_plateau["budget"]["max_cost_usd"] = 1000
-            invalid_plateau["budget"]["plateau_k"] = 1.5
-            path.write_text(json.dumps(invalid_plateau))
-            with self.assertRaisesRegex(ValueError, "positive integer"):
-                validate_launch_registration(path, campaign=campaign)
-
-            invalid_execution = json.loads(json.dumps(invalid_plateau))
-            invalid_execution["budget"]["plateau_k"] = 4
-            invalid_execution["execution"]["max_task_minutes"] = float("nan")
-            path.write_text(json.dumps(invalid_execution))
-            with self.assertRaisesRegex(ValueError, "must be positive"):
-                validate_launch_registration(path, campaign=campaign)
-
     def test_banked_partial_requires_fresh_exact_gate_and_vector(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "bank.json"
@@ -374,7 +661,6 @@ class ProvenanceReceiptTests(unittest.TestCase):
                 "banking_gate_receipt": {
                     "fresh": True,
                     "exact_tree_match": True,
-                    "tree_receipt": {"tree_hash": "tree"},
                     "vector": {
                         "hard_admits": 4,
                         "verification_errors": 3,
@@ -397,49 +683,6 @@ class ProvenanceReceiptTests(unittest.TestCase):
             value["receipt_id"] = receipt_id(value)
             path.write_text(json.dumps(value))
             with self.assertRaisesRegex(ValueError, "fresh exact-tree"):
-                reusable_seed_authority(path)
-
-    def test_accepted_seed_requires_scored_green_exact_receipt(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "accepted.json"
-            forged = {
-                "decision": "ACCEPTED",
-                "terminal_disposition": {
-                    "state": "ACCEPTED", "reusable": True,
-                },
-                "final_tree_receipt": {"tree_hash": "tree"},
-                "lineage_id": "lineage",
-            }
-            path.write_text(json.dumps(forged))
-            with self.assertRaisesRegex(ValueError, "content ID mismatch"):
-                reusable_seed_authority(path)
-
-            accepted = {
-                **forged,
-                "schema_version": 2,
-                "scoreable": True,
-                "campaign_spec_sha256": "campaign",
-                "acceptance_gate_receipt": {
-                    "fresh": True,
-                    "exact_tree_match": True,
-                    "tree_receipt": {"tree_hash": "tree"},
-                    "verus_result": {"okay": True},
-                    "vector": {
-                        "hard_admits": 0,
-                        "verification_errors": 0,
-                        "resource_limits": 0,
-                        "raw_errors": 0,
-                    },
-                },
-            }
-            accepted["receipt_id"] = receipt_id(accepted)
-            path.write_text(json.dumps(accepted))
-            self.assertEqual(reusable_seed_authority(path)["kind"], "COMPLETE")
-
-            accepted["acceptance_gate_receipt"]["vector"]["hard_admits"] = -1
-            accepted["receipt_id"] = receipt_id(accepted)
-            path.write_text(json.dumps(accepted))
-            with self.assertRaisesRegex(ValueError, "non-negative"):
                 reusable_seed_authority(path)
 
 

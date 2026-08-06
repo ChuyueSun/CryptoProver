@@ -15,7 +15,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
-from lib import frontier, provenance  # noqa: E402
+from lib import frontier, provenance, taxonomy  # noqa: E402
 
 
 class NextPackageError(RuntimeError):
@@ -309,7 +309,10 @@ def updated_registration(
     registered["supervisor_amendment"] = {
         "schema_version": 1,
         "policy": "durable_reset_aware_resume_and_mechanical_bank_chaining",
-        "same_package_retry": ["RATE_LIMITED", "TRANSPORT_ERROR", "RETRY_EXHAUSTED"],
+        # Registered retry policy must state what the supervisor actually
+        # does — a hand-copied subset had already drifted (T315). Single
+        # source: lib.taxonomy, same body the supervisor imports.
+        "same_package_retry": sorted(taxonomy.AUTORETRY_END_REASONS),
         "bank_continuation": "canonical peel to exact reusable bank cumulative patch; independent replay required",
         "fail_closed": True,
         "review_thread": "AGENT_DEBATE.md:T311",
@@ -349,8 +352,38 @@ def updated_package(
         for entry in current["immutable_inputs"]
         if Path(entry["path"]) not in role_paths
     ]
+    # Preserved inputs were hash-verified at launch time, possibly hours ago.
+    # Re-pinning them from current disk without comparing would silently bless
+    # any in-between mutation with a plausible successor package (T315 M5) —
+    # carry the registered digest forward only if the bytes still match it.
+    registered_sha = {
+        Path(entry["path"]): entry["sha256"]
+        for entry in current["immutable_inputs"]
+    }
+    # Hash each path EXACTLY ONCE and pin the digest that was verified.
+    # Verifying one read and pinning a second read leaves a window in which a
+    # concurrent writer's mutation passes the check and is then blessed into
+    # the successor package as immutable — the very substitution this guard
+    # exists to stop.
+    digests: dict[Path, str] = {}
+    for path in preserved:
+        actual = _sha(path)
+        if actual != registered_sha[path]:
+            raise NextPackageError(
+                f"preserved immutable input changed since registration: "
+                f"{path} registered {registered_sha[path][:16]} != "
+                f"current {actual[:16]}"
+            )
+        digests[path] = actual
+    for path in new_role_paths:
+        # NOT setdefault: its default argument is evaluated eagerly, so an
+        # overlapping path (a preserved input reused as a new role) would be
+        # read a second time — reintroducing the verify-once/pin-twice window
+        # this loop exists to close.
+        if path not in digests:
+            digests[path] = _sha(path)
     inputs = [
-        {"path": str(path), "sha256": _sha(path)}
+        {"path": str(path), "sha256": digests[path]}
         for path in sorted(set(preserved) | new_role_paths, key=str)
     ]
     updated = {**current, "launch_argv": argv, "immutable_inputs": inputs}

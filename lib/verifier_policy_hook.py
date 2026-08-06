@@ -19,7 +19,9 @@ Claude Code PreToolUse contract: the event JSON arrives on stdin
 tool call and returns the stderr text to the model. Exit 0 allows it.
 
 Patterns mirror `run.py`'s gate regexes (kept in sync intentionally) plus the
-`cargo verus | grep/head` substitution codex flagged.
+`cargo verus | grep/head` substitution codex flagged. Process wrappers are an
+enumerated defence-in-depth surface, not a complete command-language security
+boundary; extend the wrapper set when a new executable prefix is observed.
 """
 import json
 import os
@@ -72,6 +74,19 @@ _VERUS_CHECK_HELP = re.compile(r"\bverus_check\.py\b[\s\S]*?(?:^|\s)(?:-h|--help
 _RAW_ADMIT_COUNT_FLAG = re.compile(r"\b(?:grep|rg)\b[\s\S]*\s(?:-[A-Za-z]*c[A-Za-z]*|--count)\b")
 _RAW_ADMIT_COUNT_PIPE = re.compile(r"\|\s*wc\s+-l\b")
 
+_VERUS_EXEC_WRAPPERS = {
+    "nice", "stdbuf", "xargs", "sudo", "setsid", "chrt", "ionice",
+    "taskset", "time", "script",
+}
+_PYTHON_PROCESS_CALL = re.compile(
+    r"\b(?:subprocess\.(?:run|Popen|call|check_call|check_output)|os\.system)\s*\("
+)
+_PYTHON_VERIFIER_ARG = re.compile(
+    r"(?:['\"]verus['\"]|['\"]cargo['\"][\s\S]{0,120}['\"]verus['\"]|"
+    r"\bcargo\s+verus\b)"
+)
+_MAX_COMMAND_BYTES = 128 * 1024
+
 
 class _Fd2Token(str):
     """Out-of-band token marking a lexically adjacent fd-2 redirect."""
@@ -113,9 +128,11 @@ def _shell_tokens(cmd):
         # after lexing. NUL cannot occur in a command accepted by execve; if it
         # arrives in tool JSON anyway, fail closed rather than treating it as a
         # shell word. Quote concatenation therefore cannot forge this identity.
-        if "\0" in source:
+        if "\0" in source or "\x01" in source:
             return []
         fd2_marker = "\0"
+        newline_marker = "\x01"
+        source = _mark_unquoted_newlines(source, newline_marker)
         source = re.sub(r"(?<!\S)2(?=>)", fd2_marker, source)
         lexer = shlex.shlex(
             source,
@@ -123,14 +140,25 @@ def _shell_tokens(cmd):
             punctuation_chars="|&;<>",
         )
         lexer.commenters = ""
-        lexer.wordchars += fd2_marker
+        lexer.wordchars += fd2_marker + newline_marker
         raw_tokens = [
-            _Fd2Token("2") if token == fd2_marker else token
+            _Fd2Token("2") if token == fd2_marker
+            else ";" if token == newline_marker
+            else token
             for token in lexer
         ]
         tokens = []
         index = 0
         while index < len(raw_tokens):
+            if (raw_tokens[index:index + 2] == ["$", "{"]
+                    and index + 3 < len(raw_tokens)
+                    and re.fullmatch(
+                        r"[A-Za-z_][A-Za-z0-9_]*", raw_tokens[index + 2],
+                    )
+                    and raw_tokens[index + 3] == "}"):
+                tokens.append("$" + "{" + raw_tokens[index + 2] + "}")
+                index += 4
+                continue
             if (raw_tokens[index] == "$" and index + 1 < len(raw_tokens)
                     and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw_tokens[index + 1])):
                 tokens.append("$" + raw_tokens[index + 1])
@@ -215,6 +243,33 @@ def _strip_shell_comments(cmd):
     return "".join(out)
 
 
+def _mark_unquoted_newlines(source, marker):
+    """Replace shell command newlines with a lexer-visible separator marker."""
+    source = source.replace("\r\n", "\n").replace("\r", "\n")
+    out = []
+    quote = None
+    escaped = False
+    for char in source:
+        if escaped:
+            out.append(char)
+            escaped = False
+        elif char == "\\" and quote != "'":
+            out.append(char)
+            escaped = True
+        elif quote:
+            out.append(char)
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            out.append(char)
+            quote = char
+        elif char == "\n":
+            out.extend((" ", marker, " "))
+        else:
+            out.append(char)
+    return "".join(out)
+
+
 def _stdout_file_redirect(tokens):
     for index, token in enumerate(tokens):
         if token not in {">", ">>", ">|", ">&", "&>", "&>>"}:
@@ -269,13 +324,21 @@ def _token_segments(tokens):
     return segments
 
 
-def _direct_verus_from_tokens(tokens):
+def _direct_verus_from_tokens(tokens, _depth=0, _inherited_assignments=None):
     """Recognize direct Verus after ordinary shell wrappers/assignments."""
-    assignments = {}
+    if _depth >= 16:
+        # Nested command-language wrappers are untrusted input. Fail closed
+        # before Python recursion exhaustion can turn the hook into an error
+        # path that Claude Code may treat differently from an explicit deny.
+        return True
+    assignments = {
+        name: set(values)
+        for name, values in (_inherited_assignments or {}).items()
+    }
     for token in tokens:
         match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.+)", token)
         if match:
-            assignments[match.group(1)] = match.group(2)
+            assignments.setdefault(match.group(1), set()).add(match.group(2))
     command_separators = _CONTROL_TOKENS | {"|", "|&"}
     commands, current = [], []
     for token in tokens:
@@ -298,6 +361,31 @@ def _direct_verus_from_tokens(tokens):
             if word in {"command", "exec", "nohup", "eval"}:
                 index += 1
                 continue
+            if word in _VERUS_EXEC_WRAPPERS:
+                # These process-launch wrappers have heterogeneous option
+                # grammars. Search only their remaining argv for the exact
+                # verifier executable instead of guessing where options end.
+                if any(os.path.basename(arg) == "verus"
+                       for arg in words[index + 1:]):
+                    return True
+                if word == "script":
+                    for option_index in range(index + 1, len(words)):
+                        option = words[option_index]
+                        if option in {"-c", "--command"}:
+                            if option_index + 1 < len(words):
+                                nested = _shell_tokens(words[option_index + 1])
+                                if nested and _direct_verus_from_tokens(
+                                        nested, _depth + 1, assignments):
+                                    return True
+                            break
+                        if option.startswith("--command="):
+                            nested = _shell_tokens(option.split("=", 1)[1])
+                            if nested and _direct_verus_from_tokens(
+                                    nested, _depth + 1, assignments):
+                                return True
+                            break
+                index += 1
+                continue
             if word == "env":
                 index += 1
                 while index < len(words) and (
@@ -317,18 +405,31 @@ def _direct_verus_from_tokens(tokens):
             continue
         command = words[index]
         shell = os.path.basename(command)
+        if re.fullmatch(r"python(?:3(?:\.\d+)?)?", shell):
+            for option_index in range(index + 1, len(words) - 1):
+                if words[option_index] != "-c":
+                    continue
+                payload = words[option_index + 1]
+                if (_PYTHON_PROCESS_CALL.search(payload)
+                        and _PYTHON_VERIFIER_ARG.search(payload)):
+                    return True
+                break
         if shell in {"sh", "bash", "zsh"}:
             for option_index in range(index + 1, len(words) - 1):
                 option = words[option_index]
                 if _is_shell_command_option(option):
                     nested = _shell_tokens(words[option_index + 1])
-                    if nested and _direct_verus_from_tokens(nested):
+                    if nested and _direct_verus_from_tokens(
+                            nested, _depth + 1, assignments):
                         return True
                     break
         if os.path.basename(command) == "verus":
             return True
         variable = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", command)
-        if variable and os.path.basename(assignments.get(variable.group(1), "")) == "verus":
+        if variable and any(
+            os.path.basename(value) == "verus"
+            for value in assignments.get(variable.group(1), ())
+        ):
             return True
     return False
 
@@ -471,6 +572,13 @@ def evaluate(tool_name, tool_input):
     cmd = (tool_input or {}).get("command") or ""
     if not isinstance(cmd, str) or not cmd:
         return []
+    if len(cmd.encode("utf-8")) > _MAX_COMMAND_BYTES:
+        # Bound parser work before shlex/recursive wrapper expansion. Commands
+        # this large cannot be audited cheaply and are far beyond normal proof
+        # harness invocations, so make the denial explicit and fail closed.
+        return ["Bash command exceeds proof-harness policy parser size limit"]
+    if "\0" in cmd or "\x01" in cmd:
+        return ["Bash command contains unsupported policy-parser control byte"]
     bg = bool((tool_input or {}).get("run_in_background"))
     shell_tokens = _shell_tokens(cmd)
     reasons = []
@@ -484,6 +592,8 @@ def evaluate(tool_name, tool_input):
         reasons.append("pre-edit proof-thread diagnostic before active source diff")
     if bg and is_verifier:
         reasons.append("run_in_background verifier")
+    if is_verifier and shell_tokens and "&" in shell_tokens:
+        reasons.append("shell-backgrounded verifier")
     if is_verifier and _TIMEOUT.search(cmd):
         reasons.append("shell timeout-wrapped verifier")
     if is_verifier and _SHARED_TMP.search(cmd):

@@ -155,6 +155,16 @@ done
 [ -n "$RUN_ID" ]  || { echo "error: --run-id required" >&2; exit 2; }
 [ -n "$PROJECT" ] || { echo "error: --project required" >&2; exit 2; }
 [ -d "$PROJECT" ] || { echo "error: --project not a directory: $PROJECT" >&2; exit 2; }
+
+# RUN_ID reaches default log, audit, result, and (when detached) PID paths
+# before run.py sees it. Reuse the canonical Python boundary instead of
+# maintaining a subtly different shell grammar.
+PY="${PYTHON:-$(command -v python3 || true)}"
+[ -n "$PY" ] || { echo "error: python3 not found on PATH" >&2; exit 3; }
+RUN_ID_ERROR=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PY" -m lib.results validate-run-id "$RUN_ID" 2>&1
+) || { printf '%s\n' "$RUN_ID_ERROR" >&2; exit 2; }
+
 if [ -n "$EXPERIMENT_MODE" ] \
    && [ "$EXPERIMENT_MODE" != "proof-only" ] \
    && [ "$EXPERIMENT_MODE" != "spec-proof" ]; then
@@ -168,9 +178,6 @@ LOG="${LOG:-./launcher_${RUN_ID}.log}"
 # which kills its entire child process group. macOS lacks the `setsid` binary,
 # so we use Python (3.11+ already required by the repo).
 if [ "$DETACH" = "1" ] && [ "${_LAUNCH_DETACHED:-0}" != "1" ]; then
-  PY="${PYTHON:-$(command -v python3 || true)}"
-  [ -n "$PY" ] || { echo "error: python3 not found on PATH" >&2; exit 3; }
-
   # Build re-entry argv with --detach stripped (so the child runs the loop)
   REENTRY_ARGS=()
   for a in "$@"; do
@@ -340,13 +347,11 @@ finalize_audit_on_exit() {
   fi
   return 0
 }
-# Bash defers trap execution while a FOREGROUND child runs, so a TERM/INT to
-# the launcher would be silently ignored until the current (possibly
-# multi-hour) run.py target completed. run.py therefore runs in the
-# BACKGROUND with the launcher `wait`ing on it (wait IS interruptible by
-# traps); on a signal we forward TERM to the child — run.py's own handler
-# killpgs its agent process group — and reap it before exiting, so the child
-# never survives as an orphan.
+# Bash defers traps while a foreground child runs, which can leave this
+# launcher unresponsive until a multi-hour run.py target completes. Run the
+# child in the background and wait for it below so traps remain responsive.
+# Forward TERM to run.py; its own handler terminates its process group. Reap
+# the child before exiting so it cannot survive as an orphan.
 CHILD_PID=""
 exit_on_signal() {
   local signal_rc="$1"
@@ -461,10 +466,9 @@ sys.exit(0 if sys.argv[2] in names else 1)
   [ -n "$EXPERIMENT_MODE" ] && CMD+=(--experiment-mode "$EXPERIMENT_MODE"
                                      --experiment-allow-edit "$target")
 
-  # Background + wait (not a foreground call): keeps the HUP/INT/TERM traps
-  # responsive mid-target — see the trap block above. The process
-  # substitution keeps live tee output while $! stays run.py's own pid
-  # (a `cmd | tee` pipeline would make $! the tee).
+  # Background + wait (not a foreground call): keeps HUP/INT/TERM traps
+  # responsive mid-target. Process substitution preserves live tee output
+  # while $! remains run.py's PID (a pipeline would make $! the tee).
   if [ "${_LAUNCH_DETACHED:-0}" = "1" ]; then
     "${CMD[@]}" &
   else
@@ -494,16 +498,16 @@ sys.exit(0 if sys.argv[2] in names else 1)
   end_admits=$(count_admits "$target")
   result_json="${results_dir}/${RUN_ID}/${task_id_root}/result.json"
   if [ -f "$result_json" ]; then
-    summary=$(python3 -c "
+    summary=$(python3 -c '
 import json, sys
 try:
-    d = json.load(open('$result_json'))
-    print('success={} end_reason={} rounds_used={} duration_seconds={:.1f}'.format(
-        d.get('success'), d.get('end_reason'), d.get('rounds_used'),
-        float(d.get('duration_seconds') or 0)))
+    d = json.load(open(sys.argv[1]))
+    print("success={} end_reason={} rounds_used={} duration_seconds={:.1f}".format(
+        d.get("success"), d.get("end_reason"), d.get("rounds_used"),
+        float(d.get("duration_seconds") or 0)))
 except Exception as e:
-    print('result_json=PARSE_ERROR ({})'.format(e))
-")
+    print("result_json=PARSE_ERROR ({})".format(e))
+' "$result_json")
   else
     summary="result_json=MISSING rc=$rc"
   fi

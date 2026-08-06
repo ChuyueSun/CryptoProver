@@ -1,18 +1,8 @@
 """Regression: launch.sh must react to TERM promptly mid-target and must
-not orphan the run.py child (T8 F7).
+not orphan the run.py child.
 
-Bash defers trap execution while a FOREGROUND child runs, so the pre-fix
-launcher recorded a TERM but did not act on it until the current (possibly
-multi-hour) run.py target completed — and never signaled the child at all.
-The fix backgrounds run.py and `wait`s on it (wait IS interruptible by
-traps); the trap forwards TERM to the child and reaps it before exiting.
-
-This drives the REAL launch.sh from a sandbox: `run.py` is resolved
-relative to the launcher's cwd, so a stub run.py stands in for the
-orchestrator, while `usage_audit.py` (stdlib-only) is the real one so the
-mandatory cost-accounting preflight runs unmodified. Both halves that
-codex's T8 verdict asked for are asserted: prompt launcher exit AND child
-cleanup (no orphan).
+Bash defers trap execution while a foreground child runs. The launcher must
+background run.py and wait on it so the trap can forward TERM and reap it.
 """
 from __future__ import annotations
 
@@ -27,8 +17,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Sleeps far longer than the test's exit deadline: a prompt launcher exit is
-# only possible if the trap fired mid-child instead of waiting the child out.
 STUB_RUN_PY = """\
 import os, signal, sys, time
 from pathlib import Path
@@ -62,6 +50,7 @@ class LaunchSignalHandling(unittest.TestCase):
             (sandbox / "run.py").write_text(STUB_RUN_PY)
             (sandbox / "launch.sh").symlink_to(ROOT / "launch.sh")
             (sandbox / "usage_audit.py").symlink_to(ROOT / "usage_audit.py")
+            (sandbox / "lib").symlink_to(ROOT / "lib", target_is_directory=True)
             project = sandbox / "proj"
             (project / "src").mkdir(parents=True)
             (project / "Cargo.toml").write_text("[package]\nname = 'p'\n")
@@ -71,6 +60,7 @@ class LaunchSignalHandling(unittest.TestCase):
 
             env = dict(os.environ)
             env["LAUNCH_TEST_STATE"] = str(state)
+            env["PYTHON"] = sys.executable
             proc = subprocess.Popen(
                 [
                     "bash", str(sandbox / "launch.sh"),
@@ -96,14 +86,11 @@ class LaunchSignalHandling(unittest.TestCase):
                 started = time.time()
                 rc = proc.wait(timeout=15)
                 elapsed = time.time() - started
-                # Pre-fix, bash sat on the deferred trap for the child's
-                # remaining ~60s sleep; prompt exit proves wait+trap works.
                 self.assertLess(
                     elapsed, 15.0,
                     "launcher deferred the TERM trap behind the child",
                 )
                 self.assertEqual(rc, 143)
-
                 self.assertTrue(
                     _wait_for(state / "child.got-term", 5),
                     "TERM was not forwarded to the run.py child",

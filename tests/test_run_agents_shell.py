@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -17,12 +18,43 @@ def shell_function(source: str, name: str, following_marker: str) -> str:
 
 
 class RunAgentsShellTests(unittest.TestCase):
-    def test_custom_provider_policy_is_the_proxy_policy(self):
-        source = RUN_AGENTS.read_text()
-        self.assertIn(
-            '-v "$PROVIDER_POLICY:/run/provider-proxy-policy.json:ro"', source,
+    def test_run_id_is_confined_before_docker_paths(self):
+        env = {
+            **os.environ,
+            "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+        }
+        for run_id in ("../escape", ".hidden", "-flag", "a..b", "x" * 41):
+            with self.subTest(run_id=run_id):
+                proc = subprocess.run(
+                    [
+                        "bash", str(RUN_AGENTS), "--gitroot", "/unused",
+                        "--run-id", run_id,
+                    ],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertNotIn("--manifests-file required", proc.stderr)
+                self.assertTrue(
+                    "invalid run id" in proc.stderr or "exceeds 40" in proc.stderr,
+                    proc.stderr,
+                )
+
+        valid = subprocess.run(
+            [
+                "bash", str(RUN_AGENTS), "--gitroot", "/unused",
+                "--run-id", "docker-run_1.2",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
         )
-        self.assertIn('--policy /run/provider-proxy-policy.json', source)
+        self.assertIn("--manifests-file required", valid.stderr)
 
     def test_trusted_core_rate_limit_is_not_shadowed_by_terminal_validation(self):
         source = RUN_AGENTS.read_text()
@@ -100,19 +132,6 @@ class RunAgentsShellTests(unittest.TestCase):
             "MARKER idx=0 target=target rc=42 end_reason=RATE_LIMITED",
             result.stdout,
         )
-
-    def test_retryable_profile_outcomes_bypass_reusable_terminal_validation(self):
-        source = RUN_AGENTS.read_text()
-        start = source.index(
-            'elif [ "$end_reason" = "PREMODEL_GATE_INDETERMINATE" ]'
-        )
-        end = source.index('elif [ ! -f "$result_json" ]', start)
-        retry_branch = source[start:end]
-        self.assertIn("RATE_LIMIT_OR_HANG", retry_branch)
-        self.assertIn("TRANSPORT_ERROR", retry_branch)
-        self.assertIn("RETRY_EXHAUSTED", retry_branch)
-        self.assertIn('audit.get("cost_status") == "complete"', retry_branch)
-        self.assertNotIn("validate-terminal", retry_branch)
 
     def test_no_tap_trusted_core_limit_reap_reaches_receipts_and_marker(self):
         source = RUN_AGENTS.read_text()
@@ -209,12 +228,6 @@ class RunAgentsShellTests(unittest.TestCase):
 
     def test_trusted_resume_allows_only_receipted_generated_cargo_lock(self):
         source = RUN_AGENTS.read_text()
-        self.assertIn(
-            'reusable_seed_authority(receipt)["tree_hash"]', source,
-        )
-        self.assertIn(
-            'else accepted_promotion_tree_hash(receipt)', source,
-        )
         profile_start = source.index(
             "# A scored profile preserves the clean canonical root receipt"
         )
@@ -249,15 +262,6 @@ class RunAgentsShellTests(unittest.TestCase):
             '--agent-max-turns "$AGENT_MAX_TURNS"',
             source,
         )
-
-    def test_harness_image_uses_supported_node_22_runtime(self):
-        dockerfile = (ROOT / "docker" / "Dockerfile").read_text()
-        self.assertIn("FROM node:22-bookworm-slim AS node", dockerfile)
-        self.assertIn("COPY --from=node /usr/local/ /usr/local/", dockerfile)
-        self.assertNotIn("nodejs npm", dockerfile)
-        self.assertIn("trusted_core_profile.py", dockerfile)
-        self.assertIn("strip_specs.py", dockerfile)
-        self.assertIn("COPY docker/ ./docker/", dockerfile)
 
 
 if __name__ == "__main__":

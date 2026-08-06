@@ -82,6 +82,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$RUN_ID" ] || die "--run-id required"
+command -v python3 >/dev/null || die "python3 not found on PATH"
+RUN_ID_ERROR=$(PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m lib.results validate-run-id "$RUN_ID" 2>&1
+) || { printf '%s\n' "$RUN_ID_ERROR" >&2; exit 2; }
+[ "${#RUN_ID}" -le 40 ] || die "--run-id exceeds 40 characters (Docker name/port derivation limit)"
 [ -n "$GITROOT" ] || die "--gitroot required"
 [ -n "$REF" ] || die "--ref required"
 [ -f "$BASE_MANIFEST" ] || die "--base-manifest not found: $BASE_MANIFEST"

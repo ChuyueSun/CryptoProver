@@ -19,10 +19,10 @@ RUN set -eux; \
 RUN chmod -R u+w /opt/harness && rm -rf /opt/harness && mkdir -p /opt/harness
 WORKDIR /opt/harness
 
-COPY run.py admit.py peel.py replay.py strip_specs.py usage_audit.py trusted_core_profile.py ./
-COPY prompt.md prompt_decompose.md ./
+COPY admit.py bounce_tap.sh demo_decompress.sh demo_pool_setup.sh launch.sh launch_spec_proof.sh launch_specgen.sh monitor_run.sh peel.py peel_run.sh prompt.md prompt_decompose.md race.py render_transcript.py replay.py run.py run_layer.py run_proofonly_layers.sh strip_specs.py trust_report.py trusted_core_profile.py usage_audit.py ./
 COPY skills/ ./skills/
 COPY lib/ ./lib/
+COPY scripts/ ./scripts/
 COPY peel_manifests/ ./peel_manifests/
 COPY docker/ ./docker/
 

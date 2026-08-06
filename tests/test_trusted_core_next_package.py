@@ -198,6 +198,97 @@ class TrustedCoreNextPackageTests(unittest.TestCase):
             for name in names[:-1]:
                 self.assertNotIn(str(paths[name]), input_paths)
             self.assertEqual(len(updated["package_id"]), 64)
+            self.assertEqual(
+                updated["package_id"],
+                next_package.provenance.supervisor_package_id(updated),
+            )
+            changed = {**updated, "run_id_prefix": "different"}
+            self.assertNotEqual(
+                updated["package_id"],
+                next_package.provenance.supervisor_package_id(changed),
+            )
+
+    def test_mutated_preserved_immutable_input_fails_closed(self):
+        # T315 M5: preserved inputs were hash-verified at launch time;
+        # re-pinning from current disk without comparing to the registered
+        # digest would silently bless an in-between mutation with a plausible
+        # successor package.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_reg = root / "old-reg"
+            old_reg.write_text("root registration")
+            fixed = root / "fixed"
+            fixed.write_text("fixed input")
+            new = {}
+            for role in ("reg", "patch", "promotion", "terminal", "state", "replay"):
+                path = root / f"new-{role}"
+                path.write_text(f"new-{role}")
+                new[role] = path
+            current = {
+                "launch_argv": ["run", "--launch-registration", str(old_reg)],
+                "immutable_inputs": [
+                    {"path": str(path),
+                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                    for path in (old_reg, fixed)
+                ],
+            }
+            fixed.write_text("tampered between launch and generation")
+            with self.assertRaises(next_package.NextPackageError) as ctx:
+                next_package.updated_package(
+                    current, registration=new["reg"], patch=new["patch"],
+                    promotion=new["promotion"], terminal=new["terminal"],
+                    campaign=new["state"], replay=new["replay"],
+                )
+            self.assertIn("changed since registration", str(ctx.exception))
+
+    def test_preserved_inputs_are_hashed_exactly_once_each(self):
+        # Verify-one-read / pin-another-read leaves a window where a mutation
+        # between the two reads passes the check and is then pinned as
+        # immutable. setdefault does NOT fix it: its default argument is
+        # evaluated eagerly, so an overlapping path was still read twice.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_reg = root / "old-reg"
+            old_reg.write_text("root registration")
+            fixed = root / "fixed"
+            fixed.write_text("fixed input")
+            new = {}
+            for role in ("reg", "patch", "promotion", "terminal", "state"):
+                path = root / f"new-{role}"
+                path.write_text(f"new-{role}")
+                new[role] = path
+            # The overlap case: a preserved immutable path reused as a role.
+            new["replay"] = fixed
+            current = {
+                "launch_argv": ["run", "--launch-registration", str(old_reg)],
+                "immutable_inputs": [
+                    {"path": str(path),
+                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                    for path in (old_reg, fixed)
+                ],
+            }
+            calls: dict[str, int] = {}
+            real_sha = next_package._sha
+
+            def counting_sha(path):
+                calls[str(path)] = calls.get(str(path), 0) + 1
+                return real_sha(path)
+
+            next_package._sha = counting_sha
+            try:
+                updated = next_package.updated_package(
+                    current, registration=new["reg"], patch=new["patch"],
+                    promotion=new["promotion"], terminal=new["terminal"],
+                    campaign=new["state"], replay=new["replay"],
+                )
+            finally:
+                next_package._sha = real_sha
+            self.assertTrue(calls, "hashing was not exercised")
+            for path, count in calls.items():
+                self.assertEqual(count, 1, f"{path} hashed {count} times")
+            # The overlapping path is present exactly once in the output.
+            paths = [e["path"] for e in updated["immutable_inputs"]]
+            self.assertEqual(paths.count(str(fixed)), 1)
 
     def test_root_package_without_seed_argv_gains_inserted_options(self):
         # F9: a fresh root launch carries NO seed/predecessor options

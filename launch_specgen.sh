@@ -77,11 +77,11 @@
 #       and drop stray untracked files (no run inherits a prior reconstruction);
 #     • $GITROOT missing → `git worktree add` it from $DALEK_SRCREPO @ $SRCREF;
 #     • $GITROOT present but broken (no/corrupt .git) → re-run with --bootstrap
-#       to `rm -rf` and recreate it (guarded so we never nuke a tree we own);
+#       to quarantine it and recreate it without destroying the stale tree;
 #     • no usable source → die with the exact command to create one.
 #   So a gutted/half-stripped tree no longer wedges the run — it self-heals.
 #
-# Env overrides (defaults verified for this machine; DALEK_* names as demo_decompress.sh):
+# Env overrides (tool paths are optional when already available on PATH):
 #   DALEK_UV_PY_BIN  DALEK_VERUS_DIR  DALEK_PROJECT  DALEK_GITROOT  DALEK_VSTD
 #   DALEK_RESULTS    CLAUDE_CODE_OAUTH_TOKEN (or DALEK_DEMO_TOKEN_FILE)
 #   DALEK_SRCREPO    canonical dalek-lite repo to bootstrap $GITROOT from
@@ -90,12 +90,12 @@ set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── machine-specific defaults (override via env) ─────────────────────────────
-UV_PY_BIN="${DALEK_UV_PY_BIN:-/path/to/python3/bin}"
-VERUS_DIR="${DALEK_VERUS_DIR:-/tmp/verus-rel/verus-arm64-macos}"
+# ── portable defaults (override via env) ─────────────────────────────────────
+UV_PY_BIN="${DALEK_UV_PY_BIN:-}"
+VERUS_DIR="${DALEK_VERUS_DIR:-}"
 PROJECT="${DALEK_PROJECT:-/private/tmp/dalek-spec-strip/curve25519-dalek}"
 GITROOT="${DALEK_GITROOT:-/private/tmp/dalek-spec-strip}"
-VSTD="${DALEK_VSTD:-/path/to/verus/vstd}"
+VSTD="${DALEK_VSTD:-}"
 RESULTS_ROOT="${DALEK_RESULTS:-$HARNESS_DIR/results}"
 # The clean, fully-proven ref every run resets to (the strip starts from here).
 SRCREF="${DALEK_SRCREF:-main}"
@@ -344,6 +344,33 @@ reset_path_to_main() {
   gitw checkout "$SRCREF" -- "$rel"
 }
 
+quarantine_bootstrap_destination() {
+  local quarantine
+  python3 - "$GITROOT" "$HARNESS_DIR" "$SRCREPO" <<'PY' >/dev/null \
+    || die "unsafe --bootstrap destination: $GITROOT"
+import sys
+from pathlib import Path
+
+candidate = Path(sys.argv[1]).expanduser().resolve()
+protected = [Path.home().resolve(), Path(sys.argv[2]).resolve()]
+if sys.argv[3]:
+    protected.append(Path(sys.argv[3]).expanduser().resolve())
+if candidate == Path(candidate.anchor):
+    raise SystemExit(f"refusing broad bootstrap destination: {candidate}")
+for path in protected:
+    if candidate == path or path.is_relative_to(candidate):
+        raise SystemExit(
+            f"refusing bootstrap destination {candidate}: it is or contains protected path {path}"
+        )
+print(candidate)
+PY
+  quarantine="${GITROOT}.stale.$(date -u +%Y%m%dT%H%M%SZ).$$"
+  [ ! -e "$quarantine" ] || die "bootstrap quarantine already exists: $quarantine"
+  mv "$GITROOT" "$quarantine" \
+    || die "could not quarantine stale worktree: $GITROOT"
+  echo "launch_specgen: moved stale worktree to recoverable quarantine $quarantine" >&2
+}
+
 # ── Guarantee a CLEAN starting state before any strip ────────────────────────
 # Three cases, in order:
 #   1. $GITROOT is a valid worktree at $SRCREF → HARD-reset the member to the
@@ -351,7 +378,7 @@ reset_path_to_main() {
 #      every run starts pristine — not just the files this rung happens to touch.
 #   2. $GITROOT is missing/broken AND $SRCREPO is a valid repo → (re)create the
 #      worktree from the source. A broken-but-present $GITROOT needs --bootstrap
-#      (it gets `rm -rf`'d), so we never silently delete a tree we didn't make.
+#      (it is moved to a guarded sibling quarantine), so bootstrap is recoverable.
 #   3. otherwise → die with the exact command to fix it.
 ensure_clean_worktree() {
   local member_rel
@@ -381,10 +408,10 @@ EOF
   "${srcgit[@]}" rev-parse --verify --quiet "$SRCREF" >/dev/null 2>&1 \
     || die "DALEK_SRCREPO=$SRCREPO has no ref '$SRCREF' (set DALEK_SRCREF or fix the repo)"
   if [ -e "$GITROOT" ] && [ "$BOOTSTRAP" != 1 ]; then
-    die "$GITROOT exists but isn't a valid worktree. Re-run with --bootstrap to rm -rf and recreate it from $SRCREPO, or remove it yourself."
+    die "$GITROOT exists but isn't a valid worktree. Re-run with --bootstrap to quarantine and recreate it from $SRCREPO, or move it yourself."
   fi
-  echo "launch_specgen: bootstrapping worktree $GITROOT from $SRCREPO @ $SRCREF…" >&2
-  [ -e "$GITROOT" ] && rm -rf "$GITROOT"
+  echo "launch_specgen: bootstrapping worktree $GITROOT from $SRCREPO @ ${SRCREF}…" >&2
+  [ -e "$GITROOT" ] && quarantine_bootstrap_destination
   "${srcgit[@]}" worktree prune >/dev/null 2>&1 || true
   "${srcgit[@]}" worktree add --force --detach "$GITROOT" "$SRCREF" \
     || die "git worktree add failed (source $SRCREPO, ref $SRCREF)"
@@ -475,14 +502,17 @@ if [ "$PRINT_ONLY" = 1 ]; then print_surface; exit 0; fi
 [ -n "$RUN_ID" ] || die "--run-id required (omit only with --print-surface)"
 
 # ── env prelude ──────────────────────────────────────────────────────────────
-export PATH="$UV_PY_BIN:$VERUS_DIR:$PATH"
+export PATH="${UV_PY_BIN:+$UV_PY_BIN:}${VERUS_DIR:+$VERUS_DIR:}$PATH"
 if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -n "${DALEK_DEMO_TOKEN_FILE:-}" ] && [ -f "$DALEK_DEMO_TOKEN_FILE" ]; then
   CLAUDE_CODE_OAUTH_TOKEN="$(cat "$DALEK_DEMO_TOKEN_FILE")"; export CLAUDE_CODE_OAUTH_TOKEN
 fi
 
 # ── preflight ────────────────────────────────────────────────────────────────
-command -v python3     >/dev/null || die "python3 not on PATH ($UV_PY_BIN missing?)"
-command -v cargo-verus >/dev/null || die "cargo-verus not on PATH ($VERUS_DIR missing?)"
+command -v python3     >/dev/null || die "python3 not on PATH (set DALEK_UV_PY_BIN if needed)"
+RUN_ID_ERROR=$(PYTHONPATH="$HARNESS_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m lib.results validate-run-id "$RUN_ID" 2>&1
+) || { printf '%s\n' "$RUN_ID_ERROR" >&2; exit 2; }
+command -v cargo-verus >/dev/null || die "cargo-verus not on PATH (set DALEK_VERUS_DIR if needed)"
 command -v claude      >/dev/null || die "claude not on PATH"
 
 # Clean start: validate / hard-reset / (re)bootstrap the worktree BEFORE any
@@ -526,9 +556,10 @@ fi
 CMD=( python3 "$HARNESS_DIR/run.py" "$TARGET"
       --project "$PROJECT" --run-id "$RUN_ID"
       --rounds "$ROUNDS" --max-task-minutes "$BUDGET"
-      --model "$MODEL" --results "$RESULTS_ROOT" --vstd-root "$VSTD"
+      --model "$MODEL" --results "$RESULTS_ROOT"
       --experiment-allow-edit "${EDIT_PATHS[@]}"
       --experiment-mode "$SURF_EXP_MODE" )
+[ -n "$VSTD" ] && CMD+=( --vstd-root "$VSTD" )
 # spec-proof rungs let the agent (re)write contracts, so the gate must be OFF.
 [ "$SURF_GATE" = "off" ] && CMD+=( --no-spec-gate )
 

@@ -23,8 +23,16 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from lib import admits as _admits  # noqa: E402
 from lib import results as _results  # noqa: E402
-from run import run_task  # noqa: E402
+
+# Keep the lightweight CLI parseable on older system Pythons so main() can
+# report the repository's explicit 3.11+ requirement instead of failing later
+# while importing run.py's 3.11-only dependency surface.
+if sys.version_info >= (3, 11):
+    from run import run_task_persisting  # noqa: E402
+else:
+    run_task_persisting = None
 
 
 # Domain layers L0-L9 mirror inference-dalek/inference_dalek/eval/domain_layers.py.
@@ -303,7 +311,12 @@ def main() -> int:
     modules = list(LAYER_SETS[args.layer_set])
     project = args.project.resolve()
     results_root = args.results.resolve()
-    run_id = args.run_id or _results.run_id_new(f"layer{args.layer_set}")
+    try:
+        run_id = _results.validate_launcher_run_id(
+            args.run_id or _results.run_id_new(f"layer{args.layer_set}"))
+    except (RuntimeError, ValueError) as exc:
+        ap.error(str(exc))
+    assert run_task_persisting is not None
     results_root.mkdir(parents=True, exist_ok=True)
 
     # Optional --only filter (subset of the layer set, exact module-path match)
@@ -372,7 +385,7 @@ def main() -> int:
 
         # Auto-budget per module: max(floor, slope * admits)
         try:
-            num_admits = target.read_text().count("admit()")
+            num_admits = _admits.count_non_axiom(target.read_text())
         except OSError:
             num_admits = 0
         budget_min = max(args.budget_min_floor,
@@ -382,7 +395,7 @@ def main() -> int:
         print(f"[run_layer] {num_admits} admit(s) → budget {budget_min:.0f} min{axiom_note}")
 
         try:
-            result = run_task(
+            result = run_task_persisting(
                 target=target, project=project,
                 run_id=run_id, results_root=results_root,
                 max_rounds=args.rounds,

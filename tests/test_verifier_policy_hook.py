@@ -68,10 +68,62 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
          {"command": "VERUS_Z3_PATH=/tmp/z3 verus src/lib.rs"}, True),
         ("variable-expanded direct verus", "Bash",
          {"command": "V=verus; $V src/lib.rs"}, True),
+        ("outer variable expanded in sh-c", "Bash",
+         {"command": "V=verus; sh -c \"$V verify src/lib.rs\""}, True),
+        ("outer braced variable expanded in bash-c", "Bash",
+         {"command": "V=/opt/verus; bash -c \"${V} verify src/lib.rs\""}, True),
+        ("outer variable expanded in script-c", "Bash",
+         {"command": "V=verus; script -c \"$V verify src/lib.rs\" /tmp/typescript"},
+         True),
+        ("outer verus candidate survives nested override", "Bash",
+         {"command": "V=verus; sh -c \"V=echo; $V verify src/lib.rs\""}, True),
+        ("nested verus candidate survives outer value", "Bash",
+         {"command": "V=echo; sh -c 'V=verus; $V verify src/lib.rs'"}, True),
         ("bash-c direct verus", "Bash",
          {"command": "bash -c 'verus src/lib.rs'"}, True),
         ("sh-c direct verus", "Bash",
          {"command": "sh -c 'verus src/lib.rs'"}, True),
+        ("nice-prefixed direct verus", "Bash",
+         {"command": "nice -n 5 verus src/lib.rs"}, True),
+        ("stdbuf-prefixed direct verus", "Bash",
+         {"command": "stdbuf -o0 verus src/lib.rs"}, True),
+        ("time-prefixed direct verus", "Bash",
+         {"command": "/usr/bin/time verus src/lib.rs"}, True),
+        ("script-prefixed direct verus", "Bash",
+         {"command": "script -q /dev/null verus src/lib.rs"}, True),
+        ("script short command-string direct verus", "Bash",
+         {"command": "script -c 'verus verify src/lib.rs' /tmp/typescript"}, True),
+        ("script long command-string direct verus", "Bash",
+         {"command": "script --command 'verus verify src/lib.rs' /tmp/typescript"},
+         True),
+        ("script equals command-string direct verus", "Bash",
+         {"command": "script --command='verus verify src/lib.rs' /tmp/typescript"},
+         True),
+        ("script nested shell command-string direct verus", "Bash",
+         {"command": "script -c \"sh -c 'verus verify src/lib.rs'\" /tmp/typescript"},
+         True),
+        ("taskset-prefixed direct verus", "Bash",
+         {"command": "taskset -c 0 verus src/lib.rs"}, True),
+        ("xargs direct verus", "Bash",
+         {"command": "printf '%s\\n' src/lib.rs | xargs verus verify"}, True),
+        ("assignment and wrapper direct verus", "Bash",
+         {"command": "LC_ALL=C nice -n 5 verus src/lib.rs"}, True),
+        ("env and wrapper direct verus", "Bash",
+         {"command": "env LC_ALL=C nice -n 5 verus src/lib.rs"}, True),
+        ("python subprocess cargo verus", "Bash",
+         {"command": "python3 -c 'import subprocess; "
+                     "subprocess.run([\"cargo\",\"verus\",\"verify\"])'"}, True),
+        ("versioned python subprocess direct verus", "Bash",
+         {"command": "/usr/bin/python3.15 -c 'import subprocess; "
+                     "subprocess.check_call([\"verus\",\"src/lib.rs\"])'"}, True),
+        ("shell-backgrounded direct verus", "Bash",
+         {"command": "verus src/lib.rs &"}, True),
+        ("direct verus after newline", "Bash",
+         {"command": "cd /tmp\nverus verify src/lib.rs"}, True),
+        ("wrapped direct verus after newline", "Bash",
+         {"command": "echo start\nnice verus verify src/lib.rs"}, True),
+        ("wrapped tool-backgrounded direct verus", "Bash",
+         {"command": "nice verus src/lib.rs", "run_in_background": True}, True),
         ("verus_check tail slice", "Bash",
          {"command": "python3 /opt/harness/skills/verus_check.py "
                      "/work/curve25519-dalek/src/ristretto.rs --project /work/curve25519-dalek "
@@ -163,6 +215,10 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
          {"command": "python3 verus_check.py x --project /p # | head -1"}, False),
         ("quoted hash is query data", "Bash",
          {"command": "python3 verus_check.py 'foo # bar' --project /p"}, False),
+        ("quoted multiline direct-verus text is query data", "Bash",
+         {"command": "rg 'line one\nverus verify src/lib.rs' src/"}, False),
+        ("escaped newline is command continuation", "Bash",
+         {"command": "echo prefix \\\nverus verify src/lib.rs"}, False),
         ("semantic search quoted Rust arrow", "Bash",
          {"command": "python3 /opt/harness/skills/search_semantic.py "
                      "\"u64 -> nat\" --project /p"}, False),
@@ -188,6 +244,14 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
         ("read harness /tmp/claude- scratch", "Bash",
          {"command": "cat /tmp/claude-501/foo.json"}, False),
         ("grep source tree", "Bash", {"command": "grep -rn lemma_foo src/"}, False),
+        ("grep for verus token", "Bash",
+         {"command": "rg -n verus run.py"}, False),
+        ("python prints verus text", "Bash",
+         {"command": "python3 -c 'print(\"verus\")'"}, False),
+        ("non-verus outer variable in sh-c", "Bash",
+         {"command": "V=echo; sh -c \"$V verus src/lib.rs\""}, False),
+        ("script ordinary command string", "Bash",
+         {"command": "script -c 'cargo build' /tmp/typescript"}, False),
         ("grep source in /opt/verus with head", "Bash",
          {"command": "grep -rn \"pub.*fn use_type_invariant\\|use_type_invariant.*=\" "
                      "/opt/verus -r --include=\"*.rs\" | head -5"},
@@ -226,6 +290,33 @@ class VerifierPolicyHookMatcher(unittest.TestCase):
                 reasons = evaluate(tool, inp)
                 self.assertEqual(bool(reasons), expect_block,
                                  f"{label}: reasons={reasons}")
+
+    def test_nested_wrapper_depth_limit_fails_closed(self):
+        self.assertTrue(
+            verifier_policy_hook._direct_verus_from_tokens(
+                ["cargo", "build"], _depth=16,
+            )
+        )
+
+    def test_oversized_command_fails_closed_before_tokenization(self):
+        command = "x" * (verifier_policy_hook._MAX_COMMAND_BYTES + 1)
+        with mock.patch.object(
+            verifier_policy_hook, "_shell_tokens",
+            side_effect=AssertionError("oversized command was tokenized"),
+        ):
+            self.assertIn(
+                "parser size limit", evaluate("Bash", {"command": command})[0],
+            )
+
+    def test_internal_marker_control_byte_fails_closed_before_tokenization(self):
+        command = "echo safe\x01\nverus verify src/lib.rs"
+        with mock.patch.object(
+            verifier_policy_hook, "_shell_tokens",
+            side_effect=AssertionError("control-byte command was tokenized"),
+        ):
+            self.assertIn(
+                "control byte", evaluate("Bash", {"command": command})[0],
+            )
 
     def test_corrective_message_uses_absolute_skill_path(self):
         # prompt.md:66-70 requires absolute skill paths; the hand-back message

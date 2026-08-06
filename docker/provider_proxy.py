@@ -130,9 +130,24 @@ def upstream_tls_ready(policy: dict[str, Any]) -> bool:
         return False
 
 
+def _log_line(payload: dict[str, Any], *, stderr: bool = False) -> None:
+    """One os-level write per event line.
+
+    print() under ThreadingHTTPServer performs two writes (payload, newline);
+    concurrent handler threads can interleave them and corrupt the
+    line-oriented accounting stream (T315).
+    """
+    stream = sys.stderr if stderr else sys.stdout
+    stream.write(json.dumps(payload, sort_keys=True) + "\n")
+    stream.flush()
+
+
 class FixedProviderProxy(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "TrustCoreProviderProxy/1"
+    # A stalled client must not pin a daemon thread forever on a socket
+    # read/write; sits just above the 900s upstream budget.
+    timeout = 930
 
     @property
     def policy(self) -> dict[str, Any]:
@@ -176,35 +191,63 @@ class FixedProviderProxy(http.server.BaseHTTPRequestHandler):
     def do_CONNECT(self) -> None:  # noqa: N802
         self._json(405, {"okay": False, "error": "CONNECT disabled"})
 
+    def _deny(self, status: int, reason: str) -> None:
+        # Denials never reach upstream (no billing), but a silent denial is
+        # an audit hole: request counts on the CLI side could not be
+        # distinguished from "never reached the proxy" (T315).
+        _log_line({
+            "event": "request_denied",
+            "status": status,
+            "reason": reason,
+            "path": (clean_target(self.path) or self.path).split("?", 1)[0],
+        }, stderr=True)
+        try:
+            self._json(status, {"okay": False, "error": reason})
+        except OSError:
+            pass
+
     def do_POST(self) -> None:  # noqa: N802
         target = clean_target(self.path)
         allowed_methods = self.policy["allowed_methods"]
         if "POST" not in allowed_methods:
-            self._json(405, {"okay": False, "error": "method not allowed"})
+            self._deny(405, "method not allowed")
             return
         if target is None or not path_allowed(
             target, self.policy["allowed_path_prefixes"],
         ):
-            self._json(404, {"okay": False, "error": "path not allowed"})
+            self._deny(404, "path not allowed")
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            self._json(400, {"okay": False, "error": "invalid content length"})
+            self._deny(400, "invalid content length")
             return
         maximum = int(self.policy["maximum_request_bytes"])
         if length < 0 or length > maximum:
-            self._json(413, {"okay": False, "error": "request too large"})
+            self._deny(413, "request too large")
             return
         body = self.rfile.read(length)
         if len(body) != length:
-            self._json(400, {"okay": False, "error": "truncated request"})
+            self._deny(400, "truncated request")
             return
 
         host = self.policy["upstream_host"]
         port = int(self.policy["upstream_port"])
         started = time.time()
-        response_started = False
+        # Receipt discipline (T315, three production receipt holes): the
+        # provider_request line lives in a `finally` so every request that
+        # opens an upstream attempt prints exactly one accounting line no
+        # matter which side of the connection dies; client disconnects are
+        # their own structured event carrying the TRUE upstream status (a
+        # billed 200 must not masquerade as 502); the 502 reply is skipped
+        # once headers are on the wire (writing a second status line into a
+        # half-sent body corrupts the client stream) and its write failure is
+        # swallowed; the upstream connection is always closed promptly so the
+        # provider can cancel generation instead of streaming into the void.
+        connection = None
+        status = 502
+        client_error: str | None = None
+        headers_sent = False
         try:
             connection = http.client.HTTPSConnection(
                 host, port, timeout=900, context=ssl.create_default_context(),
@@ -218,52 +261,76 @@ class FixedProviderProxy(http.server.BaseHTTPRequestHandler):
                 ),
             )
             response = connection.getresponse()
-            self.send_response(response.status, response.reason)
-            for key, value in response.getheaders():
-                lower = key.lower()
-                if lower in HOP_HEADERS or lower in {"content-length", "connection"}:
-                    continue
-                self.send_header(key, value)
-            self.send_header("Connection", "close")
-            self.end_headers()
-            response_started = True
             status = response.status
-            while True:
-                chunk = response.read(64 * 1024)
+            try:
+                self.send_response(response.status, response.reason)
+                for key, value in response.getheaders():
+                    lower = key.lower()
+                    if lower in HOP_HEADERS or lower in {"content-length", "connection"}:
+                        continue
+                    self.send_header(key, value)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                headers_sent = True
+            except OSError as exc:
+                client_error = type(exc).__name__
+            while client_error is None:
+                # read1: return as soon as ANY data is available. read(64k)
+                # accumulates the full 64KB across chunks, holding SSE events
+                # back for minutes during long generation pauses — plausibly
+                # the root cause of the observed client resets.
+                chunk = response.read1(64 * 1024)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-            connection.close()
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except OSError as exc:
+                    client_error = type(exc).__name__
             self.close_connection = True
         except Exception as exc:
-            if not response_started:
-                self._json(502, {
-                    "okay": False, "error": "fixed upstream unavailable",
-                })
+            # Only claim "upstream unavailable" when we never got a real
+            # upstream status. A failure raised by response.read1() AFTER
+            # getresponse() succeeded is a mid-stream death on an already
+            # BILLED response: overwriting its 200 with 502 recreates, on the
+            # upstream side, exactly the masquerade this block fixes for
+            # client-side deaths. (Pre-response, status is already 502 from
+            # the initializer, so this is the only case that assigns.)
+            if not headers_sent:
                 status = 502
-            else:
-                # Headers/body are already committed. A second HTTP status
-                # line would corrupt the provider stream; close the connection
-                # and let the client classify the truncated response.
-                self.close_connection = True
-            print(
-                json.dumps({
-                    "event": "upstream_error",
-                    "type": type(exc).__name__,
+            _log_line({
+                "event": "upstream_error",
+                "type": type(exc).__name__,
+                "path": target.split("?", 1)[0],
+            }, stderr=True)
+            if not headers_sent:
+                try:
+                    self._json(502, {"okay": False, "error": "fixed upstream unavailable"})
+                except OSError:
+                    pass
+            self.close_connection = True
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+            if client_error is not None:
+                _log_line({
+                    "event": "client_disconnect",
+                    "type": client_error,
                     "path": target.split("?", 1)[0],
-                }, sort_keys=True),
-                file=sys.stderr,
-                flush=True,
-            )
-        print(json.dumps({
-            "event": "provider_request",
-            "method": "POST",
-            "path": target.split("?", 1)[0],
-            "status": status,
-            "duration_ms": round((time.time() - started) * 1000),
-            "policy_sha256": self.policy_sha256,
-        }, sort_keys=True), flush=True)
+                    "upstream_status": status,
+                }, stderr=True)
+            _log_line({
+                "event": "provider_request",
+                "method": "POST",
+                "path": target.split("?", 1)[0],
+                "status": status,
+                "client_disconnect": client_error is not None,
+                "duration_ms": round((time.time() - started) * 1000),
+                "policy_sha256": self.policy_sha256,
+            })
 
 
 class ThreadingProxyServer(http.server.ThreadingHTTPServer):

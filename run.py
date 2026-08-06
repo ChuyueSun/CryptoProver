@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lib import discovery_brief, failure_memory, frontier, provenance, results, taxonomy  # noqa: E402
+from lib import admits, discovery_brief, failure_memory, frontier, provenance, results, taxonomy  # noqa: E402
 from lib.admits import count_non_axiom as _count_llm_target_admits  # noqa: E402
 from lib.admits import find_matching_brace, find_proof_fn_body_brace  # noqa: E402
 from lib.admits import axiom_fn_names  # noqa: E402
@@ -67,11 +67,88 @@ _AGENT_TURN_OBSERVATION_WINDOW = 3
 _AGENT_TURN_SAFETY_FACTOR = 1.25
 
 
+def _tooling_files() -> set[Path]:
+    """Return the executable harness surface guarded during a proof run."""
+    return {
+        *HERE.glob("*.py"), *HERE.glob("*.sh"),
+        *HERE.glob("prompt*.md"), HERE / "skills/SKILL.md",
+        *HERE.glob("skills/**/*.py"), *HERE.glob("skills/**/*.sh"),
+        *HERE.glob("skills/**/*.json"),
+        *HERE.glob("lib/**/*.py"), *HERE.glob("lib/**/*.sh"),
+        *HERE.glob("lib/**/*.json"),
+        *HERE.glob("docker/**/*.py"), *HERE.glob("docker/**/*.sh"),
+        *HERE.glob("docker/**/*.json"),
+        *HERE.glob("scripts/**/*.py"), *HERE.glob("scripts/**/*.sh"),
+        *HERE.glob("scripts/**/*.json"),
+    }
+
+
+class SourceReceiptInvalid(RuntimeError):
+    """A source-tree receipt could not be computed over the live workspace.
+
+    `provenance.source_tree_receipt` refuses to hash a tree it cannot bind —
+    a symlink escaping the workspace, a dangling or cyclic link, an unreadable
+    target, a literal Rust include pointing outside the tree. Those are all
+    fail-CLOSED conditions, but the raise reaches fourteen call sites that do
+    not catch it, so it surfaced as an unhandled traceback: no result.json, no
+    end_reason, and a durable supervisor that sees a process die with no
+    verdict rather than a labelled terminal it can classify. Typed here so the
+    runner can persist SOURCE_RECEIPT_INVALID instead of crashing.
+    """
+
+    def __init__(self, message: str, *, source_path: Optional[Path] = None):
+        super().__init__(message)
+        self.source_path = source_path
+
+
+def _source_tree_receipt(project: Path) -> dict:
+    """`provenance.source_tree_receipt` with a typed, catchable failure."""
+    try:
+        return provenance.source_tree_receipt(project)
+    except (ValueError, OSError) as exc:
+        raise SourceReceiptInvalid(
+            str(exc), source_path=getattr(exc, "source_path", None),
+        ) from exc
+
+
+def _persisted_abort(
+    tdir: Path, *, task_id: str, run_id: str, target: Path,
+    module: str, backend: str, end_reason: str, message: str,
+    experiment_provenance: Optional[dict] = None,
+    duration_seconds: float = 0.0, **extra,
+) -> TaskResult:
+    """Build, PERSIST, and return an early-exit TaskResult.
+
+    Writing result.json is part of aborting, not a step each exit remembers
+    separately: the durable supervisor polls for exactly that file and
+    classifies the leg from it, so an early return that skips the write is
+    invisible to it — the campaign stalls on a missing verdict instead of
+    failing closed on a recorded one. One of the five early exits had already
+    drifted into exactly that shape.
+    """
+    task_result = TaskResult(
+        task_id=task_id,
+        run_id=run_id,
+        target_path=str(target),
+        module_path=module,
+        success=False,
+        end_reason=end_reason,
+        rounds_used=0,
+        duration_seconds=duration_seconds,
+        agent_backend=backend,
+        error_message=message,
+        experiment_provenance=experiment_provenance,
+        **extra,
+    )
+    write_json(tdir / "result.json", task_result)
+    return task_result
+
+
 def _count_forbidden_in_files(files) -> dict[str, int]:
     """Sum `count_forbidden_constructs` over `files` (unreadable files skipped).
     Module-level (not a run_task closure) so the forbidden-construct gate's
     exact counting behavior is unit-testable — see tests/test_admits.py."""
-    totals = {"assume": 0, "external_body": 0, "rlimit": 0}
+    totals = {"assume": 0, "external_body": 0, "rlimit": 0, "admit_alias": 0}
     for f in files:
         try:
             c = count_forbidden_constructs(f.read_text())
@@ -136,7 +213,7 @@ def _forbidden_delta(files, baseline: dict,
     cur = _count_forbidden_in_files(files)
     delta = [
         f"{k} (+{cur[k] - baseline_counts.get(k, 0)})"
-        for k in ("assume", "external_body")
+        for k in ("assume", "external_body", "admit_alias")
         if cur[k] > baseline_counts.get(k, 0)
     ]
     baseline_rlimits = baseline.get("rlimits", [])
@@ -183,40 +260,6 @@ def _final_gate_allowance_seconds(experiment_mode: str) -> float:
 
 def _agent_budget_seconds(total_seconds: float, experiment_mode: str) -> float:
     return max(0.0, total_seconds - _final_gate_allowance_seconds(experiment_mode))
-
-
-def _resolve_launch_budget(
-    total_minutes: float,
-    experiment_mode: str,
-    round_gate_allowance_seconds: float,
-    budget_is_auto: bool,
-) -> tuple[float, float, bool, Optional[str]]:
-    """Return (total_minutes, agent_budget_seconds, raised, error).
-
-    The launch minimum is one productive provider slice plus the round's
-    authoritative gate; the terminal reserve sits on top. An AUTO-scaled
-    budget below that minimum is raised to it — the auto formula promises a
-    launchable run, and the whole-crate terminal reserve can exceed the
-    20-minute auto floor (F3: a bare whole-crate run would otherwise exit
-    LIMIT with zero rounds). An EXPLICIT operator budget that cannot fund one
-    round stays a hard error rather than being silently reinterpreted.
-    """
-    final_allowance = _final_gate_allowance_seconds(experiment_mode)
-    minimum_launch = round_gate_allowance_seconds + _MIN_PRODUCTIVE_ROUND_SEC
-    agent_budget = _agent_budget_seconds(total_minutes * 60, experiment_mode)
-    if agent_budget >= minimum_launch:
-        return total_minutes, agent_budget, False, None
-    if budget_is_auto:
-        raised_minutes = (minimum_launch + final_allowance) / 60.0
-        return raised_minutes, minimum_launch, True, None
-    msg = (
-        "task budget cannot fund one provider round plus its authoritative "
-        f"gate: pre-terminal budget={agent_budget:.0f}s, "
-        f"provider floor={_MIN_PRODUCTIVE_ROUND_SEC:.0f}s, "
-        f"round gate allowance={round_gate_allowance_seconds:.0f}s, "
-        f"terminal reserve={final_allowance:.0f}s"
-    )
-    return total_minutes, agent_budget, False, msg
 
 
 def _provider_deadline_seconds(
@@ -785,7 +828,7 @@ def target_needs_decompose(target: Path) -> bool:
         text = target.read_text()
     except OSError:
         return False
-    if "admit()" not in text:
+    if not admits.has_admit_call(text):
         return False
     # Signal 1: any `ensures` clause with >=3 top-level conjuncts (>=2 `&&`).
     for m in re.finditer(r"\bensures\b", text):
@@ -1104,7 +1147,7 @@ def _classify_remaining_admits_one(target: Path) -> dict:
     except OSError:
         return {"total": 0, "intentional": 0, "hard": 0, "detail": []}
 
-    if "admit()" not in text:
+    if not admits.has_admit_call(text):
         return {"total": 0, "intentional": 0, "hard": 0, "detail": []}
 
     # curve_equation_lemmas is REMOVED from this set per user direction:
@@ -1123,8 +1166,14 @@ def _classify_remaining_admits_one(target: Path) -> dict:
     # only counts as real code — never a comment mention, and never lost to a
     # `//` inside a string literal (e.g. `let _ = "https://x"; admit();`).
     masked_lines = strip_comments_strings(text).splitlines()
-    admit_lines = [i + 1 for i, code in enumerate(masked_lines)
-                   if "admit()" in code]
+    # Line numbers come from lib.admits — the single source of truth — so this
+    # inventory cannot disagree with the COMPLETE gate about what an admit is
+    # (`admit ( );` and multi-line calls counted there but not here left the
+    # agent staring at an empty inventory while the gate refused to finish).
+    _classified = admits.classify_admit_lines(text)
+    admit_lines = sorted(
+        set(_classified["non_axiom_lines"]) | set(_classified["axiom_lines"])
+    )
 
     def find_fn(ln: int) -> Optional[tuple[str, int, int]]:
         best = None
@@ -1778,98 +1827,15 @@ def _frozen_paths_changed_from_git(
         else:
             detail = f"rc={proc.returncode}"
         return [], f"git diff rc={proc.returncode}: {detail}"
-    frozen = _frozen_paths_from_diff_name_status_z(proc.stdout, allow_edit_rel)
-    untracked_paths, untracked_error = _untracked_paths_changed_from_git(
-        project, env=env,
-    )
-    if untracked_error:
-        return [], untracked_error
-    for path in untracked_paths:
-        if path not in allow_edit_rel and path not in frozen:
-            frozen.append(path)
-    return sorted(frozen), None
-
-
-def _untracked_paths_changed_from_git(
-    project: Path,
-    env: Optional[dict[str, str]] = None,
-) -> tuple[list[str], Optional[str]]:
-    """Enumerate untracked paths; unlike git diff, these may be compiler inputs."""
-    commands = (
-        ["git", "-C", str(project), "ls-files", "--others",
-         "--exclude-standard", "--full-name", "-z"],
-        ["git", "-C", str(project), "ls-files", "--others", "--ignored",
-         "--exclude-standard", "--full-name", "-z"],
-    )
-    outputs = []
-    try:
-        for command in commands:
-            completed = subprocess.run(
-                command, env=env, capture_output=True, text=True, timeout=30,
-            )
-            if completed.returncode != 0:
-                detail = (completed.stderr or completed.stdout or "").strip()
-                return [], f"git ls-files rc={completed.returncode}: {detail[-1000:]}"
-            outputs.append(completed.stdout)
-    except Exception as e:
-        return [], f"git untracked-file audit failed: {e!r}"
-
-    try:
-        gitroot_result = subprocess.run(
-            ["git", "-C", str(project), "rev-parse", "--show-toplevel"],
-            env=env, capture_output=True, text=True, timeout=30,
-        )
-        if gitroot_result.returncode != 0:
-            return [], "cannot resolve git root for ignored-path audit"
-        gitroot = Path(gitroot_result.stdout.strip())
-    except Exception as e:
-        return [], f"git root audit failed: {e!r}"
-
-    def _generated_noise(path: str) -> bool:
-        current = gitroot
-        for component in Path(path).parts:
-            if component in {"__pycache__", ".mypy_cache", ".pytest_cache", ".verilib"}:
-                return True
-            if (component in {"target", "results", "claude_raw", "claude_memory"}
-                    and (current == gitroot or (current / "Cargo.toml").is_file())):
-                return True
-            current /= component
-        return False
-
-    return sorted(
-        {
-            path
-            for output in outputs
-            for path in output.split("\0")
-            if path and not _generated_noise(path)
-        }
-    ), None
+    return _frozen_paths_from_diff_name_status_z(proc.stdout, allow_edit_rel), None
 
 
 def _bound_file_intact(path: Path, expected_sha256: str) -> bool:
-    """Fail-closed equality check for an authority file exposed on disk."""
+    """Fail closed when an authority file exposed on disk changes or vanishes."""
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest() == expected_sha256
     except OSError:
         return False
-
-
-def _literal_compiler_input_drift(baseline: dict, current: dict) -> list[str]:
-    """Detect new/changed compiler inputs that live below ignored directories."""
-    def _entries(receipt: dict) -> dict[str, str]:
-        explicit = set(receipt.get("literal_compiler_inputs") or [])
-        return {
-            str(entry.get("path")): str(entry.get("sha256"))
-            for entry in receipt.get("files") or []
-            if entry.get("path") in explicit
-        }
-
-    before = _entries(baseline)
-    after = _entries(current)
-    return sorted(
-        path for path in before.keys() | after.keys()
-        if before.get(path) != after.get(path)
-    )
 
 
 def _declared_edit_scope(
@@ -1878,10 +1844,107 @@ def _declared_edit_scope(
     experiment_allow_edit: list[Path],
     experiment_active_edit: list[Path],
 ) -> list[Path]:
-    """Return the exact file set the agent is authorized to modify."""
+    """Return the exact source files the current task may modify."""
     if experiment_allow_edit:
         return experiment_active_edit or experiment_allow_edit
     return [target, *siblings]
+
+
+def _frozen_paths_changed_from_receipts(
+    baseline: dict,
+    current: dict,
+    allow_edit_rel: set[str],
+    tracked_paths: Optional[set[str]] = None,
+) -> list[str]:
+    """Compare actual receipted bytes outside the exact editable set.
+
+    Git's index flags (`assume-unchanged` and `skip-worktree`) can hide a
+    worktree mutation from `git diff`. Receipt entries are read from disk, so
+    this second authority check detects changed, added, removed, retargeted,
+    and changed-pointee inputs independently of index metadata.
+    """
+    def entries(receipt: dict) -> dict[str, tuple]:
+        return {
+            item["path"]: (
+                item.get("kind"), item.get("sha256"), item.get("size"),
+                item.get("target_sha256"),
+            )
+            for item in receipt.get("files", [])
+            if isinstance(item, dict) and isinstance(item.get("path"), str)
+        }
+
+    before = entries(baseline)
+    after = entries(current)
+    explicit_inputs = {
+        path
+        for receipt in (baseline, current)
+        for key in ("cargo_compiler_inputs", "literal_compiler_inputs")
+        for path in receipt.get(key, [])
+        if isinstance(path, str)
+    }
+    changed = {
+        path for path in before.keys() | after.keys()
+        if before.get(path) != after.get(path)
+    }
+    if tracked_paths is not None:
+        # Index flags only blind Git for HEAD-tracked paths. Keep those plus
+        # explicit compiler inputs and newly added Rust modules authoritative,
+        # while ignoring regenerated Cargo.lock/log/scratch bytes that were
+        # never part of the frozen tracked surface.
+        changed = {
+            path for path in changed
+            if path in tracked_paths or path in explicit_inputs
+            or Path(path).suffix == ".rs"
+        }
+    return sorted(
+        path for path in changed if path not in allow_edit_rel
+    )
+
+
+def _tracked_receipt_paths_from_git(
+    gitroot: Path,
+    receipt_root: Path,
+    env: Optional[dict[str, str]] = None,
+) -> tuple[set[str], Optional[str]]:
+    """Return HEAD-tracked paths in receipt-root-relative vocabulary."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(gitroot), "ls-tree", "-rz", "--name-only", "HEAD"],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:
+        return set(), f"git ls-tree failed: {exc!r}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip()
+        return set(), f"git ls-tree rc={proc.returncode}: {detail[-1000:]}"
+    tracked: set[str] = set()
+    for path in proc.stdout.split("\0"):
+        if not path:
+            continue
+        try:
+            tracked.add(
+                (gitroot.resolve() / path).relative_to(
+                    receipt_root.resolve()).as_posix())
+        except ValueError:
+            continue
+    return tracked, None
+
+
+def _recoverable_receipt_source_path(
+    exc: SourceReceiptInvalid,
+    gitroot: Path,
+    allow_edit_rel: set[str],
+    experiment_mode: Optional[str],
+) -> Optional[str]:
+    """Return a frozen declaring path that may be restored before re-receipt."""
+    if experiment_mode not in _WHOLE_CRATE_MODES or exc.source_path is None:
+        return None
+    try:
+        rel = exc.source_path.resolve().relative_to(
+            gitroot.resolve()).as_posix()
+    except ValueError:
+        return None
+    return None if rel in allow_edit_rel else rel
 
 
 # Tokens that, inside a git command, name a NON-HEAD revision. On a SEALED
@@ -2447,14 +2510,20 @@ def _in_progress_fns(file_path: Path) -> set[str]:
         text = file_path.read_text()
     except OSError:
         return set()
-    if "admit()" not in text:
+    if not admits.has_admit_call(text):
         return set()
     ranges = _fn_ranges_in_file(file_path)
     if not ranges:
         return set()
-    # For each admit() occurrence, find enclosing fn by line number.
-    lines = text.splitlines()
-    admit_lines = [i + 1 for i, ln in enumerate(lines) if "admit()" in ln]
+    # For each admit() occurrence, find enclosing fn by line number. Line
+    # numbers come from lib.admits (comment/string aware, whitespace
+    # tolerant); the old raw-line substring scan both missed real admits and
+    # counted commented-out ones, so a still-admitted fn could be filtered out
+    # of the round-history diff as if it were finished.
+    _classified = admits.classify_admit_lines(text)
+    admit_lines = sorted(
+        set(_classified["non_axiom_lines"]) | set(_classified["axiom_lines"])
+    )
     out: set[str] = set()
     for ln in admit_lines:
         # Innermost fn containing ln (most-recently-started before ln).
@@ -2813,6 +2882,37 @@ def _complete_verus_gate_okay(round_result: Optional[RoundResult]) -> bool:
     return True
 
 
+def _has_determinate_proof_diagnostic(verus_result: dict) -> bool:
+    """True when a failed check names an exhaustive, scoreable proof owner.
+
+    Ordinary verification failures remain determinate even when Verus also
+    reports a panic/meta wrapper: the source-span obligation is still real.
+    A resource-limit diagnostic is likewise a concrete proof owner, but only
+    when the same check did not time out, panic, or otherwise end with an
+    indeterminate meta failure.  Cargo's generic build wrapper is harmless in
+    both cases; it accompanies every failed package build.
+    """
+    if _verification_error_count(verus_result) > 0:
+        return True
+    counts = _diagnostic_kind_counts(verus_result)
+    indeterminate_kinds = {
+        "timeout", "panic", "meta", "compile", "missing-module",
+    }
+    has_source_spanned_rlimit = any(
+        isinstance(message, dict)
+        and message.get("severity", "error") == "error"
+        and _diagnostic_kind(message) == "resource-limit"
+        and bool(message.get("file"))
+        and isinstance(message.get("line"), int)
+        and message["line"] > 0
+        for message in (verus_result.get("messages", []) or [])
+    )
+    return (
+        has_source_spanned_rlimit
+        and not indeterminate_kinds.intersection(counts)
+    )
+
+
 def _compile_blocked_or_indeterminate(verus_result: dict) -> bool:
     """True when a failed check lacks source-span proof obligations to score.
 
@@ -2832,10 +2932,47 @@ def _compile_blocked_or_indeterminate(verus_result: dict) -> bool:
     counts = _diagnostic_kind_counts(verus_result)
     if counts.get("compile", 0) or counts.get("missing-module", 0):
         return True
-    if _verification_error_count(verus_result) > 0:
+    if _has_determinate_proof_diagnostic(verus_result):
         return False
+    if counts.get("resource-limit", 0):
+        # A spanless rlimit does not identify a scoreable proof owner.
+        return True
     blocker_kinds = {"timeout", "panic", "build-wrapper", "meta"}
-    return bool(blocker_kinds.intersection(counts))
+    return (
+        bool(blocker_kinds.intersection(counts))
+        or not _has_determinate_proof_diagnostic(verus_result)
+    )
+
+
+def _parse_verus_gate_stdout(stdout: str) -> tuple[dict, bool]:
+    """Parse a verifier skill result with one fail-closed malformed shape."""
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {"okay": False, "messages": [], "truncated": True}, True
+    if not isinstance(value, dict):
+        return {"okay": False, "messages": [], "truncated": True}, True
+    return value, False
+
+
+def _verus_gate_result_coherent(verus_result: dict, returncode: int) -> bool:
+    """Whether a checker result and process status form an authoritative gate."""
+    if (
+        not isinstance(verus_result.get("okay"), bool)
+        or returncode not in {0, 1}
+    ):
+        return False
+    okay = verus_result.get("okay") is True
+    if okay != (returncode == 0):
+        return False
+    verified = verus_result.get("verified_count")
+    if (
+        not isinstance(verified, int)
+        or isinstance(verified, bool)
+        or verified < 0
+    ):
+        return False
+    return okay or not _compile_blocked_or_indeterminate(verus_result)
 
 
 def _plateau_metric_indeterminate(
@@ -2847,7 +2984,7 @@ def _plateau_metric_indeterminate(
         and admits_left == 0
         and not verus_result.get("okay", False)
         and (
-            _verification_error_count(verus_result) == 0
+            not _has_determinate_proof_diagnostic(verus_result)
             # Truncated runs DO carry source-span errors, but the count is a
             # lower bound of an aborted sweep — not a plateau measurement.
             or verus_result.get("truncated", False)
@@ -2860,9 +2997,19 @@ def _plateau_progress_metric(
 ) -> tuple[str, int]:
     """Return the metric the plateau guard should minimize this round."""
     if experiment_mode in _WHOLE_CRATE_MODES and admits_left == 0:
+        verification_errors = _verification_error_count(verus_result)
+        if verification_errors == 0:
+            resource_limits = _diagnostic_kind_counts(verus_result).get(
+                "resource-limit", 0,
+            )
+            if resource_limits > 0:
+                return (
+                    "whole-crate resource-limit proof obligations",
+                    resource_limits,
+                )
         return (
             "whole-crate source-span Verus errors",
-            _verification_error_count(verus_result),
+            verification_errors,
         )
     return ("hard admits", admits_left)
 
@@ -3628,7 +3775,7 @@ def _supersede_prior_attempt_receipts(tdir: Path) -> Optional[Path]:
     """
     candidates = [tdir / name for name in _PRIOR_ATTEMPT_RECEIPTS]
     candidates.extend(sorted(tdir.glob("reset_handoff_round_*.json")))
-    present = [p for p in candidates if p.exists()]
+    present = [path for path in candidates if path.exists()]
     if not present:
         return None
     base = tdir / "_superseded_receipts"
@@ -3753,6 +3900,111 @@ def _dominated_bank_disposition(
     }
 
 
+def _prepare_terminal_best_frontier(
+    *, experiment_mode: Optional[str], final_end_reason: str,
+    best_decided_gate: Optional[dict], last_gate: Optional[dict],
+    best_snapshot_round: int, snapshot_targets: list[Path],
+    snapshots_root: Path, project: Path,
+) -> dict:
+    """Restore a strictly better decided snapshot before the terminal gate.
+
+    Loop-local rollback cannot cover every way the round loop can end.  In
+    particular, a wall deadline may expire after a regressed round has already
+    sealed but before the next top-of-loop budget check.  This terminal
+    preparation is therefore deliberately outside the loop and immediately
+    before the fresh acceptance/banking gate.
+
+    Restoration is narrow: whole-crate bankable partials only, and only when
+    the shared registered ordering says the last decided gate REGRESSED from
+    the recorded best.  An incomparable DISPLACED frontier remains subject to
+    the existing fail-closed dominance guard.  Before copying bytes, the live
+    tree must still equal the last gate; afterwards it must equal the best gate
+    exactly.  Any failed precondition is reported to the caller, which rejects
+    the terminal bank without running a misleading fresh gate.
+    """
+    relation = _gate_frontier_relation(best_decided_gate, last_gate)
+    receipt = {
+        "schema_version": 1,
+        "kind": "terminal_best_frontier_restore",
+        "status": "NOT_APPLICABLE",
+        "attempted": False,
+        "okay": True,
+        "relation": relation,
+        "best_snapshot_round": best_snapshot_round,
+        "current_tree_hash": None,
+        "last_gate_tree_hash": (
+            ((last_gate or {}).get("tree_receipt") or {}).get("tree_hash")
+        ),
+        "expected_best_tree_hash": (
+            ((best_decided_gate or {}).get("tree_receipt") or {}).get(
+                "tree_hash"
+            )
+        ),
+    }
+    if (
+        experiment_mode not in _WHOLE_CRATE_MODES
+        or final_end_reason not in set(BANKABLE_END_REASONS)
+        or relation != "REGRESSED"
+    ):
+        return receipt
+
+    receipt["attempted"] = True
+    current_tree = _source_tree_receipt(project)
+    receipt["current_tree_hash"] = current_tree.get("tree_hash")
+    last_tree_hash = receipt["last_gate_tree_hash"]
+    expected_best_tree_hash = receipt["expected_best_tree_hash"]
+    if (
+        expected_best_tree_hash
+        and current_tree.get("tree_hash") == expected_best_tree_hash
+    ):
+        # A loop-local rollback (budget bail, drift revert) may already have
+        # restored the best tree without refreshing last_gate — the honest
+        # already-restored state. Rejecting it as CURRENT_TREE_DOES_NOT_MATCH
+        # _LAST_GATE destroyed valid banks (T315 H4); recognize it instead.
+        receipt.update({
+            "status": "ALREADY_RESTORED",
+            "okay": True,
+        })
+        return receipt
+    if not last_tree_hash or current_tree.get("tree_hash") != last_tree_hash:
+        receipt.update({
+            "status": "FAILED",
+            "okay": False,
+            "failure_reason": "CURRENT_TREE_DOES_NOT_MATCH_LAST_GATE",
+        })
+        return receipt
+    if not expected_best_tree_hash:
+        receipt.update({
+            "status": "FAILED",
+            "okay": False,
+            "failure_reason": "BEST_GATE_LACKS_TREE_HASH",
+        })
+        return receipt
+
+    restore = _restore_snapshot_targets(
+        snapshot_targets, snapshots_root, best_snapshot_round,
+    )
+    restored_tree = _source_tree_receipt(project)
+    receipt["restore"] = restore
+    receipt["restored_tree_receipt"] = restored_tree
+    if not restore.get("okay"):
+        receipt.update({
+            "status": "FAILED",
+            "okay": False,
+            "failure_reason": "SNAPSHOT_RESTORE_FAILED",
+        })
+        return receipt
+    if restored_tree.get("tree_hash") != expected_best_tree_hash:
+        receipt.update({
+            "status": "FAILED",
+            "okay": False,
+            "failure_reason": "RESTORED_TREE_DOES_NOT_MATCH_BEST_GATE",
+        })
+        return receipt
+    receipt["status"] = "RESTORED"
+    return receipt
+
+
 class PremodelWarmIndeterminate(ValueError):
     """Round-0 verifier infrastructure failed before provider contact."""
 
@@ -3761,6 +4013,7 @@ def _premodel_verifier_warm(
     *, tdir: Path, project: Path, gate_commands: list[list[str]],
     env: dict[str, str], lineage_id: Optional[str],
     before_tree_receipt: Optional[dict] = None,
+    hard_admits: Optional[int] = None,
 ) -> dict:
     """Run a round-0 whole-crate gate before any provider process.
 
@@ -3773,9 +4026,9 @@ def _premodel_verifier_warm(
     """
     if not gate_commands or "--whole-crate" not in gate_commands[0]:
         raise ValueError("premodel verifier warm requires a whole-crate gate")
-    before = before_tree_receipt or provenance.source_tree_receipt(project)
+    before = before_tree_receipt or _source_tree_receipt(project)
     rc, stdout, stderr = run_subskill(gate_commands[0], env=env)
-    after = provenance.source_tree_receipt(project)
+    after = _source_tree_receipt(project)
 
     def fail(reason: str, message: str) -> None:
         receipt = {
@@ -3797,9 +4050,8 @@ def _premodel_verifier_warm(
         )
         raise PremodelWarmIndeterminate(message)
 
-    try:
-        result = json.loads(stdout)
-    except json.JSONDecodeError:
+    result, malformed = _parse_verus_gate_stdout(stdout)
+    if malformed:
         fail(
             "MALFORMED_RESULT",
             "premodel verifier warm returned malformed JSON",
@@ -3809,14 +4061,16 @@ def _premodel_verifier_warm(
             "SOURCE_TREE_CHANGED",
             "premodel verifier warm changed the source tree",
         )
-    if _compile_blocked_or_indeterminate(result):
+    if not _verus_gate_result_coherent(result, rc):
         fail(
-            "INDETERMINATE_GATE",
-            "premodel verifier warm did not complete authoritatively",
+            "INCOHERENT_OR_INDETERMINATE_GATE",
+            "premodel verifier warm did not complete authoritatively: "
+            "checker result and return code were incoherent or indeterminate",
         )
     gate_receipt = _gate_receipt(
         tdir, 0, after, gate_commands, result, rc,
         forced_recheck=True, lineage_id=lineage_id,
+        hard_admits=hard_admits,
     )
     gate_receipt["premodel_warm"] = True
     _persist_gate_receipt(gate_receipt)
@@ -4015,7 +4269,7 @@ def _validate_scored_lineage_context(
         raise ValueError("scoreable lineage context carries launch taints")
     if operator_events:
         raise ValueError("operator events permanently taint a scored lineage")
-    current_tree = provenance.source_tree_receipt(project)
+    current_tree = _source_tree_receipt(project)
     if current_tree.get("tree_hash") != context["expected_tree_hash"]:
         raise ValueError(
             "lineage context tree mismatch: expected "
@@ -4099,16 +4353,25 @@ def _gate_receipt(
     tdir: Path, round_num: int, tree_receipt: dict, commands: list[list[str]],
     verus_result: dict, returncode: int, *, cache_hit: bool = False,
     forced_recheck: bool = False, lineage_id: Optional[str] = None,
-    signature: Optional[dict] = None,
+    signature: Optional[dict] = None, hard_admits: Optional[int] = None,
 ) -> dict:
     """Create an unpersisted runner-owned receipt for one exact package gate.
 
     ``signature`` lets callers that already computed the tool signature (the
     round loop derives its cache key from it one statement earlier) skip a
     redundant re-hash of ~400KB of harness tool bytes per gate.
+
+    ``hard_admits`` puts the admit count into EVERY gate vector, not just the
+    fresh terminal one. The frontier ordering treats the key as decisive only
+    when both sides carry it, so a vector that omits it silently disables the
+    admit-dominance rule — which is exactly the in-loop promotion path an
+    admit-stuffed round travels to become the best decided frontier.
     """
     signature = signature or _gate_signature_for_commands(commands)
     key = provenance.receipt_key(str(tree_receipt.get("tree_hash") or ""), signature["signature"])
+    vector = _gate_vector(verus_result)
+    if hard_admits is not None:
+        vector["hard_admits"] = int(hard_admits)
     receipt = {
         "schema_version": 1,
         "receipt_key": key,
@@ -4118,7 +4381,7 @@ def _gate_receipt(
         "gate_commands": commands,
         "returncode": returncode,
         "verus_result": verus_result,
-        "vector": _gate_vector(verus_result),
+        "vector": vector,
         "compile_blocked": _compile_blocked_or_indeterminate(verus_result),
         "diagnostic_inventory": _normalized_diagnostic_inventory(verus_result),
         "cache_hit": cache_hit,
@@ -4146,15 +4409,12 @@ def _fresh_terminal_gate(
     """Run and persist a mandatory fresh exact-tree promotion/banking gate."""
     if experiment_mode not in _WHOLE_CRATE_MODES:
         raise ValueError("BANKED_PARTIAL requires a whole-crate experiment mode")
-    tree = provenance.source_tree_receipt(project)
+    tree = _source_tree_receipt(project)
     commands = _harness_gate_commands(
         target, project, experiment_mode, verus_rlimit, experiment_allow_edit,
     )
     rc, stdout, _ = run_subskill(commands[0], env=env)
-    try:
-        verus_result = json.loads(stdout)
-    except json.JSONDecodeError:
-        verus_result = {"okay": False, "messages": [], "truncated": True}
+    verus_result, _ = _parse_verus_gate_stdout(stdout)
     receipt = _gate_receipt(
         tdir, round_number, tree, commands, verus_result, rc,
         forced_recheck=True, lineage_id=lineage_id,
@@ -6540,7 +6800,6 @@ def run_task(
     admitted_ref: Optional[str] = None,
     truth_ref: str = "main",
     max_task_minutes: float = 45.0,
-    budget_is_auto: bool = False,
     agent_max_turns: Optional[int] = _DEFAULT_AGENT_MAX_TURNS,
     skip_failure_memory: bool = False,
     verus_rlimit: Optional[float] = _DEFAULT_VERUS_RLIMIT,
@@ -6592,8 +6851,11 @@ def run_task(
     tdir = task_dir(results_root, run_id, target_id)
     superseded = _supersede_prior_attempt_receipts(tdir)
     if superseded:
-        print(f"[run] prior-attempt immutable receipts superseded into "
-              f"{superseded}", flush=True)
+        print(
+            "[run] prior-attempt immutable receipts superseded into "
+            f"{superseded}",
+            flush=True,
+        )
     if lineage_context:
         provenance.write_immutable_json(
             tdir / "lineage_context.json", lineage_context,
@@ -6613,44 +6875,30 @@ def run_task(
         os.environ.get("DALEK_EXPERIMENT_PROVENANCE", "").strip() or None
     )
     final_gate_allowance_seconds = _final_gate_allowance_seconds(experiment_mode)
+    agent_budget_seconds = _agent_budget_seconds(max_task_minutes * 60, experiment_mode)
     canonical_gate_commands = _harness_gate_commands(
         target, project, experiment_mode, verus_rlimit, experiment_allow_edit,
     )
     round_gate_allowance_seconds = _round_gate_allowance_seconds(
         canonical_gate_commands,
     )
-    max_task_minutes, agent_budget_seconds, budget_raised, budget_error = (
-        _resolve_launch_budget(
-            max_task_minutes, experiment_mode,
-            round_gate_allowance_seconds, budget_is_auto,
-        )
+    minimum_launch_budget = (
+        round_gate_allowance_seconds + _MIN_PRODUCTIVE_ROUND_SEC
     )
-    if budget_raised:
-        print(
-            f"[run] auto budget could not fund one provider round plus its "
-            f"authoritative gate; raised to {max_task_minutes:.1f} min "
-            f"(round gate allowance={round_gate_allowance_seconds:.0f}s, "
-            f"terminal reserve={final_gate_allowance_seconds:.0f}s)",
-            flush=True,
+    if agent_budget_seconds < minimum_launch_budget:
+        msg = (
+            "task budget cannot fund one provider round plus its authoritative "
+            f"gate: pre-terminal budget={agent_budget_seconds:.0f}s, "
+            f"provider floor={_MIN_PRODUCTIVE_ROUND_SEC:.0f}s, "
+            f"round gate allowance={round_gate_allowance_seconds:.0f}s, "
+            f"terminal reserve={final_gate_allowance_seconds:.0f}s"
         )
-    if budget_error:
-        msg = budget_error
         print(f"[error] {msg}", file=sys.stderr)
-        task_result = TaskResult(
-            task_id=target_id,
-            run_id=run_id,
-            target_path=str(target),
-            module_path=module,
-            success=False,
-            end_reason="ERROR",
-            rounds_used=0,
-            duration_seconds=0.0,
-            agent_backend=backend,
-            error_message=msg,
+        return _persisted_abort(
+            tdir, task_id=target_id, run_id=run_id, target=target,
+            module=module, backend=backend, end_reason="ERROR", message=msg,
             experiment_provenance=experiment_provenance,
         )
-        write_json(tdir / "result.json", task_result)
-        return task_result
 
     omitted_active_admits = _active_edit_omitted_admit_files(
         target, experiment_allow_edit, experiment_active_edit)
@@ -6665,21 +6913,11 @@ def run_task(
             "before narrowing the active edit scope."
         )
         print(f"[error] {msg}", file=sys.stderr)
-        task_result = TaskResult(
-            task_id=target_id,
-            run_id=run_id,
-            target_path=str(target),
-            module_path=module,
-            success=False,
-            end_reason="ERROR",
-            rounds_used=0,
-            duration_seconds=0.0,
-            agent_backend=backend,
-            error_message=msg,
+        return _persisted_abort(
+            tdir, task_id=target_id, run_id=run_id, target=target,
+            module=module, backend=backend, end_reason="ERROR", message=msg,
             experiment_provenance=experiment_provenance,
         )
-        write_json(tdir / "result.json", task_result)
-        return task_result
 
     # Scratch cwd for the agent subprocess, built once and reused for every
     # round of this task (stable cwd → stable session-project slug for
@@ -6743,10 +6981,8 @@ def run_task(
     # it, so the spec gate is the only thing freezing its contracts. After the
     # strip, an editable file's surviving fn headers ARE the frozen contracts
     # (deleted lemmas are gone; re-added ones are tolerated as additions).
-    # Keep the authority baseline distinct from the agent-facing convenience
-    # copy. The proof agent can write anywhere under results, so filesystem
-    # permissions are not an authority boundary; the runner binds the authority
-    # bytes in memory and checks them immediately after every agent turn.
+    # The proof agent can write below results/. Keep its convenience copy
+    # separate from the runner's authority bytes and bind the latter in memory.
     spec_snapshot = tdir / "spec_snapshot.authority.json"
     agent_spec_snapshot = tdir / "spec_snapshot.json"
     # Agent-facing spec_check invocations should still pass --against explicitly,
@@ -6763,12 +6999,10 @@ def run_task(
         snap_cmd += ["--siblings"] + _snap_extra
     rc, _, _ = run_subskill(snap_cmd, env=env)
     if rc != 0:
-        return TaskResult(
-            task_id=target_id, run_id=run_id, target_path=str(target),
-            module_path=module, success=False, end_reason="ERROR",
-            rounds_used=0, duration_seconds=0.0,
-            agent_backend=backend,
-            error_message="spec_check snapshot failed",
+        return _persisted_abort(
+            tdir, task_id=target_id, run_id=run_id, target=target,
+            module=module, backend=backend, end_reason="ERROR",
+            message="spec_check snapshot failed",
             experiment_provenance=experiment_provenance,
         )
     spec_snapshot_bytes = spec_snapshot.read_bytes()
@@ -6781,7 +7015,7 @@ def run_task(
     # Bind prompt memory and every later gate to the exact baseline tree and
     # canonical runner argv. Older records remain useful as archival hints, but
     # must not masquerade as evidence for this candidate/configuration.
-    baseline_tree_receipt = provenance.source_tree_receipt(project)
+    baseline_tree_receipt = _source_tree_receipt(project)
     canonical_gate_signature = _gate_signature_for_commands(canonical_gate_commands)
 
     # Continuation legs previously spent their first provider transaction
@@ -6798,6 +7032,7 @@ def run_task(
                 gate_commands=canonical_gate_commands, env=env,
                 lineage_id=lineage_id,
                 before_tree_receipt=baseline_tree_receipt,
+                hard_admits=_count_gate_admits(target, experiment_allow_edit),
             )
         except PremodelWarmIndeterminate as exc:
             # This boundary is before any provider process. Persist a result so
@@ -6805,23 +7040,15 @@ def run_task(
             # backoff instead of converting a bare exception into a permanent
             # no-result stop. The failed warm remains non-authoritative and
             # contributes no gate/frontier authority.
-            task_result = TaskResult(
-                task_id=target_id,
-                run_id=run_id,
-                target_path=str(target),
-                module_path=module,
-                success=False,
+            return _persisted_abort(
+                tdir, task_id=target_id, run_id=run_id, target=target,
+                module=module, backend=backend,
                 end_reason="PREMODEL_GATE_INDETERMINATE",
-                rounds_used=0,
-                duration_seconds=0.0,
-                agent_backend=backend,
-                error_message=str(exc),
+                message=str(exc),
                 experiment_provenance=experiment_provenance,
-                final_tree_receipt=provenance.source_tree_receipt(project),
+                final_tree_receipt=_source_tree_receipt(project),
                 lineage_context=lineage_context,
             )
-            write_json(tdir / "result.json", task_result)
-            return task_result
         print(
             f"[run] exact-seeded premodel whole-crate gate: "
             f"{premodel_gate_receipt['receipt_key'][:12]}", flush=True,
@@ -7107,17 +7334,13 @@ def run_task(
                 f"unreachable objects are a source-recovery oracle ({detail})"
             )
             print(f"[run] GIT_RECOVERY: {msg}", flush=True)
-            task_result = TaskResult(
-                task_id=target_id, run_id=run_id, target_path=str(target),
-                module_path=module, success=False, end_reason="GIT_RECOVERY",
-                rounds_used=0,
+            return _persisted_abort(
+                tdir, task_id=target_id, run_id=run_id, target=target,
+                module=module, backend=backend, end_reason="GIT_RECOVERY",
+                message=msg,
                 duration_seconds=(datetime.now() - start).total_seconds(),
-                agent_backend=backend,
-                error_message=msg,
                 experiment_provenance=experiment_provenance,
             )
-            write_json(tdir / "result.json", task_result)
-            return task_result
 
     # Forbidden-construct integrity gate. `assume(...)`,
     # `#[verifier::external_body]`, and `#[verifier::rlimit(N)]` are forbidden
@@ -7161,33 +7384,15 @@ def run_task(
     # an undetected fake-green vector otherwise: the
     # same cheat class the spec- and axiom-integrity gates exist to stop. (A
     # verus_check.py edit actually happened mid-run on this branch — that one
-    # was a correct fix, but the hole is real.) Snapshot a content hash of
-    # every tooling file under skills/ + lib/ at run start and diff after each
-    # round; any add / edit / delete fails the round like SPEC_DRIFT. Note
+    # was a correct fix, but the hole is real.) Snapshot the full executable
+    # harness surface at run start and diff after each round; any add / edit /
+    # delete fails the round like SPEC_DRIFT. Note
     # tool-scoping (AGENT_TOOL_FLAGS) can't close this on its own: Bash is a
     # write primitive and `--allowedTools` is a no-op under bypassPermissions.
     def _tooling_digest() -> dict[str, str]:
         digest: dict[str, str] = {}
-        top_level = [
-            *HERE.glob("*.py"), *HERE.glob("*.sh"),
-            *HERE.glob("prompt*.md"), HERE / "skills/SKILL.md",
-        ]
-        files = [
-            *top_level,
-            *HERE.glob("skills/**/*.py"),
-            *HERE.glob("skills/**/*.sh"),
-            *HERE.glob("skills/**/*.json"),
-            *HERE.glob("lib/**/*.py"),
-            *HERE.glob("lib/**/*.sh"),
-            *HERE.glob("lib/**/*.json"),
-            *HERE.glob("docker/**/*.py"),
-            *HERE.glob("docker/**/*.sh"),
-            *HERE.glob("docker/**/*.json"),
-            *HERE.glob("scripts/**/*.py"),
-            *HERE.glob("scripts/**/*.sh"),
-            *HERE.glob("scripts/**/*.json"),
-        ]
-        for f in files:
+        files = _tooling_files()
+        for f in sorted(files):
             if "__pycache__" in f.parts:
                 continue
             rel = str(f.relative_to(HERE))
@@ -7208,38 +7413,81 @@ def run_task(
             if baseline_tooling.get(k) != current.get(k)
         )
 
-    # Frozen-file guard: in every run mode the agent may edit ONLY the declared
-    # scope. Ordinary runs allow target + discovered siblings; experiments use
-    # the active-edit subset when present, otherwise their full allow-edit set.
-    # Every other tracked or untracked path must stay byte-identical to HEAD.
-    # Whole-crate modes rely on frozen consumers for semantic pinning, while
-    # module-mode runs need the same ownership boundary to prevent an unrelated
-    # implementation edit from making a focused verifier green.
+    # Frozen-file guard (bridge-specs rung): the agent may edit ONLY the
+    # allow-edit set; every other tracked file must stay byte-identical to
+    # clean main. This is what makes the rung sound — the reconstructed map is
+    # PINNED by frozen consumers (montgomery::to_edwards's proof, decompress's
+    # contract, the curve lemmas), so the agent must not be able to weaken them
+    # to fit a convenient definition. We diff the worktree against HEAD (the
+    # committed clean main) and subtract the allow-edit files.
     try:
         _rc, _gr, _ = run_subskill(
             ["git", "-C", str(project), "rev-parse", "--show-toplevel"], env=env)
         _gitroot = Path(_gr.strip()) if _rc == 0 and _gr.strip() else project
     except Exception:
         _gitroot = project
-    allow_edit_rel: set[str] = set()
     guard_edit_scope = _declared_edit_scope(
-        target, siblings, experiment_allow_edit, experiment_active_edit,
-    )
+        target, siblings, experiment_allow_edit, experiment_active_edit)
+    allow_edit_rel: set[str] = set()
     for _p in guard_edit_scope:
         try:
             allow_edit_rel.add(str(_p.resolve().relative_to(_gitroot)))
         except ValueError:
             pass
 
-    frozen_check_error: Optional[str] = None
+    receipt_root = Path(baseline_tree_receipt["workspace_root"]).resolve()
+    tracked_receipt_paths, tracked_receipt_error = (
+        _tracked_receipt_paths_from_git(_gitroot, receipt_root, env=env)
+    )
+    allow_edit_receipt_rel: set[str] = set()
+    for _p in guard_edit_scope:
+        try:
+            allow_edit_receipt_rel.add(
+                _p.resolve().relative_to(receipt_root).as_posix())
+        except ValueError:
+            pass
 
-    def _frozen_files_changed() -> list[str]:
-        """Tracked files (vs HEAD = clean main) the agent changed OUTSIDE the
-        allow-edit set. Empty = only the permitted file(s) moved."""
+    frozen_check_error: Optional[str] = tracked_receipt_error
+
+    def _frozen_files_changed(
+        current_receipt: Optional[dict] = None,
+        *,
+        include_git_head: bool = True,
+    ) -> list[str]:
+        """Compiler inputs the agent changed outside the allow-edit set.
+
+        Git remains defense in depth for index/rename state. The source
+        receipt is the byte authority and cannot be blinded by index flags.
+        Returned paths are git-root-relative for the existing recovery path.
+        """
         nonlocal frozen_check_error
-        changed, frozen_check_error = _frozen_paths_changed_from_git(
-            project, allow_edit_rel, env=env)
-        return changed
+        if tracked_receipt_error:
+            frozen_check_error = tracked_receipt_error
+            return []
+        git_changed: list[str] = []
+        if include_git_head:
+            git_changed, frozen_check_error = _frozen_paths_changed_from_git(
+                project, allow_edit_rel, env=env)
+            if frozen_check_error:
+                return []
+        else:
+            # Ordinary worktrees may start dirty. Their authority is the
+            # baseline receipt captured at run start, not repository HEAD.
+            frozen_check_error = None
+        current_receipt = current_receipt or _source_tree_receipt(project)
+        receipt_changed = _frozen_paths_changed_from_receipts(
+            baseline_tree_receipt, current_receipt, allow_edit_receipt_rel,
+            tracked_receipt_paths)
+        translated: list[str] = []
+        for path in receipt_changed:
+            try:
+                translated.append(
+                    (receipt_root / path).relative_to(_gitroot.resolve()).as_posix())
+            except ValueError:
+                frozen_check_error = (
+                    f"receipted frozen path is outside git root: {path}")
+                return []
+        return sorted(set(git_changed) | set(translated))
 
     def _revert_frozen_files(paths: list[str]) -> bool:
         """Best-effort restore of frozen files (gitroot-relative) to baseline.
@@ -7580,26 +7828,28 @@ def run_task(
                   "or removed by the agent; failing closed.", flush=True)
             end_reason = "SPEC_DRIFT"
             break
-        if experiment_mode not in _WHOLE_CRATE_MODES:
-            untracked_paths, untracked_error = _untracked_paths_changed_from_git(
-                project, env=env,
+        receipt_recovered_frozen: list[str] = []
+        try:
+            current_tree_receipt = _source_tree_receipt(project)
+        except SourceReceiptInvalid as exc:
+            # A frozen Cargo manifest can become temporarily unparsable (or
+            # point outside the workspace) while the agent is editing. Receipt
+            # authority fires before the ordinary recoverable FROZEN_EDIT
+            # branch, so restore the declaring FROZEN path first and recompute.
+            # Editable declarations and unlocated symlink defects remain
+            # terminal: there is no authorized baseline path to restore.
+            source_rel = _recoverable_receipt_source_path(
+                exc, _gitroot, allow_edit_rel, experiment_mode)
+            if (source_rel is None
+                    or not _revert_frozen_files([source_rel])):
+                raise
+            current_tree_receipt = _source_tree_receipt(project)
+            receipt_recovered_frozen = [source_rel]
+            print(
+                "[run] FROZEN_EDIT: source receipt rejected a frozen "
+                f"declaration in {source_rel}; restored it before gating.",
+                flush=True,
             )
-            if untracked_error or untracked_paths:
-                print("[run] FROZEN_EDIT: untracked source authority is not "
-                      f"permitted ({untracked_error or untracked_paths[:5]}); "
-                      "failing closed.", flush=True)
-                end_reason = "FROZEN_EDIT"
-                break
-        current_tree_receipt = provenance.source_tree_receipt(project)
-        literal_input_drift = _literal_compiler_input_drift(
-            baseline_tree_receipt, current_tree_receipt,
-        )
-        if literal_input_drift:
-            print("[run] FROZEN_EDIT: compiler-visible input below an ignored "
-                  f"directory changed or appeared ({literal_input_drift[:5]}); "
-                  "failing closed.", flush=True)
-            end_reason = "FROZEN_EDIT"
-            break
 
         # Deterministic rate-limit halt. A 429 means the API rejected the
         # request outright (5-hour session limit, quota exhausted, overage
@@ -7807,10 +8057,7 @@ def run_task(
                       f"tree={current_tree_receipt['tree_hash'][:12]}", flush=True)
             else:
                 rc_verus, verus_stdout, _ = run_subskill(verus_cmd, env=env)
-                try:
-                    verus_result = json.loads(verus_stdout)
-                except json.JSONDecodeError:
-                    verus_result = {"okay": False, "messages": []}
+                verus_result, _ = _parse_verus_gate_stdout(verus_stdout)
             plateau_verus_result = {
                 **verus_result,
                 "messages": list(verus_result.get("messages", []) or []),
@@ -7848,6 +8095,8 @@ def run_task(
                     tdir, round_num, current_tree_receipt, gate_commands,
                     verus_result, rc_verus, forced_recheck=force_gate_recheck,
                     lineage_id=lineage_id, signature=current_signature,
+                    hard_admits=_count_gate_admits(
+                        target, experiment_allow_edit),
                 )
                 _persist_gate_receipt(gate_receipt)
                 gate_cache[gate_key] = dict(gate_receipt)
@@ -8205,9 +8454,13 @@ def run_task(
                 metric=plateau_metric_name,
                 metric_best=plateau_best_value,
             ))
+            # Any whole-crate metric (verification errors OR the rlimit
+            # phase) means hard admits are already 0 — passing the metric
+            # value as an admit count made the directive chase an empty
+            # admit inventory in the rlimit endgame (T315 M3).
             directive_best_admits = (
-                0 if plateau_metric_name == "whole-crate source-span Verus errors"
-                else plateau_best_value
+                plateau_best_value if plateau_metric_name == "hard admits"
+                else 0
             )
             plateau_directive = _plateau_directive_text(
                 rounds_since_new_low, directive_best_admits, experiment_mode)
@@ -8287,7 +8540,7 @@ def run_task(
                 end_reason = "GIT_RECOVERY"
                 break
 
-            restored_tree_receipt = provenance.source_tree_receipt(project)
+            restored_tree_receipt = _source_tree_receipt(project)
             if (
                 restored_tree_receipt.get("tree_hash")
                 != previous_tree_receipt.get("tree_hash")
@@ -8411,7 +8664,7 @@ def run_task(
             # Taint this round: Verus was skipped on the drifted state, and the
             # restored state has not yet been verified. COMPLETE requires a later
             # clean round after the restore.
-            restored_tree_receipt = provenance.source_tree_receipt(project)
+            restored_tree_receipt = _source_tree_receipt(project)
             candidate_transaction = _rejected_recovered_transaction(
                 candidate_transaction,
                 "SPEC_DRIFT_RECOVERED",
@@ -8445,8 +8698,10 @@ def run_task(
                 _spec_drift_continue_msg(spec_drift, restored_files))
         else:
             spec_drift_recovery_counts.clear()
-        frozen_changed = _frozen_files_changed()
-        if frozen_check_error or frozen_changed:
+        if experiment_mode in _WHOLE_CRATE_MODES:
+            frozen_changed = sorted(set(
+                _frozen_files_changed(current_tree_receipt)
+            ) | set(receipt_recovered_frozen))
             if frozen_check_error:
                 print(f"[run] FROZEN_EDIT: frozen-file audit failed "
                       f"({frozen_check_error}) — cannot prove frozen files "
@@ -8507,7 +8762,7 @@ def run_task(
                 # True would promote to a COMPLETE the post-revert state never
                 # earned. Mark it not-okay so COMPLETE requires a clean,
                 # re-verified post-revert round (P1).
-                restored_tree_receipt = provenance.source_tree_receipt(project)
+                restored_tree_receipt = _source_tree_receipt(project)
                 candidate_transaction = _rejected_recovered_transaction(
                     candidate_transaction,
                     "FROZEN_EDIT_RECOVERED",
@@ -8526,6 +8781,25 @@ def run_task(
                 rr.end_reason = "FROZEN_EDIT_RECOVERED"
                 recovery_continue_messages.append(
                     _frozen_edit_continue_msg(frozen_changed))
+        else:
+            # Ordinary worktrees may contain user-owned edits that predate the
+            # run. Detect out-of-scope drift, but never restore those files to
+            # HEAD: only isolated peeled whole-crate worktrees have that safe
+            # recovery invariant.
+            frozen_changed = _frozen_files_changed(
+                current_tree_receipt, include_git_head=False)
+            if frozen_check_error:
+                print(f"[run] FROZEN_EDIT: frozen-file audit failed "
+                      f"({frozen_check_error}) — cannot prove task scope. "
+                      "Failing task without modifying frozen files.", flush=True)
+                end_reason = "FROZEN_EDIT"
+                break
+            if frozen_changed:
+                print(f"[run] FROZEN_EDIT: ordinary target run modified "
+                      f"out-of-scope file(s) {frozen_changed}; failing task "
+                      "without restoring user-owned files.", flush=True)
+                end_reason = "FROZEN_EDIT"
+                break
         new_axioms = _axiom_names() - baseline_axioms
         if new_axioms:
             # Hard fail: agent introduced a new `proof fn axiom_*`. Admits
@@ -8702,20 +8976,12 @@ def run_task(
     if not final_spec_baseline_intact and (end_reason or "").upper() not in (
             "PROCESS_CROSSTALK", "AXIOM_DRIFT", "TOOLING_DRIFT"):
         end_reason = "SPEC_DRIFT"
-    try:
-        final_literal_input_drift = _literal_compiler_input_drift(
-            baseline_tree_receipt, provenance.source_tree_receipt(project),
-        )
-    except (OSError, ValueError):
-        final_literal_input_drift = ["<compiler-input-audit-error>"]
-    if final_literal_input_drift and (end_reason or "").upper() not in (
-            "SPEC_DRIFT", "PROCESS_CROSSTALK", "AXIOM_DRIFT", "TOOLING_DRIFT"):
-        end_reason = "FROZEN_EDIT"
 
     # Frozen-file integrity (bridge-specs rung): any edit outside the bridge
     # module weakens a pinning consumer — fold into end_reason so a budget-bail
     # exit can't be promoted to COMPLETE off a tampered frozen file.
-    final_frozen_changed = _frozen_files_changed()
+    final_frozen_changed = _frozen_files_changed(
+        include_git_head=experiment_mode in _WHOLE_CRATE_MODES)
     final_frozen_check_error = frozen_check_error
     if final_frozen_check_error and (end_reason or "").upper() not in (
             "SPEC_DRIFT", "PROCESS_CROSSTALK", "AXIOM_DRIFT", "TOOLING_DRIFT"):
@@ -8761,7 +9027,6 @@ def run_task(
     done_for_real = (
         last_round_okay and admits_remaining == 0
         and final_spec_baseline_intact
-        and not final_literal_input_drift
         and not final_new_axioms and not final_changed_tooling
         and not final_frozen_changed and not final_frozen_check_error
         and not final_forbidden
@@ -8776,7 +9041,40 @@ def run_task(
 
     success = final_end_reason == "COMPLETE"
     integrity_rejections = set(INTEGRITY_REJECTION_END_REASONS)
-    pre_disposition_tree = provenance.source_tree_receipt(project)
+    terminal_frontier_restore = _prepare_terminal_best_frontier(
+        experiment_mode=experiment_mode,
+        final_end_reason=final_end_reason,
+        best_decided_gate=best_decided_gate_receipt,
+        last_gate=last_gate_receipt,
+        best_snapshot_round=best_decided_snapshot_round,
+        snapshot_targets=snapshot_targets,
+        snapshots_root=snapshots_root,
+        project=project,
+    )
+    terminal_frontier_restore_failed = bool(
+        terminal_frontier_restore.get("attempted")
+        and not terminal_frontier_restore.get("okay")
+    )
+    if terminal_frontier_restore.get("status") in {
+        "RESTORED", "ALREADY_RESTORED",
+    }:
+        # The live source now exactly matches this authoritative in-loop gate.
+        # Keep the terminal receipt's last-gate field aligned with those bytes;
+        # the displaced last round remains preserved in round_N.json and in the
+        # terminal restore receipt's pre-restore hashes.
+        # ALREADY_RESTORED ends in the IDENTICAL physical state (a loop-local
+        # rollback got there first), so it must realign too — otherwise the
+        # promotion receipt pairs a best-tree final_tree_receipt with a
+        # regressed last_gate_receipt, and with banking off that stale receipt
+        # becomes the run's reported final gate.
+        last_gate_receipt = dict(best_decided_gate_receipt or {})
+        print(
+            "[run] terminal frontier restored before fresh gate: "
+            f"round={best_decided_snapshot_round} "
+            f"tree={terminal_frontier_restore['expected_best_tree_hash']}",
+            flush=True,
+        )
+    pre_disposition_tree = _source_tree_receipt(project)
     banking_gate_receipt: dict = {}
     acceptance_gate_receipt: dict = {}
     if success and lineage_context:
@@ -8796,6 +9094,7 @@ def run_task(
     banking_attempted = bool(
         bank_partial
         and final_end_reason in bankable_end_reasons
+        and not terminal_frontier_restore_failed
         and not final_new_axioms
         and not final_changed_tooling
         and not final_frozen_changed
@@ -8826,7 +9125,7 @@ def run_task(
     if final_end_reason in integrity_rejections:
         restore = _restore_snapshot_targets(
             snapshot_targets, snapshots_root, last_integrity_clean_snapshot_round)
-        post_disposition_tree = provenance.source_tree_receipt(project)
+        post_disposition_tree = _source_tree_receipt(project)
         terminal_disposition = {
             "state": "REJECTED_DRIFTED",
             "reason": final_end_reason,
@@ -8842,6 +9141,23 @@ def run_task(
         print(f"[run] terminal integrity disposition={terminal_disposition['state']} "
               f"restore_round={last_integrity_clean_snapshot_round} "
               f"okay={restore['okay']}", flush=True)
+    elif terminal_frontier_restore_failed:
+        post_disposition_tree = pre_disposition_tree
+        terminal_disposition = {
+            "state": "TERMINAL_FRONTIER_RESTORE_FAILED",
+            "reason": final_end_reason,
+            "restore": terminal_frontier_restore,
+            "reusable": False,
+            "scoreable": False,
+        }
+        promotion_decision = "REJECTED"
+        promotion_scoreable = False
+        success = False
+        print(
+            "[run] terminal best-frontier restore failed closed: "
+            f"reason={terminal_frontier_restore.get('failure_reason')}",
+            flush=True,
+        )
     elif dominated_bank is not None:
         post_disposition_tree = pre_disposition_tree
         terminal_disposition = dominated_bank
@@ -8898,9 +9214,11 @@ def run_task(
         "acceptance_gate_receipt": _portable_gate_receipt(
             acceptance_gate_receipt,
         ),
+        "terminal_frontier_restore": terminal_frontier_restore,
         "terminal_disposition": terminal_disposition,
         "integrity": {
             "spec_drift_count": len(round_results[-1].spec_drift) if round_results else 0,
+            "spec_baseline_intact": final_spec_baseline_intact,
             "new_axioms": sorted(final_new_axioms),
             "tooling_changes": final_changed_tooling,
             "frozen_changes": final_frozen_changed,
@@ -9073,6 +9391,54 @@ def _print_summary(result: TaskResult) -> None:
 
 # ----------------- CLI -----------------
 
+def _abort_source_receipt_invalid(
+    results_root: Path, run_id: str, target: Path, backend: str,
+    exc: Exception,
+) -> TaskResult:
+    """Persist SOURCE_RECEIPT_INVALID and return the recorded TaskResult.
+
+    A tree the harness cannot bind is fail-CLOSED, but it must fail as a
+    RECORDED terminal: the durable supervisor classifies from result.json, and
+    an unhandled traceback leaves it with a dead process and no verdict. Both
+    receipt-computing phases of main() route here so neither can regress into
+    a bare crash.
+    """
+    print(f"[run] SOURCE_RECEIPT_INVALID: {exc}", file=sys.stderr)
+    # task_dir takes the target ID, not the target path: passing the Path
+    # builds results/<run>/<absolute-target-path> and collides with the file
+    # itself. Caught by the handler's own regression test.
+    target_id = results.target_id_from_path(target)
+    tdir = task_dir(results_root, run_id, target_id)
+    return _persisted_abort(
+        tdir, task_id=target_id, run_id=run_id,
+        target=target, module=str(target), backend=backend,
+        end_reason="SOURCE_RECEIPT_INVALID", message=str(exc),
+    )
+
+
+def run_task_persisting(
+    *, results_root: Path, run_id: str, target: Path,
+    backend: str = "claude", **kwargs,
+) -> TaskResult:
+    """`run_task` with an unbindable source tree converted to a RECORDED terminal.
+
+    A1's persistence guarantee holds for the documented production entry
+    points because both `main()` and `run_layer.py` are pinned to this wrapper.
+    The latter used to call `run_task` directly, so a handler placed only in
+    `main()` left layer-set runs without a per-target verdict. Raw `run_task`
+    remains callable for internal and test use and bypasses this wrapper;
+    production callers must use this boundary. Callers that want a process
+    exit code map it from the returned result.
+    """
+    try:
+        return run_task(
+            results_root=results_root, run_id=run_id, target=target,
+            backend=backend, **kwargs,
+        )
+    except SourceReceiptInvalid as exc:
+        return _abort_source_receipt_invalid(
+            results_root, run_id, target, backend, exc)
+
 def main() -> int:
     _install_signal_handler()
     ap = argparse.ArgumentParser()
@@ -9093,7 +9459,7 @@ def main() -> int:
                          "Default: the selected CLI's configured default.")
     ap.add_argument("--vstd-root", type=Path, default=None,
                     help="Path to Verus's vstd source to index alongside the "
-                         "project. Example: /path/to/verus/vstd")
+                         "project. Example: /path/to/verus/source/vstd")
     ap.add_argument("--admitted-ref", default=None,
                     help="Git ref of the admitted baseline (e.g. "
                          "eval/admitted-layerA-debug). Enables diff.md generation.")
@@ -9297,6 +9663,13 @@ def main() -> int:
         print(f"[error] target not found: {target}", file=sys.stderr)
         return 1
     project = (args.project or find_cargo_root(target)).resolve()
+    # run_id/results_root are established BEFORE any work that can compute a
+    # source receipt: scored-lineage validation hashes the tree, and an
+    # unbindable tree there must still be persisted as a labelled terminal
+    # rather than crash with nowhere to write the verdict.
+    run_id = args.run_id or results.run_id_new()
+    results_root = args.results.resolve()
+    results_root.mkdir(parents=True, exist_ok=True)
     lineage_context: dict = {}
     lineage_frontier_sidecar: Optional[Path] = None
     if args.lineage_context is not None:
@@ -9314,6 +9687,10 @@ def main() -> int:
                 lineage_frontier_sidecar = (
                     context_path.parent / frontier["sidecar_name"]
                 )
+        except SourceReceiptInvalid as exc:
+            _abort_source_receipt_invalid(
+                results_root, run_id, target, args.backend, exc)
+            return 1
         except ValueError as exc:
             print(f"[error] scored lineage validation failed: {exc}", file=sys.stderr)
             return 2
@@ -9323,9 +9700,6 @@ def main() -> int:
     elif args.bank_partial:
         print("[error] --bank-partial requires --lineage-context", file=sys.stderr)
         return 2
-    run_id = args.run_id or results.run_id_new()
-    results_root = args.results.resolve()
-    results_root.mkdir(parents=True, exist_ok=True)
 
     # Budget: explicit override, or auto-scale by admit count.
     if args.max_task_minutes is not None:
@@ -9368,7 +9742,7 @@ def main() -> int:
     print(f"[run] budget   = {max_minutes:.1f} min  ({budget_source})")
     print(f"[run] pid      = {os.getpid()}  (Ctrl-C or kill -TERM {os.getpid()} to stop)")
 
-    result = run_task(
+    result = run_task_persisting(
         target=target, project=project,
         run_id=run_id, results_root=results_root,
         max_rounds=args.rounds,
@@ -9379,7 +9753,6 @@ def main() -> int:
         admitted_ref=args.admitted_ref,
         truth_ref=args.truth_ref,
         max_task_minutes=max_minutes,
-        budget_is_auto=(args.max_task_minutes is None),
         skip_failure_memory=args.no_failure_memory,
         verus_rlimit=args.verus_rlimit,
         auto_reset=args.auto_reset,
@@ -9401,6 +9774,8 @@ def main() -> int:
         lineage_frontier_sidecar=lineage_frontier_sidecar,
         bank_partial=args.bank_partial,
     )
+    if result.end_reason == "SOURCE_RECEIPT_INVALID":
+        return 1
     # Distinct exit code 42 on a 429 halt so a batch launcher (launch.sh) can
     # tell "this target failed" (rc 1) from "the quota window is exhausted,
     # stop the whole sweep" (rc 42) — every later target would just be

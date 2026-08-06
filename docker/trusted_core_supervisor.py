@@ -17,7 +17,6 @@ import os
 import random
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +25,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 from lib import provenance, taxonomy  # noqa: E402
+from lib.durable import atomic_write_text  # noqa: E402
 
 # Routing sets come from the single shared taxonomy (lib/taxonomy.py) — the
 # hand-copied versions of these two sets drifted from the runner's emitted
@@ -57,25 +57,8 @@ def _sha256(path: Path) -> str:
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as target:
-            target.write(payload)
-            target.flush()
-            os.fsync(target.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+    atomic_write_text(path, payload, new_mode=0o600)
 
 
 def _utc_now() -> str:
@@ -132,19 +115,6 @@ def _validate_package(path: Path) -> dict[str, Any]:
 def _find_reset_epoch(paths: list[Path]) -> int | None:
     candidates: list[int] = []
 
-    def visit(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key in {"resetsAt", "reset_at", "resetEpoch", "reset_epoch"}:
-                    try:
-                        candidates.append(int(child))
-                    except (TypeError, ValueError):
-                        pass
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
-
     for path in paths:
         try:
             with path.open(encoding="utf-8") as source:
@@ -153,14 +123,21 @@ def _find_reset_epoch(paths: list[Path]) -> int | None:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    # Assistant/user envelopes contain model-owned tool input
-                    # and tool results. They are not provider reset authority:
-                    # recursively accepting a `reset_epoch` key there lets the
-                    # proof agent choose the supervisor's next wake time.
-                    if not isinstance(event, dict) or event.get("type") not in {
-                        "assistant", "user",
-                    }:
-                        visit(event)
+                    # Only the provider-owned rate-limit event schema is reset
+                    # authority. Model tool input is mirrored in assistant and
+                    # result envelopes, so recursively scanning arbitrary JSON
+                    # would let the proof agent choose the supervisor wake time.
+                    if not isinstance(event, dict) or event.get("type") != (
+                        "rate_limit_event"
+                    ):
+                        continue
+                    info = event.get("rate_limit_info")
+                    if not isinstance(info, dict):
+                        continue
+                    try:
+                        candidates.append(int(info["resetsAt"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
         except OSError:
             continue
     return max(candidates) if candidates else None
@@ -197,7 +174,11 @@ def _registered_budget(package: dict[str, Any]) -> tuple[float, float]:
     if registration_path.resolve() not in immutable:
         raise SupervisorError("launch registration is not an immutable package input")
     registration = _json(registration_path)
-    budget = registration.get("budget") or {}
+    if not isinstance(registration, dict):
+        raise SupervisorError("launch registration is malformed")
+    budget = registration.get("budget")
+    if not isinstance(budget, dict):
+        raise SupervisorError("launch registration budget is malformed")
     max_cost = _finite_nonnegative(
         budget.get("max_cost_usd"), "registered maximum cost",
     )
@@ -209,13 +190,27 @@ def _registered_budget(package: dict[str, Any]) -> tuple[float, float]:
     return max_cost, max_wall
 
 
-def _usage_debit(audit: dict[str, Any]) -> tuple[float, float]:
+def _usage_debit(
+    audit: dict[str, Any], *, allow_not_run: bool = False,
+) -> tuple[float, float]:
     """Return the conservative cost and active launch time for one attempt."""
+    if not isinstance(audit, dict):
+        raise SupervisorError("usage audit is malformed")
     status = audit.get("cost_status")
-    cost = _finite_nonnegative(
-        audit.get("recorded_cost_usd") or 0, "usage recorded cost",
+    recorded_cost = _finite_nonnegative(
+        audit.get("recorded_cost_usd"), "usage recorded cost",
     )
-    if status == "reconciled":
+    cost = recorded_cost
+    counts = audit.get("counts")
+    if not isinstance(counts, dict):
+        raise SupervisorError("usage audit counts are malformed")
+    unresolved = counts.get("unresolved_streams")
+    if status == "complete":
+        if unresolved != 0:
+            raise SupervisorError("usage accounting is not complete")
+    elif status == "not_run" and allow_not_run:
+        pass
+    elif status == "reconciled":
         reconciliation = audit.get("reconciliation") or {}
         if reconciliation.get("status") != "accepted":
             raise SupervisorError("usage reconciliation is not accepted")
@@ -229,8 +224,17 @@ def _usage_debit(audit: dict[str, Any]) -> tuple[float, float]:
         cost = _finite_nonnegative(
             conservative.get("accounted_cost_usd"), "conservative cost",
         )
-    segments = (audit.get("launch") or {}).get("segments") or []
-    if not segments:
+    else:
+        raise SupervisorError("usage accounting is not complete")
+    if cost < recorded_cost:
+        raise SupervisorError("usage debit undercuts recorded receipts")
+    launch = audit.get("launch")
+    if not isinstance(launch, dict):
+        raise SupervisorError("usage audit launch envelope is malformed")
+    if launch.get("status") != "sealed":
+        raise SupervisorError("usage audit launch envelope is not sealed")
+    segments = launch.get("segments")
+    if not isinstance(segments, list) or not segments:
         raise SupervisorError("usage audit lacks launch timing segments")
     elapsed = 0.0
     for segment in segments:
@@ -241,12 +245,14 @@ def _usage_debit(audit: dict[str, Any]) -> tuple[float, float]:
             ended = datetime.fromisoformat(
                 str(segment["ended_at"]).replace("Z", "+00:00")
             )
+            duration = (ended - started).total_seconds()
         except (KeyError, TypeError, ValueError) as exc:
             raise SupervisorError("usage audit timing segment is invalid") from exc
-        duration = (ended - started).total_seconds()
         if not math.isfinite(duration) or duration < 0:
             raise SupervisorError("usage audit timing segment is negative")
         elapsed += duration
+    if not math.isfinite(elapsed):
+        raise SupervisorError("usage audit total wall time is not finite")
     return cost, elapsed
 
 
@@ -261,13 +267,15 @@ def _classify(
     if not audit_path.is_file():
         raise SupervisorError(f"launch result lacks usage audit: {audit_path}")
     audit = _json(audit_path)
-    attempt_cost, attempt_wall = _usage_debit(audit)
     end_reason = result.get("end_reason")
     if not isinstance(end_reason, str) or not end_reason:
         raise SupervisorError("result lacks end_reason")
     promotion = result.get("promotion_receipt") or {}
     decision = promotion.get("decision")
     disposition = promotion.get("terminal_disposition") or {}
+    attempt_cost, attempt_wall = _usage_debit(
+        audit, allow_not_run=end_reason == "PREMODEL_GATE_INDETERMINATE",
+    )
 
     if end_reason == "PREMODEL_GATE_INDETERMINATE":
         if not audit_path.is_file():
@@ -285,13 +293,6 @@ def _classify(
             raise SupervisorError(
                 "PREMODEL_GATE_INDETERMINATE is not exact zero-provider accounting"
             )
-    elif end_reason in RETRYABLE_TRANSPORT:
-        if not audit_path.is_file():
-            raise SupervisorError(f"{end_reason} result lacks usage audit")
-        if audit.get("cost_status") != "complete" or (
-            audit.get("counts") or {}
-        ).get("unresolved_streams") != 0:
-            raise SupervisorError(f"{end_reason} accounting is not complete")
     if end_reason == "RATE_LIMITED":
         if returncode not in {0, 42}:
             raise SupervisorError(
@@ -303,11 +304,6 @@ def _classify(
             "attempt_wall_seconds": attempt_wall,
         }
 
-    if returncode != 0:
-        raise SupervisorError(
-            f"launcher exited {returncode} before authoritative terminal classification"
-        )
-
     if end_reason in RETRYABLE_TRANSPORT:
         return "retry", {
             "end_reason": end_reason, "decision": decision,
@@ -317,6 +313,15 @@ def _classify(
     if decision == "ACCEPTED" or end_reason == "COMPLETE":
         if decision != "ACCEPTED" or disposition.get("reusable") is not True:
             raise SupervisorError("COMPLETE lacks reusable ACCEPTED promotion")
+        # An ACCEPTED result.json with a nonzero launcher exit means terminal
+        # validation (budget ceiling, sealed envelope, audit agreement) failed
+        # AFTER the promotion was written — trusting the label alone would
+        # seal the campaign complete over a failed validation (T315 H5a).
+        if returncode != 0:
+            raise SupervisorError(
+                "ACCEPTED promotion but launcher exited "
+                f"{returncode}: terminal validation did not pass"
+            )
         return "complete", {
             "end_reason": end_reason, "decision": decision,
             "attempt_cost_usd": attempt_cost,
@@ -325,6 +330,18 @@ def _classify(
     if decision == "BANKED_PARTIAL":
         if disposition.get("reusable") is not True:
             raise SupervisorError("BANKED_PARTIAL is not reusable")
+        # Same authority rule as ACCEPTED: the promotion receipt is written by
+        # the runner INSIDE the container, before the launcher validates the
+        # terminal (budget ceiling, sealed envelope, audit agreement). A
+        # nonzero exit means that validation failed afterwards, so the bank
+        # must not chain a successor. Downstream receipt binding in
+        # _next_package rejects some of these, but not every exit-45 cause,
+        # and "probably caught later" is not an authority check.
+        if returncode != 0:
+            raise SupervisorError(
+                "BANKED_PARTIAL promotion but launcher exited "
+                f"{returncode}: terminal validation did not pass"
+            )
         campaign_path = package.get("campaign_state_path")
         if not campaign_path:
             raise SupervisorError("banked package lacks campaign_state_path")
@@ -357,7 +374,7 @@ def _classify(
 
 def _next_package(
     package: dict[str, Any], values: dict[str, str], current_path: Path,
-) -> Path:
+) -> tuple[Path, str]:
     command = package.get("next_package_argv")
     if not isinstance(command, list) or not command:
         raise SupervisorError("BANKED_PARTIAL lacks next_package_argv")
@@ -367,8 +384,8 @@ def _next_package(
     completed = subprocess.run(_format_parts(command, hook_values), check=False)
     if completed.returncode != 0:
         raise SupervisorError(f"next-package generator exited {completed.returncode}")
-    _validate_package(next_path)
-    return next_path
+    next_package = _validate_package(next_path)
+    return next_path, next_package["package_id"]
 
 
 def run(args: argparse.Namespace) -> int:
@@ -390,6 +407,18 @@ def run(args: argparse.Namespace) -> int:
             if state.get("status") in {"stop", "complete", "error"}:
                 raise SupervisorError(
                     f"persisted terminal supervisor state requires human reset: {state['status']}"
+                )
+            if state.get("status") == "launching":
+                # A restart over a persisted "launching" state means the
+                # previous supervisor died mid-launch; its launcher child may
+                # still be running re-parented, and its spend/result was never
+                # classified. Launching attempt N+1 alongside orphan N would
+                # double-run and lose accounting (T315 H5b) — fail closed for
+                # a human to reap the orphan first.
+                raise SupervisorError(
+                    "persisted 'launching' state: prior attempt was never "
+                    "classified (possible orphaned launcher) — human reap "
+                    "required before relaunch"
                 )
             if state.get("status") == "waiting":
                 try:
@@ -417,6 +446,24 @@ def run(args: argparse.Namespace) -> int:
                 state.update({"status": "error", "terminal": {"error": str(exc)}})
                 _atomic_json(state_path, state)
                 raise exc
+            try:
+                max_cost, max_wall = _registered_budget(package)
+                prior_cost = _finite_nonnegative(
+                    state.get("supervised_cost_usd", 0),
+                    "supervisor cumulative cost",
+                )
+                prior_wall = _finite_nonnegative(
+                    state.get("supervised_wall_seconds", 0),
+                    "supervisor cumulative wall time",
+                )
+                if prior_cost >= max_cost or prior_wall >= max_wall:
+                    raise SupervisorError(
+                        "supervisor cumulative budget is exhausted before launch"
+                    )
+            except SupervisorError as exc:
+                state.update({"status": "error", "terminal": {"error": str(exc)}})
+                _atomic_json(state_path, state)
+                raise
             attempt = int(state.get("attempt") or 0) + 1
             run_id = f"{package['run_id_prefix']}-{attempt:06d}"
             if len(run_id) > 40:
@@ -443,19 +490,18 @@ def run(args: argparse.Namespace) -> int:
             completed = subprocess.run(_format_parts(package["launch_argv"], values), check=False)
             try:
                 action, evidence = _classify(package, values, completed.returncode)
-                max_cost, max_wall = _registered_budget(package)
             except SupervisorError as exc:
                 state.update({"status": "error", "terminal": {"error": str(exc)}})
                 _atomic_json(state_path, state)
                 raise
             cumulative_cost = _finite_nonnegative(
-                state.get("supervised_cost_usd") or 0,
+                prior_cost + evidence["attempt_cost_usd"],
                 "supervisor cumulative cost",
-            ) + float(evidence.get("attempt_cost_usd") or 0)
+            )
             cumulative_wall = _finite_nonnegative(
-                state.get("supervised_wall_seconds") or 0,
+                prior_wall + evidence["attempt_wall_seconds"],
                 "supervisor cumulative wall time",
-            ) + float(evidence.get("attempt_wall_seconds") or 0)
+            )
             state.update({
                 "supervised_cost_usd": cumulative_cost,
                 "supervised_wall_seconds": cumulative_wall,
@@ -487,13 +533,15 @@ def run(args: argparse.Namespace) -> int:
                 return 0 if action == "complete" else 3
             if action == "advance":
                 try:
-                    next_path = _next_package(package, values, package_path)
+                    next_path, next_package_id = _next_package(
+                        package, values, package_path,
+                    )
                 except SupervisorError as exc:
                     state.update({"status": "error", "terminal": {"error": str(exc)}})
                     _atomic_json(state_path, state)
                     raise
                 state.update({"package_path": str(next_path), "status": "ready",
-                              "package_id": _validate_package(next_path)["package_id"],
+                              "package_id": next_package_id,
                               "next_trigger": "BANKED_PARTIAL", "retry_streak": 0})
                 _atomic_json(state_path, state)
                 if args.once:

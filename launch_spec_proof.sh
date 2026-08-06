@@ -27,13 +27,14 @@ MVP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ── defaults: the prepared dalek-spec-strip edwards surface ──────────────────
 PROJECT="/private/tmp/dalek-spec-strip/curve25519-dalek"
 ANCHOR=""
-VSTD="/path/to/verus/vstd"
+VSTD="${VSTD_ROOT:-}"
 RUN_ID="spec_proof_$(date +%Y%m%d_%H%M%S)"
 ROUNDS=2
 BUDGET=15
 MODEL=""
 DETACH=0
 DEPS=()
+PYTHON="${PYTHON:-python3}"
 
 usage() { sed -n '2,30p' "$0"; exit "${1:-0}"; }
 
@@ -52,6 +53,12 @@ while [ $# -gt 0 ]; do
     *) echo "unknown flag: $1" >&2; usage 2 ;;
   esac
 done
+
+# RUN_ID reaches the launcher log and detached PID path before run.py. Use the
+# same canonical component grammar as the main launcher.
+RUN_ID_ERROR=$(PYTHONPATH="$MVP_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m lib.results validate-run-id "$RUN_ID" 2>&1
+) || { printf '%s\n' "$RUN_ID_ERROR" >&2; exit 2; }
 
 # Fill anchor + deps from the project root if not explicitly overridden.
 [ -n "$ANCHOR" ] || ANCHOR="$PROJECT/src/edwards.rs"
@@ -74,7 +81,7 @@ LOG="$MVP_ROOT/launcher_${RUN_ID}.log"
 
 # ── build run.py argv ────────────────────────────────────────────────────────
 CMD=(
-  python3 "$MVP_ROOT/run.py" "$ANCHOR"
+  "$PYTHON" "$MVP_ROOT/run.py" "$ANCHOR"
   --project "$PROJECT"
   --run-id  "$RUN_ID"
   --rounds  "$ROUNDS"
@@ -99,7 +106,7 @@ echo "  log    : $LOG"
 # killpg on teardown. Same mechanism as launch.sh --detach.
 if [ "$DETACH" = "1" ]; then
   export _SP_LOG="$LOG"
-  PID=$(python3 - "${CMD[@]}" <<'PYEOF'
+  PID=$("$PYTHON" - "${CMD[@]}" <<'PYEOF'
 import os, subprocess, sys
 log_path = os.environ['_SP_LOG']
 p = subprocess.Popen(

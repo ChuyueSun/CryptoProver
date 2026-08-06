@@ -19,6 +19,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from lib.durable import atomic_write_text
+
 
 RAW_RE = re.compile(r"^round_(\d+)\.jsonl$")
 ROUND_RE = re.compile(r"^round_(\d+)\.json$")
@@ -119,10 +121,9 @@ def _raw_receipt(path: Path | None) -> dict[str, Any]:
 
 
 def _atomic_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    atomic_write_text(
+        path, json.dumps(data, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def archive_task_receipts(
@@ -376,6 +377,23 @@ def audit_run(
             )
             for number in numbers
         ]
+        # Coverage is defined over files that EXIST; a wholly-lost round
+        # (billed provider request, no raw/round/lifecycle written) would
+        # otherwise leave cost_status "complete" (T315 M6). Round numbers
+        # are contiguous from 1 by construction, so any gap is a lost round
+        # — record it as an unresolvable stream, never as completeness.
+        if numbers:
+            for missing in sorted(set(range(1, max(numbers) + 1)) - set(numbers)):
+                record = _stream_record(
+                    logical_task_id, missing, None, None, None,
+                    require_lifecycle, source,
+                )
+                record.setdefault("unresolved_reasons", []).append(
+                    "round_missing_from_disk"
+                )
+                record["cost_resolved"] = False
+                task_streams.append(record)
+            task_streams.sort(key=lambda item: item["round_number"])
         streams.extend(task_streams)
 
     task_summaries: list[dict[str, Any]] = []

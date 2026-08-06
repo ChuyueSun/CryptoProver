@@ -1,6 +1,7 @@
 import hashlib
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,11 +15,15 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
     @staticmethod
     def _seal_package(package: dict) -> None:
         package.pop("package_id", None)
-        package["package_id"] = hashlib.sha256(json.dumps(
+        canonical = json.dumps(
             package, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-        ).encode("utf-8")).hexdigest()
+        ).encode("utf-8")
+        package["package_id"] = hashlib.sha256(
+            b"trusted-core-supervisor-package:v1\x00" + canonical
+        ).hexdigest()
 
-    def _fixture(self, root: Path, mode: str, *, audit_complete: bool = True):
+    def _fixture(self, root: Path, mode: str, *, audit_complete: bool = True,
+                 audit_status: str | None = None):
         immutable = root / "registration.json"
         immutable.write_text(json.dumps({
             "budget": {
@@ -27,6 +32,20 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             },
         }))
         launch = root / "launch.py"
+        base_status = "complete" if audit_complete else "unknown"
+        status = audit_status or base_status
+        unresolved = 2 if audit_status else 0
+        amendment = ""
+        if audit_status == "reconciled":
+            amendment = (
+                ",'reconciliation':{'status':'accepted',"
+                "'reconciled_cost_usd':1.25}"
+            )
+        elif audit_status == "equivalent_conservative":
+            amendment = (
+                ",'equivalent_conservative':{'status':'accepted',"
+                "'accounted_cost_usd':1.5}"
+            )
         launch.write_text(
             "import json,pathlib,sys\n"
             "run_id,root,mode=sys.argv[1:4]\n"
@@ -35,19 +54,20 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             "decision='UNCOMMITTED_CANDIDATE'\n"
             "end='RATE_LIMITED'\n"
             "reusable=False\n"
-            "if mode=='bank': decision='BANKED_PARTIAL'; end='LIMIT'; reusable=True\n"
+            "if mode in ('bank','bank45'): decision='BANKED_PARTIAL'; end='LIMIT'; reusable=True\n"
             "if mode=='dominated': decision='BANK_DOMINATED'; end='LIMIT'\n"
-            "if mode in ('complete','complete_fail'): decision='ACCEPTED'; end='COMPLETE'; reusable=True\n"
+            "if mode in ('complete','complete45'): decision='ACCEPTED'; end='COMPLETE'; reusable=True\n"
             "if mode=='unknown': end='LIMIT'\n"
             "if mode=='hang': end='RATE_LIMIT_OR_HANG'\n"
             "if mode=='premodel': end='PREMODEL_GATE_INDETERMINATE'\n"
             "result={'end_reason':end,'promotion_receipt':{'decision':decision,"
             "'terminal_disposition':{'reusable':reusable}}}\n"
-            "(base/'result.json').write_text(json.dumps(result))\n"
-            f"audit={{'cost_status':{'complete' if audit_complete else 'unknown'!r},"
-            "'recorded_cost_usd':1.0,'counts':{'unresolved_streams':0},"
+            "if mode!='noresult': (base/'result.json').write_text(json.dumps(result))\n"
+            f"audit={{'cost_status':{status!r},'recorded_cost_usd':1.0,"
+            f"'counts':{{'unresolved_streams':{unresolved}}},"
             "'launch':{'status':'sealed','segments':[{'started_at':"
-            "'2026-08-05T00:00:00Z','ended_at':'2026-08-05T00:00:10Z'}]}}\n"
+            "'2026-08-05T00:00:00Z','ended_at':'2026-08-05T00:00:10Z'}]}"
+            f"{amendment}}}\n"
             "if mode=='premodel': audit={'cost_status':'not_run',"
             "'recorded_cost_usd':0,'counts':{'stream_attempts':0,"
             "'provider_cost_events':0,'unresolved_streams':0},"
@@ -56,8 +76,13 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             "(base.parent/'usage_audit.json').write_text(json.dumps(audit))\n"
             "import time\n"
             "raw=base/'claude_raw'; raw.mkdir(); "
-            "(raw/'round_1.jsonl').write_text(json.dumps({'resetsAt':int(time.time())+3600})+'\\n')\n"
-            "sys.exit(42 if mode=='rate' else (45 if mode=='complete_fail' else 0))\n"
+            "reset={'type':'rate_limit_event','rate_limit_info':"
+            "{'resetsAt':int(time.time())+3600}}\n"
+            "(raw/'round_1.jsonl').write_text(json.dumps(reset)+'\\n')\n"
+            "rc=0\n"
+            "if mode=='rate': rc=42\n"
+            "if mode in ('complete45','bank45'): rc=45\n"
+            "sys.exit(rc)\n"
         )
         campaign = root / "campaign.json"
         campaign.write_text(json.dumps({"stop": False, "stop_reasons": []}))
@@ -85,7 +110,7 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
 
     def _run(self, root: Path, package: Path):
         return subprocess.run(
-            ["python3", str(SUPERVISOR), "--package", str(package),
+            [sys.executable, str(SUPERVISOR), "--package", str(package),
              "--state", str(root / "state.json"),
              "--ledger", str(root / "ledger.jsonl"),
              "--lock", str(root / "supervisor.lock"), "--once",
@@ -100,6 +125,8 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             state = json.loads((root / "state.json").read_text())
             self.assertEqual(state["status"], "waiting")
+            self.assertEqual(state["supervised_cost_usd"], 1.0)
+            self.assertEqual(state["supervised_wall_seconds"], 10.0)
             self.assertIsInstance(state["provider_reset_epoch"], int)
             self.assertGreaterEqual(
                 state["next_attempt_epoch"], state["provider_reset_epoch"],
@@ -109,7 +136,6 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             self.assertEqual(events[-1]["next_action"], "RETRY")
 
     def test_model_tool_input_cannot_choose_provider_reset_time(self):
-        import sys
         import time
 
         sys.path.insert(0, str(ROOT / "docker"))
@@ -119,13 +145,27 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             sys.path.pop(0)
         with tempfile.TemporaryDirectory() as tmp:
             raw = Path(tmp) / "round.jsonl"
-            raw.write_text(json.dumps({
-                "type": "assistant",
-                "message": {"content": [{
-                    "type": "tool_use",
-                    "input": {"reset_epoch": int(time.time()) + 13 * 86400},
-                }]},
-            }) + "\n")
+            hostile_epoch = int(time.time()) + 13 * 86400
+            hostile_events = [
+                {
+                    "type": "assistant",
+                    "message": {"content": [{
+                        "type": "tool_use",
+                        "input": {"reset_epoch": hostile_epoch},
+                    }]},
+                },
+                {
+                    "type": "result",
+                    "permission_denials": [{
+                        "tool_name": "Bash",
+                        "tool_input": {"resetsAt": hostile_epoch},
+                    }],
+                },
+                [{"type": "assistant", "resetsAt": hostile_epoch}],
+                {"reset_epoch": hostile_epoch},
+            ]
+            raw.write_text("".join(json.dumps(event) + "\n"
+                                   for event in hostile_events))
             self.assertIsNone(_find_reset_epoch([raw]))
 
             raw.write_text(json.dumps({
@@ -144,6 +184,16 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             self.assertIn("accounting is not complete", completed.stderr)
             state = json.loads((root / "state.json").read_text())
             self.assertEqual(state["status"], "error")
+
+    def test_no_result_attempt_fails_closed_without_zero_debit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            completed = self._run(root, self._fixture(root, "noresult"))
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("launch produced no result", completed.stderr)
+            state = json.loads((root / "state.json").read_text())
+            self.assertEqual(state["status"], "error")
+            self.assertNotIn("supervised_cost_usd", state)
 
     def test_restart_preserves_future_wait_without_relaunching(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -202,15 +252,144 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
                 json.loads((root / "state.json").read_text())["status"], "complete",
             )
 
-    def test_failed_launcher_cannot_promote_complete_result(self):
+    def test_accepted_with_failed_terminal_validation_fails_closed(self):
+        # T315 H5a: an ACCEPTED result.json with launcher exit 45 means
+        # terminal validation failed AFTER the promotion was written; the
+        # supervisor must not seal the campaign complete off the label alone.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            completed = self._run(root, self._fixture(root, "complete_fail"))
+            completed = self._run(root, self._fixture(root, "complete45"))
             self.assertEqual(completed.returncode, 2)
-            self.assertIn("launcher exited 45", completed.stderr)
-            self.assertEqual(
-                json.loads((root / "state.json").read_text())["status"], "error",
-            )
+            self.assertIn("terminal validation did not pass", completed.stderr)
+            state = json.loads((root / "state.json").read_text())
+            self.assertEqual(state["status"], "error")
+
+    def test_banked_partial_with_failed_terminal_validation_fails_closed(self):
+        # Same authority rule as ACCEPTED: the promotion receipt is written by
+        # the runner before the launcher validates the terminal, so a nonzero
+        # exit means validation failed afterwards and the bank must not chain
+        # a successor. "Downstream receipt binding probably rejects it" is not
+        # an authority check.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            completed = self._run(root, self._fixture(root, "bank45"))
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("terminal validation did not pass", completed.stderr)
+            state = json.loads((root / "state.json").read_text())
+            self.assertEqual(state["status"], "error")
+
+    def test_persisted_launching_state_requires_human_reap(self):
+        # T315 H5b: a restart over a persisted "launching" state means the
+        # prior attempt was never classified (possible orphaned launcher);
+        # relaunching would double-run and lose its accounting.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = self._fixture(root, "rate")
+            (root / "state.json").write_text(json.dumps({
+                "schema_version": 1, "attempt": 1,
+                "package_path": str(package), "status": "launching",
+            }))
+            completed = self._run(root, package)
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("human reap required", completed.stderr)
+
+    def test_amended_audit_is_acceptable_retry_evidence(self):
+        # T315 M7: reconciled / equivalent_conservative are the
+        # human-authorized amendment statuses; refusing them made an amended
+        # (more truthful) audit permanently unretryable.
+        for status, expected_cost in (
+            ("equivalent_conservative", 1.5),
+            ("reconciled", 1.25),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                completed = self._run(
+                    root, self._fixture(root, "rate", audit_status=status),
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                state = json.loads((root / "state.json").read_text())
+                self.assertEqual(state["status"], "waiting")
+                self.assertEqual(state["supervised_cost_usd"], expected_cost)
+
+    def test_amended_audit_cannot_undercut_recorded_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = self._fixture(root, "rate", audit_status="reconciled")
+            launch = root / "launch.py"
+            launch.write_text(launch.read_text().replace(
+                "'reconciled_cost_usd':1.25",
+                "'reconciled_cost_usd':0.5",
+            ))
+
+            completed = self._run(root, package)
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("undercuts recorded receipts", completed.stderr)
+            state = json.loads((root / "state.json").read_text())
+            self.assertEqual(state["status"], "error")
+
+    def test_nonfinite_registered_budget_blocks_before_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = self._fixture(root, "complete")
+            registration = root / "registration.json"
+            registration.write_text(json.dumps({
+                "budget": {
+                    "max_cost_usd": float("nan"),
+                    "max_wall_seconds": 10000,
+                },
+            }))
+            package_value = json.loads(package.read_text())
+            package_value["immutable_inputs"][0]["sha256"] = hashlib.sha256(
+                registration.read_bytes()
+            ).hexdigest()
+            self._seal_package(package_value)
+            package.write_text(json.dumps(package_value))
+
+            completed = self._run(root, package)
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("registered maximum cost", completed.stderr)
+            state = json.loads((root / "state.json").read_text())
+            self.assertEqual(state["status"], "error")
+            events = [
+                json.loads(line)
+                for line in (root / "ledger.jsonl").read_text().splitlines()
+            ]
+            self.assertNotIn("LAUNCH", [event["event"] for event in events])
+
+    def test_nonfinite_usage_cost_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = self._fixture(root, "complete")
+            launch = root / "launch.py"
+            launch.write_text(launch.read_text().replace(
+                "'recorded_cost_usd':1.0",
+                "'recorded_cost_usd':float('nan')",
+            ))
+
+            completed = self._run(root, package)
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("usage recorded cost", completed.stderr)
+            state = json.loads((root / "state.json").read_text())
+            self.assertEqual(state["status"], "error")
+
+    def test_unsealed_usage_envelope_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = self._fixture(root, "rate")
+            launch = root / "launch.py"
+            launch.write_text(launch.read_text().replace(
+                "'status':'sealed'", "'status':'open'",
+            ))
+
+            completed = self._run(root, package)
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("launch envelope is not sealed", completed.stderr)
+            state = json.loads((root / "state.json").read_text())
+            self.assertEqual(state["status"], "error")
 
     def test_prior_retry_cost_counts_against_complete_ceiling(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -237,11 +416,14 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
                 "supervised_cost_usd": 9.5,
                 "supervised_wall_seconds": 20,
             }))
+
             completed = self._run(root, package)
+
             self.assertEqual(completed.returncode, 3, completed.stderr)
             state = json.loads((root / "state.json").read_text())
             self.assertEqual(state["status"], "stop")
             self.assertEqual(state["supervised_cost_usd"], 10.5)
+            self.assertEqual(state["supervised_wall_seconds"], 30.0)
             self.assertIn("COST_CEILING", state["terminal"]["stop_reasons"])
 
     def test_bank_without_generator_fails_closed(self):
@@ -264,6 +446,18 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             self.assertEqual(state["attempt"], 1)
             events = [json.loads(line) for line in (root / "ledger.jsonl").read_text().splitlines()]
             self.assertEqual(events[-1]["next_action"], "STOP")
+
+    def test_nontransport_incomplete_accounting_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            completed = self._run(
+                root, self._fixture(root, "unknown", audit_complete=False),
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("accounting is not complete", completed.stderr)
+            state = json.loads((root / "state.json").read_text())
+            self.assertEqual(state["status"], "error")
+            self.assertNotIn("supervised_cost_usd", state)
 
     def test_dominated_bank_stops_without_successor_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -293,6 +487,27 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             self.assertEqual(events[-1]["event"], "ERROR")
             self.assertEqual(events[-1]["next_action"], "STOP_FAIL_CLOSED")
 
+    def test_package_content_id_mismatch_blocks_before_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = self._fixture(root, "rate")
+            mutated = json.loads(package.read_text())
+            mutated["launch_argv"][-1] = "complete"
+            package.write_text(json.dumps(mutated))
+
+            completed = self._run(root, package)
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("package_id does not bind", completed.stderr)
+            state = json.loads((root / "state.json").read_text())
+            self.assertEqual(state["status"], "error")
+            events = [
+                json.loads(line)
+                for line in (root / "ledger.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(events[-1]["event"], "ERROR")
+            self.assertEqual(events[-1]["next_action"], "STOP_FAIL_CLOSED")
+
     def test_package_command_mutation_between_retries_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -305,7 +520,7 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             state_path.write_text(json.dumps(state))
 
             mutated = json.loads(package.read_text())
-            mutated["launch_argv"][4] = "complete"
+            mutated["launch_argv"][-1] = "complete"
             self._seal_package(mutated)
             package.write_text(json.dumps(mutated))
             second = self._run(root, package)
@@ -314,8 +529,10 @@ class TrustedCoreSupervisorTests(unittest.TestCase):
             self.assertIn("persisted package_id", second.stderr)
             final = json.loads(state_path.read_text())
             self.assertEqual(final["status"], "error")
-            events = [json.loads(line) for line in
-                      (root / "ledger.jsonl").read_text().splitlines()]
+            events = [
+                json.loads(line)
+                for line in (root / "ledger.jsonl").read_text().splitlines()
+            ]
             self.assertEqual(
                 [event["event"] for event in events].count("LAUNCH"), 1,
             )

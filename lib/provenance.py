@@ -9,24 +9,36 @@ and the host-side Docker launcher can use one canonical algorithm.
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import hmac
 import json
-import math
 import os
 import re
 import subprocess
-import tempfile
+import tomllib
 from pathlib import Path
 from typing import Any, Iterable
 
+from lib.durable import atomic_write_text
 
-_ALWAYS_IGNORED_DIRS = frozenset({
-    ".git", "__pycache__", ".mypy_cache", ".pytest_cache",
+
+# Two ignore tiers. Cache/VCS dirs are never source at any depth.
+#
+# Run-artifact dirs (target/results/claude_*) are created by cargo and the
+# harness at a workspace or member-crate ROOT — the directory holding a
+# Cargo.toml — and nowhere else. Pruning them by bare NAME at any depth is a
+# naming heuristic, not a structural one, and it hides real compiler input:
+# `target`/`results` are legal Rust module names, and Cargo lets a manifest
+# point `[lib] path` or `[[bin]] path` at any directory, so a source file can
+# legitimately live at `custom/results/lib.rs`. Prune by POSITION instead.
+_IGNORED_DIRS_ANYWHERE = frozenset({
+    ".git", ".verilib", "__pycache__", ".mypy_cache", ".pytest_cache",
 })
-_CARGO_OUTPUT_DIRS = frozenset({
+_IGNORED_DIRS_AT_CRATE_ROOT = frozenset({
     "target", "results", "claude_raw", "claude_memory",
 })
+_IGNORED_DIRS = _IGNORED_DIRS_ANYWHERE | _IGNORED_DIRS_AT_CRATE_ROOT
 _IGNORED_FILES = frozenset({".DS_Store", ".git"})
 _LITERAL_RUST_INCLUDE = re.compile(
     r"\b(?:include|include_str|include_bytes)!\s*\(\s*\"([^\"]+)\"\s*\)"
@@ -49,6 +61,14 @@ PEEL_TRANSFORM_TOOL_PATHS = (
     "lib/admits.py",
     "lib/provenance.py",
 )
+
+
+class SourceInputError(ValueError):
+    """A compiler input cannot be bound, with its declaring source path."""
+
+    def __init__(self, message: str, *, source_path: Path | None = None):
+        super().__init__(message)
+        self.source_path = source_path
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -534,24 +554,11 @@ def validate_launch_registration(
     authorization_id = budget.get("authorization_id")
     if not isinstance(authorization_id, str) or not authorization_id:
         raise ValueError("launch registration lacks budget.authorization_id")
-    for key in ("max_cost_usd", "max_wall_seconds"):
+    positive_fields = ("max_cost_usd", "max_wall_seconds", "plateau_k")
+    for key in positive_fields:
         amount = budget.get(key)
-        if (
-            not isinstance(amount, (int, float))
-            or isinstance(amount, bool)
-            or not math.isfinite(amount)
-            or amount <= 0
-        ):
+        if not isinstance(amount, (int, float)) or isinstance(amount, bool) or amount <= 0:
             raise ValueError(f"launch registration budget.{key} must be positive")
-    plateau_k = budget.get("plateau_k")
-    if (
-        not isinstance(plateau_k, int)
-        or isinstance(plateau_k, bool)
-        or plateau_k <= 0
-    ):
-        raise ValueError(
-            "launch registration budget.plateau_k must be a positive integer"
-        )
     hint_level = value.get("hint_level")
     if hint_level not in {"H0", "H1", "H2", "H3", "H4"}:
         raise ValueError("launch registration hint_level must be H0-H4")
@@ -582,7 +589,6 @@ def validate_launch_registration(
         if (
             not isinstance(amount, (int, float))
             or isinstance(amount, bool)
-            or not math.isfinite(amount)
             or amount <= 0
         ):
             raise ValueError(
@@ -668,20 +674,28 @@ def reusable_seed_authority(receipt_path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid promotion receipt: {receipt_path}") from exc
     stored_id = value.get("receipt_id")
-    if not isinstance(stored_id, str) or stored_id != receipt_id(value):
+    if stored_id is not None and stored_id != receipt_id(value):
         raise ValueError("promotion receipt content ID mismatch")
-    if value.get("schema_version") != 2 or value.get("scoreable") is not True:
-        raise ValueError("promotion receipt is not a scoreable schema_version 2 receipt")
     decision = value.get("decision")
     disposition = value.get("terminal_disposition") or {}
     if decision == "ACCEPTED":
         allowed_state = "ACCEPTED"
         kind = "COMPLETE"
-        gate = value.get("acceptance_gate_receipt") or {}
     elif decision == "BANKED_PARTIAL":
         allowed_state = "BANKED_PARTIAL"
         kind = "BANKED_PARTIAL"
+        if value.get("scoreable") is not True:
+            raise ValueError("BANKED_PARTIAL receipt is not scoreable")
         gate = value.get("banking_gate_receipt") or {}
+        if gate.get("fresh") is not True or gate.get("exact_tree_match") is not True:
+            raise ValueError("BANKED_PARTIAL lacks a fresh exact-tree banking gate")
+        vector = gate.get("vector")
+        required_vector = {
+            "hard_admits", "verification_errors",
+            "resource_limits", "raw_errors",
+        }
+        if not isinstance(vector, dict) or not required_vector <= set(vector):
+            raise ValueError("BANKED_PARTIAL lacks canonical progress vector")
     else:
         raise ValueError("promotion receipt is neither ACCEPTED nor BANKED_PARTIAL")
     if disposition.get("state") != allowed_state or not disposition.get("reusable"):
@@ -690,44 +704,15 @@ def reusable_seed_authority(receipt_path: Path) -> dict[str, Any]:
     tree_hash = tree.get("tree_hash")
     if not isinstance(tree_hash, str) or not tree_hash:
         raise ValueError("promotion receipt lacks final_tree_receipt.tree_hash")
-    if (
-        gate.get("fresh") is not True
-        or gate.get("exact_tree_match") is not True
-        or (gate.get("tree_receipt") or {}).get("tree_hash") != tree_hash
-    ):
-        raise ValueError(f"{decision} lacks a fresh exact-tree terminal gate")
-    vector = gate.get("vector")
-    required_vector = {
-        "hard_admits", "verification_errors", "resource_limits", "raw_errors",
-    }
-    if (
-        not isinstance(vector, dict)
-        or not required_vector <= set(vector)
-        or any(
-            not isinstance(vector[key], int)
-            or isinstance(vector[key], bool)
-            or vector[key] < 0
-            for key in required_vector
-        )
-    ):
-        raise ValueError(f"{decision} lacks a canonical non-negative progress vector")
-    if decision == "ACCEPTED" and (
-        (gate.get("verus_result") or {}).get("okay") is not True
-        or vector.get("hard_admits") != 0
-    ):
-        raise ValueError("ACCEPTED lacks a fresh green zero-admit terminal gate")
     lineage_id = value.get("lineage_id")
     if not isinstance(lineage_id, str) or not lineage_id:
         raise ValueError("promotion receipt lacks lineage_id")
-    campaign_spec_sha256 = value.get("campaign_spec_sha256")
-    if not isinstance(campaign_spec_sha256, str) or not campaign_spec_sha256:
-        raise ValueError("promotion receipt lacks campaign_spec_sha256")
     return {
         "kind": kind,
         "tree_hash": tree_hash,
         "lineage_id": lineage_id,
-        "receipt_id": stored_id,
-        "campaign_spec_sha256": campaign_spec_sha256,
+        "receipt_id": stored_id or receipt_id(value),
+        "campaign_spec_sha256": value.get("campaign_spec_sha256"),
     }
 
 
@@ -747,16 +732,30 @@ def workspace_root(project: Path) -> Path:
 
 
 def _iter_relevant_files(root: Path) -> Iterable[Path]:
+    resolved_root = Path(root)
     for current, dirs, names in os.walk(root, followlinks=False):
         base = Path(current)
-        dirs[:] = sorted(
-            directory for directory in dirs
-            if directory not in _ALWAYS_IGNORED_DIRS
-            and not (
-                directory in _CARGO_OUTPUT_DIRS
-                and (base == root or (base / "Cargo.toml").is_file())
-            )
+        # Cargo and the harness create their output dirs beside a manifest;
+        # everywhere else those names are ordinary source.
+        at_crate_root = (
+            base == resolved_root or (base / "Cargo.toml").is_file()
         )
+        kept: list[str] = []
+        for d in sorted(dirs):
+            if d in _IGNORED_DIRS_ANYWHERE:
+                continue
+            if at_crate_root and d in _IGNORED_DIRS_AT_CRATE_ROOT:
+                continue
+            # os.walk(followlinks=False) lists a symlinked directory in
+            # `dirs` but never descends into it and never yields it as a
+            # file — so it was entirely absent from the receipt, an
+            # oracle-smuggling channel (T315 H3). Emit it as a symlink
+            # entry instead of walking it.
+            if (base / d).is_symlink():
+                yield base / d
+                continue
+            kept.append(d)
+        dirs[:] = kept
         for name in sorted(names):
             if name in _IGNORED_FILES:
                 continue
@@ -765,19 +764,38 @@ def _iter_relevant_files(root: Path) -> Iterable[Path]:
                 yield path
 
 
-def _literal_rust_include_files(root: Path, initial: Iterable[Path]) -> list[Path]:
-    """Return literal Rust include inputs, including those below ignored dirs.
+def _confined_path(root: Path, base: Path, raw: str, *, kind: str,
+                   source_path: Path | None = None) -> Path:
+    """Return a lexical input path after proving its target stays in root."""
+    candidate = Path(os.path.abspath(base / raw))
+    try:
+        resolved_rel = candidate.resolve().relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SourceInputError(
+            f"{kind} escapes workspace: {base}: {raw}",
+            source_path=source_path,
+        ) from exc
+    try:
+        candidate.relative_to(root)
+        return candidate
+    except ValueError:
+        # macOS exposes /var as a symlink to /private/var. An absolute Cargo
+        # member can name either spelling while still denoting bytes under the
+        # workspace; normalize only this non-lexically-relative case.
+        return root / resolved_rel
 
-    Build outputs remain excluded from the ordinary walk, but a source file can
-    make any byte sequence compiler-visible with include!/include_str!/
-    include_bytes!. Those explicit dependencies must therefore enter the exact
-    source identity even when their directory is normally generated/noisy.
-    Dynamic include expressions are derived from already-receipted source/build
-    inputs and are checked by the fresh terminal build; literal paths are the
-    direct mutable-input hole this closure prevents.
-    """
+
+def _lexical_path(base: Path, raw: str) -> Path:
+    """Normalize a declared path without resolving symlinks."""
+    return Path(os.path.abspath(base / raw))
+
+
+def _literal_rust_include_files(root: Path,
+                                initial: Iterable[Path]) -> list[Path]:
+    """Close literal Rust include/path dependencies below pruned directories."""
     pending = list(initial)
-    seen = {path.resolve() for path in pending}
+    queued = {Path(os.path.abspath(path)) for path in pending}
+    explicit_seen: set[Path] = set()
     included: list[Path] = []
     while pending:
         source = pending.pop()
@@ -790,23 +808,274 @@ def _literal_rust_include_files(root: Path, initial: Iterable[Path]) -> list[Pat
         dependencies = [
             *_LITERAL_RUST_INCLUDE.findall(text),
             *_LITERAL_RUST_PATH.findall(text),
-            *(match.group("path") for match in _LITERAL_RUST_INCLUDE_RAW.finditer(text)),
-            *(match.group("path") for match in _LITERAL_RUST_PATH_RAW.finditer(text)),
+            *(m.group("path") for m in _LITERAL_RUST_INCLUDE_RAW.finditer(text)),
+            *(m.group("path") for m in _LITERAL_RUST_PATH_RAW.finditer(text)),
         ]
         for raw in dependencies:
-            candidate = (source.parent / raw).resolve()
-            try:
-                candidate.relative_to(root.resolve())
-            except ValueError as exc:
-                raise ValueError(
-                    f"literal Rust include escapes workspace: {source}: {raw}"
-                ) from exc
-            if not candidate.is_file() or candidate in seen:
+            candidate = _lexical_path(source.parent, raw)
+            # Regex matches are intentionally conservative and can occur in
+            # comments or string examples. A nonexistent path is not compiler
+            # input, so do not turn it into a false workspace-escape verdict.
+            if not (candidate.is_file() or candidate.is_symlink()):
                 continue
-            seen.add(candidate)
-            included.append(candidate)
-            pending.append(candidate)
+            candidate = _confined_path(
+                root, source.parent, raw, kind="literal Rust include",
+                source_path=source)
+            if candidate not in explicit_seen:
+                explicit_seen.add(candidate)
+                included.append(candidate)
+            if candidate not in queued:
+                queued.add(candidate)
+                pending.append(candidate)
     return included
+
+
+def _cargo_dependency_paths(data: dict[str, Any]) -> Iterable[str]:
+    """Yield path crates only from Cargo's dependency-bearing tables."""
+    table_names = {
+        "dependencies", "dev-dependencies", "build-dependencies",
+        "patch", "replace",
+    }
+
+    def table_paths(table: Any) -> Iterable[str]:
+        if not isinstance(table, dict):
+            return
+        for declaration in table.values():
+            if isinstance(declaration, dict):
+                path = declaration.get("path")
+                if isinstance(path, str):
+                    yield path
+
+    for name in table_names:
+        table = data.get(name)
+        yield from table_paths(table)
+        if name == "patch" and isinstance(table, dict):
+            for registry_table in table.values():
+                yield from table_paths(registry_table)
+    workspace = data.get("workspace")
+    if isinstance(workspace, dict):
+        yield from table_paths(workspace.get("dependencies"))
+    target = data.get("target")
+    if isinstance(target, dict):
+        for target_table in target.values():
+            if not isinstance(target_table, dict):
+                continue
+            for name in table_names:
+                yield from table_paths(target_table.get(name))
+
+
+def _cargo_manifest_inputs(root: Path,
+                           project: Path,
+                           initial: Iterable[Path]) -> list[Path]:
+    """Close Cargo-declared targets, build scripts, members and path crates.
+
+    The ordinary walk intentionally prunes generated directories beside a
+    manifest. Cargo declarations override that default: a target or local
+    crate below such a directory is compiler-visible and must be receipted.
+    """
+    discovered: list[Path] = []
+    seen_paths = {Path(os.path.abspath(path)) for path in initial}
+    pending_manifests = []
+    for manifest in (root / "Cargo.toml", project.resolve() / "Cargo.toml"):
+        if manifest.is_file() and manifest not in pending_manifests:
+            pending_manifests.append(manifest)
+    seen_manifests: set[Path] = set()
+    recorded: set[Path] = set()
+
+    def add(path: Path, *, declared: bool = False) -> None:
+        lexical = Path(os.path.abspath(path))
+        if not (lexical.is_file() or lexical.is_symlink()):
+            return
+        if (declared or lexical not in seen_paths) and lexical not in recorded:
+            recorded.add(lexical)
+            discovered.append(lexical)
+        seen_paths.add(lexical)
+
+    def add_crate(crate_dir: Path) -> None:
+        manifest = crate_dir / "Cargo.toml"
+        if not manifest.is_file():
+            return
+        for path in _iter_relevant_files(crate_dir):
+            add(path)
+        pending_manifests.append(manifest)
+
+    while pending_manifests:
+        manifest = Path(os.path.abspath(pending_manifests.pop()))
+        if manifest in seen_manifests:
+            continue
+        seen_manifests.add(manifest)
+        try:
+            data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise SourceInputError(
+                f"invalid Cargo manifest: {manifest}", source_path=manifest,
+            ) from exc
+        base = manifest.parent
+
+        declared: list[str] = []
+        package = data.get("package") or {}
+        if isinstance(package, dict) and isinstance(package.get("build"), str):
+            declared.append(package["build"])
+        lib = data.get("lib") or {}
+        if isinstance(lib, dict) and isinstance(lib.get("path"), str):
+            declared.append(lib["path"])
+        for table_name in ("bin", "example", "test", "bench"):
+            tables = data.get(table_name) or []
+            if isinstance(tables, list):
+                declared.extend(
+                    table["path"] for table in tables
+                    if isinstance(table, dict) and isinstance(table.get("path"), str)
+                )
+        for raw in declared:
+            candidate = _lexical_path(base, raw)
+            if candidate.is_file() or candidate.is_symlink():
+                add(_confined_path(
+                    root, base, raw, kind="Cargo target path",
+                    source_path=manifest), declared=True)
+
+        workspace = data.get("workspace") or {}
+        members = workspace.get("members", []) if isinstance(workspace, dict) else []
+        for pattern in members if isinstance(members, list) else []:
+            if not isinstance(pattern, str):
+                continue
+            # glob.glob accepts both absolute and relative Cargo member
+            # patterns. Only actual matches are compiler inputs; confine every
+            # match before walking it.
+            absolute_pattern = str(_lexical_path(base, pattern))
+            for matched in sorted(glob.glob(absolute_pattern, recursive=True)):
+                member = Path(matched)
+                raw_member = os.path.relpath(member, base)
+                member = _confined_path(
+                    root, base, raw_member, kind="Cargo workspace member",
+                    source_path=manifest)
+                add_crate(member)
+
+        for raw in _cargo_dependency_paths(data):
+            candidate = _lexical_path(base, raw)
+            if (candidate / "Cargo.toml").is_file():
+                crate_dir = _confined_path(
+                    root, base, raw, kind="Cargo path dependency",
+                    source_path=manifest)
+                add_crate(crate_dir)
+    return discovered
+
+
+def _symlink_target_digest(path: Path, root: Path) -> str:
+    """Digest of what a symlink actually exposes to the compiler.
+
+    Hashing only the link TEXT binds the pointer, not the bytes: a link into
+    an out-of-tree directory keeps a constant tree hash while its target — real
+    compiler input — is edited freely. That is an oracle channel and a
+    fake-green vector, so the receipt must cover the target's content.
+
+    Escaping, dangling and cyclic links are REJECTED rather than hashed, for
+    two reasons: hashing an out-of-tree target means walking an unbounded
+    external filesystem (a link to ``/`` would hash the machine), and a target
+    outside the workspace cannot be bound to the tree identity in any
+    meaningful sense. This matches the existing workspace-escape rule for
+    literal Rust includes, which raises from this same function.
+
+    For in-workspace targets the digest binds the LOGICAL traversal path, not
+    the resolved one. Two same-named files reached through different logical
+    directories are distinct compiler inputs; hashing a sorted multiset of
+    basenames let their contents be swapped invisibly. Cycle detection is
+    per-recursion-path, not global, because two logical aliases of one
+    directory are two real inputs and must both be bound.
+    """
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:      # dangling link or symlink loop
+        raise ValueError(
+            f"source symlink is dangling or cyclic: {path} ({type(exc).__name__})"
+        ) from exc
+    root_resolved = root.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(
+            f"source symlink escapes workspace: {path} -> {resolved}"
+        ) from exc
+    if resolved.is_file():
+        return _hash_file_bytes(resolved)[0]
+    if not resolved.is_dir():
+        return "not-a-source-target"
+
+    entries: list[str] = []
+
+    def walk(directory: Path, logical: str, chain: tuple[Path, ...]) -> None:
+        real = directory.resolve()
+        if real in chain:                       # cycle on THIS path only
+            raise ValueError(
+                f"source symlink target cycles: {path} at {logical or '.'}"
+            )
+        chain = chain + (real,)
+        try:
+            children = sorted(directory.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            raise ValueError(
+                f"source symlink target unreadable: {directory} "
+                f"({type(exc).__name__})"
+            ) from exc
+        for child in children:
+            child_logical = f"{logical}/{child.name}" if logical else child.name
+            # Resolve nested LINKS strictly and first. Dispatching on
+            # exists()/is_dir() beforehand silently absorbs a dangling or
+            # self-cyclic nested link into "not-a-source-target" — so the
+            # rejection only fired when the target directory happened to be
+            # walked independently, i.e. never under a pruned target.
+            if child.is_symlink():
+                try:
+                    child_resolved = child.resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise ValueError(
+                        f"source symlink is dangling or cyclic: {child} "
+                        f"({type(exc).__name__})"
+                    ) from exc
+            else:
+                child_resolved = child.resolve() if child.exists() else None
+            if child_resolved is not None:
+                try:
+                    child_resolved.relative_to(root_resolved)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"source symlink escapes workspace: "
+                        f"{child} -> {child_resolved}"
+                    ) from exc
+            if child.is_dir():
+                walk(child, child_logical, chain)
+            elif child.is_file():
+                # Bind the LOGICAL path so identically-named files under
+                # different logical parents cannot swap contents unseen; bind
+                # link text too so retargeting a nested link is visible.
+                link_text = (
+                    os.readlink(child) if child.is_symlink() else ""
+                )
+                entries.append(
+                    f"{child_logical}\0{link_text}\0{_hash_file_bytes(child)[0]}"
+                )
+            else:
+                entries.append(f"{child_logical}\0\0not-a-source-target")
+
+    walk(resolved, "", ())
+    return hashlib.sha256(
+        "\n".join(sorted(entries)).encode("utf-8", "surrogateescape")
+    ).hexdigest()
+
+
+def _hash_file_bytes(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as fh:
+            while True:
+                block = fh.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                size += len(block)
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}", 0
+    return digest.hexdigest(), size
 
 
 def _file_entry(path: Path, root: Path) -> dict[str, Any]:
@@ -814,11 +1083,14 @@ def _file_entry(path: Path, root: Path) -> dict[str, Any]:
     if path.is_symlink():
         target = os.readlink(path)
         data = target.encode("utf-8", "surrogateescape")
+        # Bind BOTH the pointer and the pointee: retargeting the link and
+        # mutating the target's bytes must each change the tree hash.
         return {
             "path": rel,
             "kind": "symlink",
             "sha256": hashlib.sha256(data).hexdigest(),
             "size": len(data),
+            "target_sha256": _symlink_target_digest(path, root),
         }
     digest = hashlib.sha256()
     size = 0
@@ -841,27 +1113,55 @@ def source_tree_receipt(project: Path) -> dict[str, Any]:
     opaque hash.
     """
     root = workspace_root(project)
+    # Preserve the schema-v1 ordinary-walk prefix exactly. Existing sealed
+    # receipts were hashed in this order; globally sorting the union would
+    # silently invalidate them. Only newly discovered explicit compiler inputs
+    # are sorted and appended.
     walked = list(_iter_relevant_files(root))
-    explicit_inputs = _literal_rust_include_files(root, walked)
-    paths = sorted({*walked, *explicit_inputs}, key=lambda path: path.relative_to(root).as_posix())
-    files = [_file_entry(path, root) for path in paths]
+    cargo_inputs = _cargo_manifest_inputs(root, project, walked)
+    literal_inputs = _literal_rust_include_files(
+        root, [*walked, *cargo_inputs])
+    walked_keys = {Path(os.path.abspath(path)) for path in walked}
+    explicit = sorted(
+        {
+            Path(os.path.abspath(path))
+            for path in [*cargo_inputs, *literal_inputs]
+            if Path(os.path.abspath(path)) not in walked_keys
+        },
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
+    files = [_file_entry(path, root) for path in [*walked, *explicit]]
     canonical = canonical_json_bytes(files)
-    return {
-        "schema_version": 1,
+    receipt = {
+        "schema_version": 2,
         "workspace_root": str(root),
         "file_count": len(files),
         "tree_hash": hashlib.sha256(canonical).hexdigest(),
         "files": files,
-        "literal_compiler_inputs": sorted(
-            path.relative_to(root).as_posix() for path in explicit_inputs
-        ),
     }
+    cargo_metadata = sorted(
+            path.relative_to(root).as_posix() for path in cargo_inputs
+        )
+    literal_metadata = sorted(
+            path.relative_to(root).as_posix() for path in literal_inputs
+        )
+    # Keep schema-v2 compact when the closure adds nothing. The version bump
+    # intentionally makes pre-v2 receipts non-comparable; omitting empty
+    # optional metadata avoids a second, content-independent shape variation.
+    if cargo_metadata:
+        receipt["cargo_compiler_inputs"] = cargo_metadata
+    if literal_metadata:
+        receipt["literal_compiler_inputs"] = literal_metadata
+    return receipt
 
 
 def supervisor_package_id(package: dict[str, Any]) -> str:
-    """Content identity for a supervisor package, excluding its ID field."""
+    """Domain-separated content ID for a package, excluding its ID field."""
     content = {key: value for key, value in package.items() if key != "package_id"}
-    return hashlib.sha256(canonical_json_bytes(content)).hexdigest()
+    preimage = (
+        b"trusted-core-supervisor-package:v1\x00" + canonical_json_bytes(content)
+    )
+    return hashlib.sha256(preimage).hexdigest()
 
 
 def gate_signature(command: Iterable[str], *, tool_paths: Iterable[Path] = ()) -> dict[str, Any]:
@@ -888,17 +1188,7 @@ def write_immutable_json(path: Path, value: Any) -> None:
         if path.read_text() != payload:
             raise RuntimeError(f"immutable receipt collision: {path}")
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        os.replace(tmp_name, path)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
+    atomic_write_text(path, payload)
 
 
 def accepted_promotion_tree_hash(receipt_path: Path) -> str:

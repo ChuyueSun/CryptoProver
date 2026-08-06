@@ -11,13 +11,62 @@ Layout (per Numina):
 from __future__ import annotations
 
 import json
+import re
+import sys
 import time
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from lib.durable import atomic_write_text
+
+
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_MIN_PYTHON = (3, 11)
+
+
+def validate_path_component(value: str, *, label: str) -> str:
+    """Validate one user-influenced results-directory component.
+
+    Keep the grammar deliberately portable across filesystems and shells. A
+    component cannot be absolute, traverse, inject control/shell syntax, or
+    create ambiguous hidden/dot paths; the 128-byte ASCII cap also keeps log
+    and Unix-socket path construction bounded.
+    """
+    if not isinstance(value, str) or not _SAFE_ID_RE.fullmatch(value):
+        raise ValueError(
+            f"invalid {label}: expected 1-128 ASCII characters matching "
+            "[A-Za-z0-9][A-Za-z0-9._-]*"
+        )
+    if value in (".", "..") or ".." in value:
+        raise ValueError(f"invalid {label}: '..' is not allowed")
+    return value
+
+
+def validate_run_id(run_id: str) -> str:
+    return validate_path_component(run_id, label="run id")
+
+
+def validate_launcher_run_id(
+    run_id: str,
+    *,
+    version_info: tuple[int, ...] | None = None,
+    executable: str | None = None,
+) -> str:
+    """Validate the runtime and identifier used by shell entry points."""
+    version = tuple(version_info or sys.version_info)
+    if version < _MIN_PYTHON:
+        rendered = ".".join(str(part) for part in version[:3])
+        raise RuntimeError(
+            "Python 3.11+ required; got "
+            f"{rendered} from {executable or sys.executable}"
+        )
+    return validate_run_id(run_id)
+
 
 def task_dir(results_root: Path, run_id: str, target_id: str) -> Path:
+    run_id = validate_run_id(run_id)
+    target_id = validate_path_component(target_id, label="target id")
     d = results_root / run_id / target_id
     d.mkdir(parents=True, exist_ok=True)
     (d / "claude_raw").mkdir(exist_ok=True)
@@ -30,12 +79,12 @@ def target_id_from_path(target_path: Path) -> str:
 
 
 def run_id_new(prefix: str = "run") -> str:
-    return f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_id = f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
+    return validate_run_id(run_id)
 
 
 def write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(
+    atomic_write_text(path, json.dumps(
         _jsonable(data), indent=2, ensure_ascii=False,
     ))
 
@@ -165,3 +214,23 @@ class TaskResult:
     # Validated pre-model campaign lineage context. Generic runs leave this
     # empty and cannot emit a scoreable BANKED_PARTIAL.
     lineage_context: dict = field(default_factory=dict)
+
+
+def _main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) != 2 or args[0] != "validate-run-id":
+        print(
+            "usage: python -m lib.results validate-run-id <run-id>",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        validate_launcher_run_id(args[1])
+    except (RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

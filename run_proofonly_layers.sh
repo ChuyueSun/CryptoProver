@@ -79,22 +79,26 @@ if [ -z "$RUN_ID" ]; then
   RUN_ID="proofonly_${tag}"
 fi
 
+PYTHON="${PYTHON:-python3}"
+RUN_ID_ERROR=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m lib.results validate-run-id "$RUN_ID" 2>&1
+) || { printf '%s\n' "$RUN_ID_ERROR" >&2; exit 2; }
+
 TARGETS_FILE="/tmp/targets_${RUN_ID}"
 
 # ── 1. Resolve layers → targets file (reuse run_layer.py's mapping) ──────────
-PYTHON="${PYTHON:-python3}"
-if ! "$PYTHON" - "$PROJECT" "$RESULTS" $LAYERS > "$TARGETS_FILE" 2> /tmp/targets_${RUN_ID}.err <<'PY'
+if ! "$PYTHON" - "$SCRIPT_DIR" "$PROJECT" "$RESULTS" $LAYERS > "$TARGETS_FILE" 2> /tmp/targets_${RUN_ID}.err <<'PY'
 import sys
 from pathlib import Path
-sys.path.insert(0, ".")
+sys.path.insert(0, sys.argv[1])
 from run_layer import LAYER_SETS, module_to_file
-project, results = Path(sys.argv[1]), sys.argv[2]
-unknown = [L for L in sys.argv[3:] if L not in LAYER_SETS]
+project, results = Path(sys.argv[2]), sys.argv[3]
+unknown = [L for L in sys.argv[4:] if L not in LAYER_SETS]
 if unknown:
     print(f"unknown layer set(s): {unknown}; known: {sorted(LAYER_SETS)}", file=sys.stderr)
     sys.exit(2)
 n = 0
-for layer in sys.argv[3:]:
+for layer in sys.argv[4:]:
     print(f"# ---- layer {layer} ----")
     for m in LAYER_SETS[layer]:
         try:
@@ -106,7 +110,7 @@ for layer in sys.argv[3:]:
 print(f"resolved {n} target file(s)", file=sys.stderr)
 PY
 then
-  echo "error: failed to resolve layers (run this from the repo root):" >&2
+  echo "error: failed to resolve layers:" >&2
   cat /tmp/targets_${RUN_ID}.err >&2
   exit 3
 fi

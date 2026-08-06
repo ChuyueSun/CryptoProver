@@ -156,9 +156,10 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$GITROOT" ] || die "--gitroot required"
 [ -n "$RUN_ID" ] || die "--run-id required"
-case "$RUN_ID" in
-    *[!A-Za-z0-9_.-]*|"") die "--run-id must contain only A-Z a-z 0-9 _ . -" ;;
-esac
+command -v python3 >/dev/null || die "python3 not found on PATH"
+RUN_ID_ERROR=$(PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m lib.results validate-run-id "$RUN_ID" 2>&1
+) || { printf '%s\n' "$RUN_ID_ERROR" >&2; exit 2; }
 [ "${#RUN_ID}" -le 40 ] || die "--run-id exceeds 40 characters (Docker network/name safety)"
 [ -n "$MANIFESTS_FILE" ] || die "--manifests-file required"
 [ -f "$MANIFESTS_FILE" ] || die "--manifests-file not found: $MANIFESTS_FILE"
@@ -184,7 +185,6 @@ esac
 command -v docker >/dev/null || die "docker not on PATH"
 if [ "$PROVIDER_ONLY" = "1" ]; then
     [ -f "$PROVIDER_POLICY" ] || die "provider policy not found: $PROVIDER_POLICY"
-    PROVIDER_POLICY="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$PROVIDER_POLICY")"
     [ "$TAP" = "0" ] || die "--provider-only-network cannot use host --tap; the fixed sidecar is the sole egress"
     [ -z "$REGISTRY_RO" ] || die "--provider-only-network forbids extra --registry-ro mounts"
     PROVIDER_POLICY_SHA256="$(python3 - "$repo" "$PROVIDER_POLICY" <<'PY'
@@ -314,19 +314,12 @@ PY
 fi
 SEED_RECEIPT_TREE_HASH=""
 if [ -n "$SEED_RECEIPT" ]; then
-    SEED_RECEIPT_TREE_HASH="$(python3 - "$repo" "$SEED_RECEIPT" \
-        "$TRUSTED_CORE_PROFILE" <<'PY'
+    SEED_RECEIPT_TREE_HASH="$(python3 - "$repo" "$SEED_RECEIPT" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
-from lib.provenance import accepted_promotion_tree_hash, reusable_seed_authority
-receipt = Path(sys.argv[2])
-tree = (
-    reusable_seed_authority(receipt)["tree_hash"]
-    if sys.argv[3] == "1"
-    else accepted_promotion_tree_hash(receipt)
-)
-print(tree)
+from lib.provenance import reusable_seed_authority
+print(reusable_seed_authority(Path(sys.argv[2]))["tree_hash"])
 PY
 )" || die "--seed-receipt must be an immutable reusable ACCEPTED/BANKED_PARTIAL promotion receipt"
 fi
@@ -554,10 +547,9 @@ start_provider_network() {
         || { echo "provider network was not created internal" >&2; return 1; }
     docker run -d --init --name "$PROVIDER_PROXY_NAME" \
         --network "$PROVIDER_NETWORK" --network-alias provider-proxy \
-        -v "$PROVIDER_POLICY:/run/provider-proxy-policy.json:ro" \
         "$IMAGE" \
         python3 /opt/harness/docker/provider_proxy.py \
-            --policy /run/provider-proxy-policy.json \
+            --policy /opt/harness/docker/provider_proxy_policy.json \
             --host 0.0.0.0 --port 8080 >/dev/null \
         || { echo "failed to start fixed provider proxy" >&2; return 1; }
     docker network connect bridge "$PROVIDER_PROXY_NAME" \
@@ -1188,47 +1180,6 @@ PY
             else
                 ledger_set "$target_id" "RATE_LIMITED"
                 RATE_LIMITED=1
-            fi
-        elif [ "$end_reason" = "PREMODEL_GATE_INDETERMINATE" ] \
-                || [ "$end_reason" = "RATE_LIMIT_OR_HANG" ] \
-                || [ "$end_reason" = "TRANSPORT_ERROR" ] \
-                || [ "$end_reason" = "RETRY_EXHAUSTED" ]; then
-            # These are deliberately non-reusable supervisor retry outcomes,
-            # so terminal promotion validation is inapplicable. Validate the
-            # accounting boundary directly and let the supervisor apply its
-            # registered backoff/cumulative budget policy.
-            if [ ! -f "$result_json" ] || [ ! -f "$audit" ] \
-                    || ! python3 - "$result_json" "$audit" <<'PY'
-import json
-import sys
-
-result = json.load(open(sys.argv[1], encoding="utf-8"))
-audit = json.load(open(sys.argv[2], encoding="utf-8"))
-reason = result.get("end_reason")
-counts = audit.get("counts") or {}
-if reason == "PREMODEL_GATE_INDETERMINATE":
-    okay = (
-        audit.get("cost_status") == "not_run"
-        and float(audit.get("recorded_cost_usd") or 0) == 0
-        and counts.get("stream_attempts") == 0
-        and counts.get("provider_cost_events") == 0
-        and counts.get("unresolved_streams") == 0
-    )
-else:
-    okay = (
-        reason in {"RATE_LIMIT_OR_HANG", "TRANSPORT_ERROR", "RETRY_EXHAUSTED"}
-        and audit.get("cost_status") == "complete"
-        and counts.get("unresolved_streams") == 0
-    )
-if not okay:
-    raise SystemExit(1)
-PY
-            then
-                echo "PROFILE RETRY AUDIT FAIL idx=$idx end_reason=$end_reason" >&2
-                ledger_set "$target_id" "PROFILE_RETRY_AUDIT_FAIL"
-                PROFILE_FAILED=1
-            else
-                ledger_set "$target_id" "$end_reason"
             fi
         elif [ ! -f "$result_json" ] || [ ! -f "$audit" ] \
                 || ! python3 "$repo/trusted_core_profile.py" validate-terminal \

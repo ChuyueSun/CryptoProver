@@ -147,7 +147,7 @@
 #   ./demo_decompress.sh --no-ristretto-proof     --run-id web_9 [--rounds 12] [--budget 240]
 #   ./demo_decompress.sh --no-fullstack-proof     --run-id web_10 [--rounds 16] [--budget 240]
 #
-# Env overrides (all have verified defaults for this machine):
+# Env overrides (tool paths are optional when already available on PATH):
 #   DALEK_UV_PY_BIN, DALEK_VERUS_DIR, DALEK_PROJECT, DALEK_GITROOT, DALEK_VSTD
 #   CLAUDE_CODE_OAUTH_TOKEN   (or DALEK_DEMO_TOKEN_FILE → file holding it;
 #                              if neither set, falls back to the keychain login)
@@ -155,12 +155,12 @@ set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── machine-specific defaults (override via env) ─────────────────────────────
-UV_PY_BIN="${DALEK_UV_PY_BIN:-/path/to/python3/bin}"
-VERUS_DIR="${DALEK_VERUS_DIR:-/tmp/verus-rel/verus-arm64-macos}"
+# ── portable defaults (override via env) ─────────────────────────────────────
+UV_PY_BIN="${DALEK_UV_PY_BIN:-}"
+VERUS_DIR="${DALEK_VERUS_DIR:-}"
 PROJECT="${DALEK_PROJECT:-/private/tmp/dalek-spec-strip/curve25519-dalek}"
 GITROOT="${DALEK_GITROOT:-/private/tmp/dalek-spec-strip}"
-VSTD="${DALEK_VSTD:-/path/to/verus/vstd}"
+VSTD="${DALEK_VSTD:-}"
 
 # DEP_SUB is relative to the cargo member dir ($PROJECT); git checkout needs it
 # relative to the workspace gitroot ($GITROOT) — computed after preflight.
@@ -280,7 +280,7 @@ TARGET="$ANCHOR"
 case "$MODE" in no-ristretto-proof|no-fullstack-proof) TARGET="$RISTRETTO" ;; esac
 
 # ── env prelude (the part the website must NOT have to re-derive) ─────────────
-export PATH="$UV_PY_BIN:$VERUS_DIR:$PATH"
+export PATH="${UV_PY_BIN:+$UV_PY_BIN:}${VERUS_DIR:+$VERUS_DIR:}$PATH"
 
 # auth: prefer an explicit token (env or file); else fall back to keychain login.
 if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -n "${DALEK_DEMO_TOKEN_FILE:-}" ] && [ -f "$DALEK_DEMO_TOKEN_FILE" ]; then
@@ -289,11 +289,11 @@ if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -n "${DALEK_DEMO_TOKEN_FILE:-}" ] 
 fi
 
 # ── preflight (fail fast & loud BEFORE launching) ────────────────────────────
-command -v python3   >/dev/null || die "python3 not on PATH ($UV_PY_BIN missing?)"
-case "$(python3 -c 'import sys;print(sys.version_info[:2]>=(3,10))' 2>/dev/null)" in
-  True) : ;; *) die "python3 is too old (need 3.10+); got $(python3 --version 2>&1)";;
-esac
-command -v cargo-verus >/dev/null || die "cargo-verus not on PATH ($VERUS_DIR missing?)"
+command -v python3   >/dev/null || die "python3 not on PATH (set DALEK_UV_PY_BIN if needed)"
+RUN_ID_ERROR=$(PYTHONPATH="$HARNESS_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m lib.results validate-run-id "$RUN_ID" 2>&1
+) || { printf '%s\n' "$RUN_ID_ERROR" >&2; exit 2; }
+command -v cargo-verus >/dev/null || die "cargo-verus not on PATH (set DALEK_VERUS_DIR if needed)"
 command -v claude    >/dev/null || die "claude not on PATH"
 [ -d "$PROJECT" ]    || die "project worktree missing: $PROJECT"
 [ -f "$ANCHOR" ]     || die "anchor missing: $ANCHOR"
@@ -585,8 +585,8 @@ CMD=( python3 "$HARNESS_DIR/run.py" "$TARGET"
       --rounds  "$ROUNDS"
       --max-task-minutes "$BUDGET"
       --model   "$MODEL"
-      --results "$RESULTS_ROOT"
-      --vstd-root "$VSTD" )
+      --results "$RESULTS_ROOT" )
+[ -n "$VSTD" ] && CMD+=( --vstd-root "$VSTD" )
 case "$MODE" in
   formal-spec)
     # proof-only: contracts given, gate ON; edit the dep only.

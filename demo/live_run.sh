@@ -8,10 +8,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # ---- config ----
-DALEK_WORKTREE="/tmp/dalek-live-demo"
+DALEK_WORKTREE="${DALEK_WORKTREE:-/tmp/dalek-live-demo}"
 TARGET_REL="curve25519-dalek/src/lemmas/ristretto_lemmas/elligator_lemmas.rs"
 TARGET="$DALEK_WORKTREE/$TARGET_REL"
-VSTD="/path/to/verus/vstd"
+VSTD="${DALEK_VSTD:-}"
+DALEK_SRCREPO="${DALEK_SRCREPO:-/path/to/dalek-lite}"
 RUN_ID="live_demo_$(date +%H%M%S)"
 
 bold=$'\033[1m'; dim=$'\033[2m'; cyan=$'\033[36m'
@@ -23,7 +24,7 @@ warn() { printf '%s%s%s\n' "$yellow" "$1" "$reset" >&2; }
 # ---- pre-flight ----
 if [ ! -f "$TARGET" ]; then
     warn "ERROR: $TARGET missing."
-    warn "Re-create the worktree:  git -C /path/to/dalek-lite worktree add $DALEK_WORKTREE eval/admitted-start"
+    warn "Re-create the worktree:  git -C $DALEK_SRCREPO worktree add $DALEK_WORKTREE eval/admitted-start"
     exit 1
 fi
 
@@ -59,12 +60,14 @@ LOG="/tmp/live-run-$RUN_ID.log"
 JSONL="results/$RUN_ID/elligator_lemmas/claude_raw/round_1.jsonl"
 mkdir -p "$(dirname "$JSONL")"
 
-python3 run.py "$TARGET" \
-    --vstd-root "$VSTD" \
-    --run-id "$RUN_ID" \
-    --rounds 5 \
-    --max-task-minutes 5 \
-    > "$LOG" 2>&1 &
+CMD=(
+    python3 run.py "$TARGET"
+    --run-id "$RUN_ID"
+    --rounds 5
+    --max-task-minutes 5
+)
+[ -n "$VSTD" ] && CMD+=(--vstd-root "$VSTD")
+"${CMD[@]}" > "$LOG" 2>&1 &
 RUN_PID=$!
 
 # Stream agent activity in real time. Exits when the final result event fires.
@@ -79,8 +82,14 @@ elapsed=$(( $(date +%s) - t0 ))
 echo
 result_json="results/$RUN_ID/elligator_lemmas/result.json"
 if [ -f "$result_json" ]; then
-    end_reason=$(python3 -c "import json; print(json.load(open('$result_json'))['end_reason'])")
-    success=$(python3 -c "import json; print(json.load(open('$result_json'))['success'])")
+    if ! read -r end_reason success < <(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["end_reason"], d["success"])
+' "$result_json"); then
+        warn "ERROR: could not parse $result_json"
+        exit 1
+    fi
     if [ "$success" = "True" ]; then
         say "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         printf '%s%s  ✅ PROOF COMPLETE  in %ss  (end_reason=%s)%s\n' \

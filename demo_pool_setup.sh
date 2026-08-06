@@ -25,9 +25,9 @@ set -euo pipefail
 
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── machine-specific defaults (same prelude as demo_decompress.sh) ───────────
-UV_PY_BIN="${DALEK_UV_PY_BIN:-/path/to/python3/bin}"
-VERUS_DIR="${DALEK_VERUS_DIR:-/tmp/verus-rel/verus-arm64-macos}"
+# ── portable defaults (same prelude as demo_decompress.sh) ───────────────────
+UV_PY_BIN="${DALEK_UV_PY_BIN:-}"
+VERUS_DIR="${DALEK_VERUS_DIR:-}"
 SIZE=3
 GITROOT="/tmp/dalek-baf"
 POOL_DIR="/tmp/dalek-demo-pool"
@@ -48,11 +48,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-export PATH="$UV_PY_BIN:$VERUS_DIR:$PATH"
+export PATH="${UV_PY_BIN:+$UV_PY_BIN:}${VERUS_DIR:+$VERUS_DIR:}$PATH"
 
 # ── preflight ────────────────────────────────────────────────────────────────
 command -v python3     >/dev/null || die "python3 not on PATH"
-command -v cargo-verus >/dev/null || die "cargo-verus not on PATH ($VERUS_DIR missing?)"
+command -v cargo-verus >/dev/null || die "cargo-verus not on PATH (set DALEK_VERUS_DIR if needed)"
 [ -d "$GITROOT/.git" ] || git -C "$GITROOT" rev-parse --git-dir >/dev/null 2>&1 \
   || die "--gitroot is not a git repo: $GITROOT"
 

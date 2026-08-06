@@ -15,6 +15,11 @@ from typing import Any
 
 from lib import provenance
 
+_HARNESS_TOP_FILES = (
+    "run.py", "prompt.md", "prompt_decompose.md", "peel.py", "admit.py",
+    "strip_specs.py", "usage_audit.py", "trusted_core_profile.py",
+    "skills/SKILL.md",
+)
 _HARNESS_DIRS = ("lib", "skills", "docker", "scripts")
 
 
@@ -78,8 +83,9 @@ def _git_value(root: Path, *args: str) -> str:
 def harness_source_receipt(repo_root: Path) -> dict[str, Any]:
     """Hash the executable harness surface, excluding ledgers/results/docs."""
     paths = [
+        *(repo_root / name for name in _HARNESS_TOP_FILES),
         *repo_root.glob("*.py"), *repo_root.glob("*.sh"),
-        *repo_root.glob("prompt*.md"), repo_root / "skills/SKILL.md",
+        *repo_root.glob("prompt*.md"),
     ]
     for directory in _HARNESS_DIRS:
         paths.extend(sorted((repo_root / directory).glob("**/*.py")))
@@ -89,6 +95,8 @@ def harness_source_receipt(repo_root: Path) -> dict[str, Any]:
     for path in sorted(set(paths)):
         if "__pycache__" in path.parts:
             continue
+        if path.is_symlink():
+            raise ValueError(f"harness source must not be a symlink: {path}")
         if not path.is_file():
             raise ValueError(f"required harness source is missing: {path}")
         data = path.read_bytes()
@@ -444,38 +452,46 @@ def validate_terminal(
         raise ValueError("terminal result is not reusable")
     cost_status = usage_audit.get("cost_status")
     recorded_cost = _finite_number(
-        usage_audit.get("recorded_cost_usd") or 0, "recorded cost",
+        usage_audit.get("recorded_cost_usd", 0), "recorded cost",
     )
     accounted_cost = recorded_cost
     cost_evidence = None
-    if cost_status == "reconciled":
+    if cost_status == "complete":
+        counts = usage_audit.get("counts") or {}
+        if not isinstance(counts, dict):
+            raise ValueError("usage audit counts are malformed")
+        if counts.get("unresolved_streams", 0) != 0:
+            raise ValueError("complete usage audit carries unresolved streams")
+    elif cost_status == "reconciled":
         reconciliation = usage_audit.get("reconciliation") or {}
-        if reconciliation.get("status") != "accepted":
+        if not isinstance(reconciliation, dict) or (
+            reconciliation.get("status") != "accepted"
+        ):
             raise ValueError("usage reconciliation is not accepted")
-        try:
-            accounted_cost = _finite_number(
-                reconciliation["reconciled_cost_usd"], "reconciled cost",
-            )
-        except (KeyError, TypeError, ValueError) as exc:
+        if "reconciled_cost_usd" not in reconciliation:
             raise ValueError(
                 "usage reconciliation lacks a numeric accounted cost"
-            ) from exc
+            )
+        accounted_cost = _finite_number(
+            reconciliation["reconciled_cost_usd"], "reconciled cost",
+        )
         if accounted_cost < recorded_cost:
             raise ValueError("usage reconciliation undercuts recorded receipts")
     elif cost_status == "equivalent_conservative":
         conservative = usage_audit.get("equivalent_conservative") or {}
-        if conservative.get("status") != "accepted":
+        if not isinstance(conservative, dict) or (
+            conservative.get("status") != "accepted"
+        ):
             raise ValueError(
                 "conservative equivalent-cost receipt is not accepted"
             )
-        try:
-            accounted_cost = _finite_number(
-                conservative["accounted_cost_usd"], "conservative debit",
-            )
-        except (KeyError, TypeError, ValueError) as exc:
+        if "accounted_cost_usd" not in conservative:
             raise ValueError(
                 "conservative equivalent-cost receipt lacks a numeric debit"
-            ) from exc
+            )
+        accounted_cost = _finite_number(
+            conservative["accounted_cost_usd"], "conservative debit",
+        )
         if accounted_cost < recorded_cost:
             raise ValueError(
                 "conservative equivalent-cost debit undercuts recorded receipts"
@@ -492,9 +508,17 @@ def validate_terminal(
                 "conservative equivalent-cost receipt lacks durable evidence"
             )
         cost_evidence = conservative
-    segments = (usage_audit.get("launch") or {}).get("segments") or []
+    else:
+        raise ValueError(
+            "terminal cost is unresolved; require complete, reconciled, or "
+            "equivalent_conservative accounting"
+        )
+    launch = usage_audit.get("launch")
+    if not isinstance(launch, dict):
+        raise ValueError("usage audit launch envelope is malformed")
+    segments = launch.get("segments")
     elapsed = 0.0
-    if not segments:
+    if not isinstance(segments, list) or not segments:
         raise ValueError("usage audit lacks launch timing segments")
     for segment in segments:
         try:
@@ -513,29 +537,17 @@ def validate_terminal(
         if ended.tzinfo is None:
             ended = ended.replace(tzinfo=timezone.utc)
         duration = (ended - started).total_seconds()
-        if duration < 0:
+        if not math.isfinite(duration) or duration < 0:
             raise ValueError("usage audit launch timing is negative")
         elapsed += duration
+    elapsed = _finite_number(elapsed, "usage audit wall time")
     harness_elapsed = _finite_number(
-        result.get("duration_seconds") or 0, "harness duration",
+        result.get("duration_seconds", 0), "harness duration",
     )
     if harness_elapsed > elapsed + 2.0:
         raise ValueError("harness duration exceeds launcher wall-clock receipt")
-    allowed_cost_statuses = {
-        "complete", "lower_bound", "unknown", "reconciled",
-        "equivalent_conservative",
-    }
-    if cost_status not in allowed_cost_statuses:
-        raise ValueError("usage audit has an invalid cost status")
-    if (usage_audit.get("launch") or {}).get("status") != "sealed":
+    if launch.get("status") != "sealed":
         raise ValueError("usage audit launch envelope is not sealed")
-    if (usage_audit.get("counts") or {}).get("unresolved_streams", 0) and (
-        cost_status not in {
-            "lower_bound", "unknown", "reconciled",
-            "equivalent_conservative",
-        }
-    ):
-        raise ValueError("usage audit unresolved-stream accounting is inconsistent")
     # This per-leg comparison is an early sanity bound. The authoritative
     # multi-leg campaign ceiling is enforced cumulatively by
     # advance_campaign_state.
@@ -549,6 +561,7 @@ def validate_terminal(
         "lineage_id": context["lineage_id"],
         "promotion_receipt_id": promotion["receipt_id"],
         "tree_hash": tree_hash,
+        "usage_audit_receipt_id": provenance.receipt_id(usage_audit),
         "cost_status": cost_status,
         "recorded_cost_usd": recorded_cost,
         "accounted_cost_usd": accounted_cost,
@@ -588,7 +601,12 @@ def advance_campaign_state(
         if prior.get("lineage_id") != terminal.get("lineage_id"):
             raise ValueError("prior campaign state belongs to another lineage")
     required = ("hard_admits", "verification_errors", "resource_limits", "raw_errors")
-    if any(not isinstance(vector.get(key), int) or vector[key] < 0 for key in required):
+    if any(
+        not isinstance(vector.get(key), int)
+        or isinstance(vector[key], bool)
+        or vector[key] < 0
+        for key in required
+    ):
         raise ValueError("leg lacks the full canonical non-negative progress vector")
     legs = list(prior.get("legs") or [])
     previous = (legs[-1].get("vector") if legs else None)
@@ -603,12 +621,18 @@ def advance_campaign_state(
         "accounted_cost_usd", terminal.get("recorded_cost_usd", 0),
     )
     cumulative_cost = _finite_number(
-        prior.get("recorded_cost_usd") or 0, "prior recorded cost",
-    ) + _finite_number(terminal_cost or 0, "terminal accounted cost")
+        _finite_number(
+            prior.get("recorded_cost_usd", 0), "prior recorded cost",
+        ) + _finite_number(terminal_cost, "terminal accounted cost"),
+        "cumulative recorded cost",
+    )
     cumulative_wall = _finite_number(
-        prior.get("elapsed_seconds") or 0, "prior elapsed time",
-    ) + _finite_number(
-        terminal.get("elapsed_seconds") or 0, "terminal elapsed time",
+        _finite_number(
+            prior.get("elapsed_seconds", 0), "prior elapsed time",
+        ) + _finite_number(
+            terminal.get("elapsed_seconds", 0), "terminal elapsed time",
+        ),
+        "cumulative elapsed time",
     )
     cost_unresolved = terminal.get("cost_status") not in {
         "complete", "reconciled", "equivalent_conservative",

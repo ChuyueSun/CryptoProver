@@ -50,6 +50,26 @@ _AXIOM_FN_NAME_RE = re.compile(
 # and passes through as ordinary code.
 _CHAR_LIT_RE = re.compile(r"'(?:\\.|[^'\\])'")
 
+# The admit() call itself. Rust tokenization ignores whitespace, so
+# `admit ( );` and `admit(\n);` are the same call as `admit();` — an exact
+# substring test counts them as zero, which is a fake-green vector.
+# Word boundary keeps `my_admit()` out; whitespace (incl. newlines) is allowed
+# between the name and parens and inside the empty argument list.
+#
+# The parenthesized-path form `(admit)()` is the same call: vstd's `admit` is
+# an ordinary zero-arg proof fn recognized by diagnostic item, so wrapping the
+# path in parens does not change its semantics. (A turbofish `admit::<>()` is
+# NOT valid — the function is non-generic — so it is deliberately absent.)
+_ADMIT_CALL_RE = re.compile(
+    r"(?:\badmit\s*|\(\s*\badmit\b\s*\)\s*)\(\s*\)"
+)
+
+# Aliasing the admit import (`use vstd::pervasive::admit as f;`) lets `f()`
+# discharge goals under a name no textual admit counter can see. There is no
+# legitimate reason to alias `admit`, so any occurrence is counted by the
+# forbidden-construct gate (increase-only vs baseline, like `assume`).
+_ADMIT_ALIAS_RE = re.compile(r"\badmit\s+as\b")
+
 
 def strip_comments_strings(text: str) -> str:
     """Blank Rust comments and string/char-literal *contents* so a later
@@ -154,16 +174,18 @@ def classify_admit_lines(text: str) -> dict:
 
     non_axiom: list[int] = []
     axiom: list[int] = []
-    offset = 0
-    for idx, line in enumerate(masked.splitlines(keepends=True), start=1):
-        col = line.find("admit()")
-        if col >= 0:
-            pos = offset + col
-            if any(start <= pos <= end for start, end in axiom_spans):
+    # Whole-text regex scan (not per-line substring): `admit ( );` and a call
+    # whose parens span lines are the same Rust call as `admit();`. The line
+    # number is where the call starts; one entry per line, as before.
+    for match in _ADMIT_CALL_RE.finditer(masked):
+        pos = match.start()
+        idx = masked.count("\n", 0, pos) + 1
+        if any(start <= pos <= end for start, end in axiom_spans):
+            if idx not in axiom:
                 axiom.append(idx)
-            else:
+        else:
+            if idx not in non_axiom:
                 non_axiom.append(idx)
-        offset += len(line)
     return {"non_axiom_lines": non_axiom, "axiom_lines": axiom}
 
 
@@ -233,18 +255,31 @@ def count_forbidden_constructs(text: str) -> dict[str, int]:
     """Count proof-bypass constructs in `text`, ignoring comments and string
     literals (so a mention in prose / a URL never trips the count).
 
-    Returns ``{"assume": int, "external_body": int, "rlimit": int}``. Used by
-    the harness's forbidden-construct integrity gate (run.py), which diffs
-    these counts against a pre-run baseline — only AGENT-introduced constructs
-    fail a round, so a pre-existing `external_body` or `#[verifier::rlimit]`
-    in seeded dalek source is tolerated.
+    Returns ``{"assume": int, "external_body": int, "rlimit": int,
+    "admit_alias": int}``. Used by the harness's forbidden-construct integrity
+    gate (run.py), which diffs these counts against a pre-run baseline — only
+    AGENT-introduced constructs fail a round, so a pre-existing
+    `external_body` or `#[verifier::rlimit]` in seeded dalek source is
+    tolerated. `admit_alias` catches `use ... admit as f;`, which would let
+    `f()` bypass every textual admit counter.
     """
     code = strip_comments_strings(text)
     return {
         "assume": len(_ASSUME_RE.findall(code)),
         "external_body": len(_EXTERNAL_BODY_RE.findall(code)),
         "rlimit": len(_VERIFIER_RLIMIT_RE.findall(code)),
+        "admit_alias": len(_ADMIT_ALIAS_RE.findall(code)),
     }
+
+
+def has_admit_call(text: str) -> bool:
+    """True when `text` contains a real admit() call (comment/string aware).
+
+    The cheap early-out every scanner wants. Exists so callers stop writing
+    `"admit()" in text`, which misses `admit ( );` and multi-line calls and
+    counts mentions inside comments and string literals.
+    """
+    return _ADMIT_CALL_RE.search(strip_comments_strings(text)) is not None
 
 
 def count_non_axiom(text: str) -> int:

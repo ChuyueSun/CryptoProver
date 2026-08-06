@@ -17,6 +17,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import run  # noqa: E402
 import run_layer  # noqa: E402
 import usage_audit  # noqa: E402
+from lib import provenance  # noqa: E402
 
 
 class LifecycleReceiptTests(unittest.TestCase):
@@ -173,30 +174,6 @@ class LifecycleReceiptTests(unittest.TestCase):
         self.assertTrue(reset["cost_reported"])
         self.assertEqual(reset["predecessor_tree_hash"], "tree-after-gate")
         self.assertEqual(reset["planned_round"], 4)
-
-        # F9: the GIT_RECOVERY reset must produce the same consumer-matchable
-        # core as the stall/plateau paths — planned_round set and
-        # actual_start_round None (the pre-launch consumer matches on both),
-        # plus the predecessor trio — so the fresh session gets its handoff
-        # receipt and result.json's reset_events stays causally complete.
-        recovery = run._reset_event(
-            ["git_recovery"],
-            planned_round=6,
-            trigger_round=5,
-            predecessor_tree_receipt={"tree_hash": "restored-tree"},
-            last_gate_receipt={"receipt_path": "/results/gate.json"},
-            candidate_transaction={"classification": "REJECTED_RECOVERED"},
-        )
-        self.assertEqual(recovery["cause"], ["git_recovery"])
-        self.assertEqual(recovery["planned_round"], 6)
-        self.assertIsNone(recovery["actual_start_round"])
-        self.assertEqual(recovery["predecessor_tree_hash"], "restored-tree")
-        self.assertEqual(
-            recovery["predecessor_gate_receipt"], "/results/gate.json")
-        self.assertEqual(
-            recovery["predecessor_transaction"],
-            {"classification": "REJECTED_RECOVERED"},
-        )
 
         with tempfile.TemporaryDirectory() as td:
             raw = Path(td) / "round.jsonl"
@@ -424,6 +401,44 @@ class LifecycleReceiptTests(unittest.TestCase):
             self.assertEqual(audit["recorded_cost_usd"], 2.5)
             self.assertEqual(audit["counts"]["unresolved_streams"], 0)
             self.assertEqual(audit["streams"][0]["unresolved_reasons"], [])
+
+    def test_usage_audit_detects_wholly_lost_round_gap(self):
+        # T315 M6: coverage was defined over files that exist. If round 2's
+        # raw/round/lifecycle were ALL lost after a billed provider request,
+        # rounds 1+3 look clean and the audit read "complete". A round-number
+        # gap is mechanically detectable and must stay unresolved.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "results"
+            self._usage_fixture(
+                root,
+                [{"type": "result", "total_cost_usd": 2.5}],
+                round_cost=2.5,
+            )
+            task = root / "run-1" / "target"
+            raw_dir = task / "claude_raw"
+            # Round 3 exists and is fully receipted; round 2 is wholly absent.
+            (raw_dir / "round_3.lifecycle.json").write_text(json.dumps({
+                "round_number": 3, "status": "agent_exited",
+            }))
+            (raw_dir / "round_3.jsonl").write_text(
+                json.dumps({"type": "result", "total_cost_usd": 1.0}) + "\n")
+            (task / "round_3.json").write_text(json.dumps({
+                "round_number": 3,
+                "claude_usage": {
+                    "total_cost_usd": 1.0,
+                    "cost_reported": True,
+                    "cost_source": "provider_terminal_event",
+                },
+            }))
+            audit = usage_audit.audit_run(
+                root, "run-1", started_at="2026-07-29T00:00:00Z",
+                ended_at="2026-07-29T00:10:00Z", launcher_rc=0,
+            )
+            self.assertNotEqual(audit["cost_status"], "complete")
+            self.assertGreaterEqual(audit["counts"]["unresolved_streams"], 1)
+            gap = [s for s in audit["streams"] if s["round_number"] == 2]
+            self.assertEqual(len(gap), 1)
+            self.assertIn("round_missing_from_disk", gap[0]["unresolved_reasons"])
 
     def test_usage_audit_unreceipted_turn_limit_remains_unresolved(self):
         with tempfile.TemporaryDirectory() as td:
@@ -667,7 +682,12 @@ class SupersedePriorAttemptReceipts(unittest.TestCase):
             tdir = Path(td)
             self.assertIsNone(run._supersede_prior_attempt_receipts(tdir))
 
-            (tdir / "promotion_receipt.json").write_text('{"decision": "REJECTED"}')
+            (tdir / "promotion_receipt.json").write_text(
+                '{"decision": "REJECTED"}'
+            )
+            (tdir / "premodel_verifier_warm.json").write_text("{}")
+            (tdir / "lineage_context.json").write_text("{}")
+            (tdir / "predecessor_frontier.json").write_text("{}")
             (tdir / "gate_receipts").mkdir()
             (tdir / "gate_receipts" / "abc.json").write_text("{}")
             (tdir / "reset_handoff_round_3.json").write_text("{}")
@@ -675,18 +695,18 @@ class SupersedePriorAttemptReceipts(unittest.TestCase):
 
             dest = run._supersede_prior_attempt_receipts(tdir)
             self.assertEqual(dest, tdir / "_superseded_receipts" / "attempt_1")
-            self.assertFalse((tdir / "promotion_receipt.json").exists())
-            self.assertFalse((tdir / "gate_receipts").exists())
+            for name in run._PRIOR_ATTEMPT_RECEIPTS:
+                self.assertFalse((tdir / name).exists())
+                self.assertTrue((dest / name).exists())
             self.assertFalse((tdir / "reset_handoff_round_3.json").exists())
             self.assertTrue((tdir / "result.json").exists())
-            self.assertTrue((dest / "promotion_receipt.json").exists())
             self.assertTrue((dest / "gate_receipts" / "abc.json").exists())
             self.assertTrue((dest / "reset_handoff_round_3.json").exists())
 
             # A rewritten receipt no longer collides after superseding.
-            from lib import provenance
             provenance.write_immutable_json(
-                tdir / "promotion_receipt.json", {"decision": "ACCEPTED"})
+                tdir / "promotion_receipt.json", {"decision": "ACCEPTED"}
+            )
 
             # A third attempt gets its own slot; attempt_1 is untouched.
             dest2 = run._supersede_prior_attempt_receipts(tdir)

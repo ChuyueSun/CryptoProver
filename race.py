@@ -369,8 +369,10 @@ def race_task(target: Path, project: Path, K: int = 3,
     target = target.resolve()
     project = project.resolve()
     results_root = (results_root or Path("results")).resolve()
-    run_id = run_id or _results.run_id_new("race")
-    target_id = _results.target_id_from_path(target)
+    run_id = _results.validate_launcher_run_id(
+        run_id or _results.run_id_new("race"))
+    target_id = _results.validate_path_component(
+        _results.target_id_from_path(target), label="target id")
     if global_cap_minutes is None:
         # default: a little headroom over a single attempt's budget
         global_cap_minutes = max_task_minutes + 15.0
@@ -512,10 +514,15 @@ def main() -> int:
         print("[error] -K must be >= 1", file=sys.stderr)
         return 2
 
+    try:
+        run_id = _results.validate_launcher_run_id(
+            args.run_id or _results.run_id_new("race"))
+    except (RuntimeError, ValueError) as exc:
+        ap.error(str(exc))
     rr = race_task(
         target=args.target, project=args.project, K=args.attempts,
         base_commit=args.base_commit, results_root=args.results,
-        run_id=args.run_id, rounds=args.rounds,
+        run_id=run_id, rounds=args.rounds,
         max_task_minutes=args.max_task_minutes,
         global_cap_minutes=args.global_cap_minutes,
         model=args.model, vstd_root=args.vstd_root,

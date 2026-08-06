@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from decimal import Decimal
@@ -18,22 +19,83 @@ from trusted_core_profile import (
     validate_terminal,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 class TrustedCoreTerminalProfileTests(unittest.TestCase):
     def test_harness_receipt_covers_top_level_and_nested_executables(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            required = (
+                "run.py", "prompt.md", "prompt_decompose.md", "peel.py",
+                "admit.py", "strip_specs.py", "usage_audit.py",
+                "trusted_core_profile.py", "skills/SKILL.md",
+            )
+            for relative in required:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"required {relative}\n")
             (root / "skills" / "nested").mkdir(parents=True)
-            (root / "skills" / "SKILL.md").write_text("skill\n")
-            (root / "skills" / "nested" / "helper.py").write_text("one\n")
+            helper = root / "skills" / "nested" / "helper.py"
+            helper.write_text("one\n")
+            (root / "scripts").mkdir()
+            (root / "scripts" / "config.json").write_text("{}\n")
             (root / "launch.sh").write_text("#!/bin/sh\n")
+
             first = harness_source_receipt(root)
-            (root / "skills" / "nested" / "helper.py").write_text("two\n")
+            helper.write_text("two\n")
             second = harness_source_receipt(root)
+
             paths = {entry["path"] for entry in second["files"]}
             self.assertIn("launch.sh", paths)
             self.assertIn("skills/nested/helper.py", paths)
+            self.assertIn("scripts/config.json", paths)
             self.assertNotEqual(first["tree_hash"], second["tree_hash"])
+            (root / "skills" / "nested" / "alias.py").symlink_to(helper)
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                harness_source_receipt(root)
+
+    def test_profile_receipt_matches_run_gate_over_tracked_files(self):
+        from run import _tooling_files
+
+        tracked = {
+            path
+            for path in subprocess.run(
+                ["git", "ls-files", "-z"], cwd=REPO_ROOT,
+                check=True, capture_output=True,
+            ).stdout.decode().split("\0")
+            if path
+        }
+        profile_paths = {
+            entry["path"]
+            for entry in harness_source_receipt(REPO_ROOT)["files"]
+        }
+        gate_paths = {
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in _tooling_files()
+            if path.is_file() and "__pycache__" not in path.parts
+        }
+        self.assertEqual(profile_paths & tracked, gate_paths & tracked)
+
+    def test_dockerfile_copies_the_bound_top_level_and_scripts_scopes(self):
+        tracked_top = {
+            path
+            for path in subprocess.run(
+                ["git", "ls-files", "*.py", "*.sh", "prompt*.md"],
+                cwd=REPO_ROOT, check=True, capture_output=True, text=True,
+            ).stdout.splitlines()
+            if "/" not in path
+        }
+        self.assertTrue(tracked_top)
+        for name in ("Dockerfile", "Dockerfile.trust-core-final"):
+            with self.subTest(name=name):
+                dockerfile = (REPO_ROOT / "docker" / name).read_text()
+                top_copy = next(
+                    line for line in dockerfile.splitlines()
+                    if line.startswith("COPY admit.py ") and line.endswith(" ./")
+                )
+                self.assertEqual(set(top_copy.split()[1:-1]), tracked_top)
+                self.assertIn("COPY scripts/ ./scripts/", dockerfile)
 
     def test_registration_predecessor_accounting_mismatch_fails_closed(self):
         predecessor = {"receipt_id": "promotion", "tree_hash": "tree"}
@@ -124,6 +186,10 @@ class TrustedCoreTerminalProfileTests(unittest.TestCase):
             )
             self.assertTrue(receipt["okay"])
             self.assertEqual(receipt["decision"], "ACCEPTED")
+            self.assertEqual(
+                receipt["usage_audit_receipt_id"],
+                provenance.receipt_id(usage),
+            )
             self.assertEqual(receipt["receipt_id"], provenance.receipt_id(receipt))
 
     def test_stale_gate_tree_and_budget_fail_closed(self):
@@ -142,17 +208,32 @@ class TrustedCoreTerminalProfileTests(unittest.TestCase):
                     project=root, max_cost_usd=3, max_wall_seconds=20,
                 )
 
-    def test_nonfinite_accounting_and_ceilings_fail_closed(self):
+            context, result, usage = self._fixture(root)
+            usage["recorded_cost_usd"] = 3.1
+            with self.assertRaisesRegex(ValueError, "budget exceeded"):
+                validate_terminal(
+                    context=context, result=result, usage_audit=usage,
+                    project=root, max_cost_usd=3, max_wall_seconds=20,
+                )
+
+    def test_nonfinite_terminal_numbers_fail_closed(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            for field in ("recorded_cost_usd",):
-                context, result, usage = self._fixture(root)
-                usage[field] = float("nan")
-                with self.assertRaisesRegex(ValueError, "finite"):
-                    validate_terminal(
-                        context=context, result=result, usage_audit=usage,
-                        project=root, max_cost_usd=3, max_wall_seconds=20,
-                    )
+            context, result, usage = self._fixture(root)
+            usage["recorded_cost_usd"] = float("nan")
+            with self.assertRaisesRegex(ValueError, "finite"):
+                validate_terminal(
+                    context=context, result=result, usage_audit=usage,
+                    project=root, max_cost_usd=3, max_wall_seconds=20,
+                )
+
+            context, result, usage = self._fixture(root)
+            result["duration_seconds"] = float("inf")
+            with self.assertRaisesRegex(ValueError, "finite"):
+                validate_terminal(
+                    context=context, result=result, usage_audit=usage,
+                    project=root, max_cost_usd=3, max_wall_seconds=20,
+                )
 
             context, result, usage = self._fixture(root)
             with self.assertRaisesRegex(ValueError, "finite"):
@@ -163,13 +244,20 @@ class TrustedCoreTerminalProfileTests(unittest.TestCase):
                 )
 
             context, result, usage = self._fixture(root)
-            usage["cost_status"] = "invented"
-            with self.assertRaisesRegex(ValueError, "invalid cost status"):
+            usage.update(
+                cost_status="reconciled",
+                reconciliation={
+                    "status": "accepted",
+                    "reconciled_cost_usd": float("inf"),
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "finite"):
                 validate_terminal(
                     context=context, result=result, usage_audit=usage,
                     project=root, max_cost_usd=3, max_wall_seconds=20,
                 )
 
+    def test_nonfinite_campaign_numbers_and_boolean_vector_fail_closed(self):
         terminal = {
             "receipt_id": "terminal",
             "decision": "BANKED_PARTIAL",
@@ -189,26 +277,49 @@ class TrustedCoreTerminalProfileTests(unittest.TestCase):
                 prior={}, terminal=terminal, vector=vector, plateau_k=2,
                 max_cost_usd=10, max_wall_seconds=100,
             )
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            advance_campaign_state(
+                prior={}, terminal={**terminal, "recorded_cost_usd": 1},
+                vector=vector, plateau_k=True,
+                max_cost_usd=10, max_wall_seconds=100,
+            )
+        with self.assertRaisesRegex(ValueError, "canonical"):
+            advance_campaign_state(
+                prior={}, terminal={**terminal, "recorded_cost_usd": 1},
+                vector={**vector, "hard_admits": False}, plateau_k=2,
+                max_cost_usd=10, max_wall_seconds=100,
+            )
 
+    def test_unknown_cost_cannot_mint_terminal_authority(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
             context, result, usage = self._fixture(root)
-            usage["recorded_cost_usd"] = 3.1
-            with self.assertRaisesRegex(ValueError, "budget exceeded"):
+            usage.update(cost_status="unknown", recorded_cost_usd=0)
+            with self.assertRaisesRegex(ValueError, "cost is unresolved"):
                 validate_terminal(
                     context=context, result=result, usage_audit=usage,
                     project=root, max_cost_usd=3, max_wall_seconds=20,
                 )
 
-    def test_unknown_cost_is_reported_not_invented(self):
+    def test_lower_bound_and_false_complete_cannot_mint_terminal_authority(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            context, result, usage = self._fixture(root)
-            usage.update(cost_status="unknown", recorded_cost_usd=0)
-            receipt = validate_terminal(
-                context=context, result=result, usage_audit=usage,
-                project=root, max_cost_usd=3, max_wall_seconds=20,
-            )
-            self.assertEqual(receipt["cost_status"], "unknown")
-            self.assertEqual(receipt["recorded_cost_usd"], 0)
+            for status, unresolved, message in (
+                ("lower_bound", 1, "cost is unresolved"),
+                ("complete", 1, "carries unresolved streams"),
+            ):
+                with self.subTest(status=status):
+                    context, result, usage = self._fixture(root)
+                    usage["cost_status"] = status
+                    usage.setdefault("counts", {})[
+                        "unresolved_streams"
+                    ] = unresolved
+                    with self.assertRaisesRegex(ValueError, message):
+                        validate_terminal(
+                            context=context, result=result, usage_audit=usage,
+                            project=root, max_cost_usd=3,
+                            max_wall_seconds=20,
+                        )
 
     def test_plateau_and_unresolved_cost_stop_before_next_leg(self):
         vector = {
@@ -516,16 +627,11 @@ class TrustedCoreTerminalProfileTests(unittest.TestCase):
             )
             self.assertEqual(usage["cost_status"], "unknown")
             self.assertEqual(usage["counts"]["unresolved_streams"], 1)
-            unresolved_terminal = validate_terminal(
-                context=context, result=result, usage_audit=usage,
-                project=root, max_cost_usd=10, max_wall_seconds=100,
-            )
-            stopped = advance_campaign_state(
-                prior={}, terminal=unresolved_terminal,
-                vector=gate["vector"], plateau_k=2,
-                max_cost_usd=10, max_wall_seconds=100,
-            )
-            self.assertIn("COST_UNRESOLVED", stopped["stop_reasons"])
+            with self.assertRaisesRegex(ValueError, "cost is unresolved"):
+                validate_terminal(
+                    context=context, result=result, usage_audit=usage,
+                    project=root, max_cost_usd=10, max_wall_seconds=100,
+                )
 
             usage = audit_run(
                 results_root, "run",
